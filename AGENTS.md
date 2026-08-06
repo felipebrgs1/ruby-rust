@@ -6,11 +6,14 @@ Calisto is a Bun-like runtime for **Ruby**: a single Rust binary that embeds and
 
 Status: Fases 1-2 (runtime + fast startup, bundler stdlib-only), Fase A (gems via
 Bundler), Fase B (preload de app), Fase C (Rails mínimo) e Fase D completa
-(degrau 4 Maybe Finance: Sidekiq fork-safe; degrau 5 Chatwoot: API + ActionCable)
-do ROADMAP.md done. Next: Fase E — produto Bun (`calisto test`/`task`/`serve`,
-watch/.env) ou a escada de apps acima do Chatwoot.
-Phases posteriores: `test` runner, `task` runner, HTTP `serve`, `sqlite`,
-`tooling` (watch/.env) — scaffolds já existem como crates vazios.
+(escada real: Sinatra → Rails → Maybe Finance/Sidekiq → Chatwoot/API+ActionCable)
+do ROADMAP.md done. O roadmap agora mira um **Bun por inteiro** (Fases E-K):
+E (test/task/serve/.env/watch), F (build --compile com gems), G (exec/-e/repl),
+H (scripts no calisto.toml), I (multi-versões de ruby), J (init/upgrade),
+K (deps add/remove). Next: **Fase E** — `calisto test` (crates
+`calisto-{test,task,serve,sqlite,tooling}` existem como scaffolds vazios).
+Risco conhecido pendente: daemon single-connection (server de longa duração
+bloqueia novos RUNs — precisa accept loop multi-conexão antes da Fase E).
 
 ## Architecture & Data Flow
 

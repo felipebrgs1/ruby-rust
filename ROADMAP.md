@@ -1,149 +1,90 @@
 # Roadmap — calisto
 
-> Runtime estilo Bun para Ruby: CRuby 3.4.10 pinado, daemon fork-based de startup
-> rápido, bundler stdlib-only. Objetivo de longo prazo: **1:1 com o Rails** — o
-> calisto como runtime/empacotador em volta de apps Rails (como o Bun roda React),
-> validado rodando apps open source reais, do trivial ao Chatwoot.
-
-## A virada de premissa (gems)
-
-Rails **é** um conjunto de gems. "Rodar Rails" e "não mexer em gems" são mutuamente
-exclusivos. A decisão que preserva o espírito do projeto (não reimplementar nada
-do Ruby):
-
-> **O calisto não passa a *gerenciar* gems — passa a *rodar* apps que usam gems,
-> delegando a instalação ao Bundler normal.** O preload do daemon deixa de ser
-> `json,yaml,...` e vira **a app inteira** (boot congelado + fork por execução).
-
-Analogia: **Bun + React/Next = calisto + Rails**. O valor continua no que já existe
-(daemon fork, preload, bundler, testes) — só muda o que é pré-carregado.
-
-## Visão de produto
+> Alvo: **um Bun por inteiro para Ruby** — runtime gerenciado (CRuby pinado),
+> startup fork-based, bundler, test/task/serve, build single-file com gems,
+> scripts (bun run), exec (bunx), multi-versões. O valor está na orquestração:
+> **nunca reimplementar o CRuby** (anti-objetivo nº 1). Cada fase tem marco
+> verificável e vira teste permanente.
 
 ```mermaid
 graph LR
-    A[Fase A: runtime com gems<br/>Bundler.setup + Gemfile] --> B[Fase B: preload da app<br/>boot congelado + fork-safe]
-    B --> C[Fase C: Rails mínimo<br/>rails new responde HTTP]
-    C --> D[Fase D: escada de apps reais<br/>até Chatwoot]
-    D --> E[Fase E: produto Bun<br/>test / task / serve / .env]
-    E --> F[Fase F: build --compile<br/>gems + C exts embutidas]
+    E[Fase E: test/task/serve/.env/watch] --> F[Fase F: build --compile com gems]
+    F --> G[Fase G: exec / -e / repl]
+    G --> H[Fase H: scripts no calisto.toml]
+    H --> I[Fase I: multi-versões de ruby]
+    I --> J[Fase J: init / upgrade / completions]
+    J --> K[Fase K: deps add/remove]
 ```
 
-| Fase | Objetivo | Marco verificável | Estimativa |
-|---|---|---|---|
-| **A** | Runtime com ecossistema | app Rack/Sinatra (5 gems) roda via `calisto run` | 2-4 sem |
-| **B** | Preload de app (frozen boot) | boot de Rails ≥2s → **<500ms** por comando | 2-3 sem |
-| **C** | Rails mínimo | `rails new` + `curl` → 200, boot <500ms | 2-4 sem |
-| **D** | Apps reais progressivos | escada abaixo; cada app vira **golden test** | contínuo |
-| **E** | Produto Bun-completo | `calisto test` roda a suíte do app + watch | 2-3 meses |
-| **F** | `build --compile` com gems | executável com gems **pure-Ruby** (sem C exts) | 2-4 meses (C exts: estelar) |
+## Pronto (Fases 1-2 + A-D) — resumo
 
-## Fases
+- [x] **Fase 1-2** — runtime pinado + daemon fork (startup 3-4×), `calisto build` stdlib-only
+- [x] **Fase A (gems)** — `run` ativa o Gemfile via Bundler (semântica `bundle exec`), warn de `.ruby-version`, preload desativado com Gemfile
+- [x] **Fase B (preload de app)** — `calisto.toml` + daemon dedicado por app, boot congelado, fork-safe (desconexão AR + `$LOADED_FEATURES`)
+- [x] **Fase C (Rails mínimo)** — dev server e console como child do fork
+- [x] **Fase D (escada real)** — degraus 1-5: stdlib → Sinatra → Rails → Maybe Finance (Sidekiq) → **Chatwoot** (API + ActionCable)
 
-### Fase A — Runtime com gems (porta de entrada)
-- `calisto run` detecta `Gemfile` e roda com `Bundler.setup` antes do script
-  (o daemon já herda `RUBYOPT`/env do cliente; falta `BUNDLE_GEMFILE` + setup)
-- check de `.ruby-version` vs pin 3.4.10 (warn se divergir)
-- **Decisão**: delegar ao `bundle` — nada de instalador próprio
-- Golden test: fixture de app Sinatra + 5 gems → `calisto run` + curl
+Números de hoje: Rails runner 2162ms → **108ms (20×)** no Chatwoot; 1527→177ms (8.6×) no Maybe; boot Rails 2.2s → 105ms; golden tests gated em `test/{bundler,app,realapps}.rs`.
 
-### Fase B — Preload de app (coração do "1:1 Rails")
-- O daemon pré-carrega o entrypoint da app (ex.: `config/environment.rb`) no
-  lugar do preload de stdlib — configuração por app via **`calisto.toml`** (novo)
-- **Fork-safe boot**: desconectar conexões `ActiveRecord` no preload, reconnect
-  no child (padrão Zeus/Spring); verificar caches/locks/threads pós-fork
-- Métrica alvo: `rails runner`/`rake`/testes ~2-5s → **200-400ms**
-- Custo conhecido: daemon com app Rails ≈ 300-500MB RSS (preço do preload)
+## Fases futuras — em partes
 
-### Fase C — Rails mínimo
-- `rails new` (sqlite, sem asset pipeline) roda: `calisto run bin/rails ...`,
-  console e dev server via rack handler
-- Servidor web roda como child do fork (threads OK — fork é single-threaded)
+### Fase E — Produto Bun: test / task / serve / .env / watch
+Crates já esboçados: `calisto-{test,task,serve,sqlite,tooling}`.
 
-### Fase D — Escada de apps reais (golden tests)
+- [ ] `calisto test` — detecta minitest/rspec do projeto, roda no daemon quente, paralelo
+- [ ] `calisto test --watch` — re-roda ao salvar (fork-safe: aprendizado do listen do Chatwoot)
+- [ ] `calisto task` — rake no daemon quente (`calisto task db:migrate`)
+- [ ] `calisto serve` — HTTP (rack handler) como child do fork
+- [ ] `.env` loading no daemon
+- Marco: `calisto test` roda a suíte do `railsapp` (minitest) e do Maybe (rspec) **<500ms por arquivo**; `calisto task db:migrate` idempotente no daemon
+- Estimativa: 2-3 meses
 
-| Degrau | App | Gems | Valida |
-|---|---|---|---|
-| 1 | scripts CLI stdlib-only | 0 | já funciona ✓ |
-| 2 | app Rack/Sinatra | ~5 | Fase A |
-| 3 | Rails blog mínimo (sqlite) | ~15 | Fase C |
-| 4 | app média com Sidekiq (ex.: Maybe Finance, plataforma de conteúdo) | ~40 | fork-safe com jobs + threads |
-| 5 | **Chatwoot** | ~100+ | boot + login + conversas + ActionCable (Postgres/Redis via docker) |
+### Fase F — build --compile com gems
+- [ ] gems **pure-Ruby** embutidas no bundle (o loader já intercepta `require`)
+- [ ] executável único roda app com gems **sem bundle install** (runtime próprio)
+- [ ] C extensions (nokogiri, pg…): compile + link no build — o item "década"; só para apps sem C exts; provavelmente nunca para Rails completo (bun levou anos com time full-time)
+- Marco: app Sinatra com 5 gems → `calisto build --compile` → executável → HTTP 200 sem rubygems/bundle no sistema
+- Estimativa: 2-4 meses (C exts: estelar)
 
-Cada degrau vira um golden test permanente (boot + smoke HTTP + endpoints-chave),
-como a suíte upstream de hoje (`test/ruby_upstream.rs`).
+### Fase G — Execução (o bunx do Ruby)
+- [ ] `calisto exec <bin>` — roda o binário de uma gem no contexto da app (ex.: `calisto exec rubocop`, `calisto exec sidekiq`) — o degrau 4/5 precisou de `bin/sidekiq` manual
+- [ ] `calisto run -e 'code'` — código inline no daemon quente (hoje o help diz "sem VM flags")
+- [ ] `calisto repl` — IRB no contexto da app pré-carregada
+- Marco: `calisto exec sidekiq` no Maybe processa job; `calisto run -e 'puts 1+1'` warm **<50ms**
+- Estimativa: 1-2 semanas
 
-### Fase E — Produto Bun
-`calisto test` (minitest/rspec + paralelo + watch), `calisto task` (rake),
-`calisto serve`, `.env`, hot reload. Módulos já esboçados em
-`crates/calisto-{test,task,serve,sqlite,tooling}/`.
+### Fase H — Scripts no calisto.toml (o package.json do Ruby)
+- [ ] `[scripts]` no calisto.toml: `dev = "bin/rails server"`, `test = "rake test"`, `db:migrate = "bin/rails db:migrate"`…
+- [ ] `calisto run dev` / `calisto run test` — executa o comando no daemon (com args)
+- Marco: `calisto run dev` sobe o `railsapp`; `calisto run test` roda a suíte; `calisto run db:migrate` idempotente
+- Estimativa: 1-2 semanas
 
-### Fase F — Build --compile com gems
-- Gems **pure-Ruby**: embutem no bundle existente (loader já intercepta `require`)
-- **C extensions** (nokogiri, pg, …): exigem compile + link no build — o item
-  "década" do roadmap; só para apps sem C exts; provavelmente nunca para Rails
-  completo (bun levou anos com time full-time)
+### Fase I — Multi-versões de ruby (hoje: pin único 3.4.10)
+- [ ] `vendor/rubies/<versão>/` (o build-ruby.sh já é parametrizável) — seleção por `.ruby-version`/Gemfile
+- [ ] daemon por versão (hash do socket inclui a versão)
+- [ ] bundle por versão (GEM_HOME de cada vendor) — C exts compilam por versão (setup libpq/libyaml já vale)
+- Marco: Maybe e Chatwoot (pinam 3.4.4) rodam **sem editar o Gemfile**; app 3.2.x roda; `.ruby-version` divergente → erro claro se a versão não está instalada (hoje: só warn)
+- Nota: 3.0/3.1 são EOL — o valor prático é 3.2/3.3/3.4; ~274MB + 10-15min por versão
+- Estimativa: 1-2 semanas
+
+### Fase J — init / upgrade / completions
+- [ ] `calisto init` — scaffold (calisto.toml + estrutura mínima), como `bun init`
+- [ ] `calisto upgrade` — rebuild do pin / troca de versão (idempotente)
+- [ ] `calisto completions` — bash/zsh
+- Marco: `calisto init meu-app` gera app que roda com `calisto run`; `upgrade` idempotente
+- Estimativa: 1 semana
+
+### Fase K — deps (UX Bun, delegando ao Bundler)
+- [ ] `calisto add <gem>` / `calisto remove <gem>` — **wrapper fino** do `bundle add/remove` com o ruby da versão certa (decisão da Fase A: nada de instalador próprio)
+- [ ] `calisto lock` — `bundle lock`
+- Marco: `calisto add sinatra` num projeto → `calisto run` ativa sem passos manuais
+- Estimativa: 1 semana
 
 ## Riscos técnicos conhecidos
-- **Fork + ActiveRecord/threads**: conexões de DB herdadas no fork — problema nº 1
-  (resolvível, padrão conhecido do Zeus/Spring)
-- **Memória**: daemon com Chatwoot pré-carregado ≈ 500MB+ RSS
-- **Frontend do Chatwoot** (React/Vite): fora do escopo — o calisto é o backend
-- **Pin único 3.4.10**: apps com `.ruby-version` diferente pedem múltiplos rubies
-  no calisto (feature futura)
-- **Não fazer**: reimplementar Bundler, bundle de C exts no curto prazo, Windows
-  (fork)
 
-## Estado atual (2026-08-06)
-
-Feito: runtime pinado + daemon fork, `calisto build` stdlib-only, suíte própria
-+ 17 arquivos de teste do ruby/ruby v3_4_10 com paridade.
-**Fase A (gems) concluída**: `calisto run` ativa o Gemfile do cwd via
-`Bundler.setup` (semântica `bundle exec`; cold com `-rbundler/setup`), warn de
-`.ruby-version` divergente, preload stdlib desativado quando há Gemfile.
-Golden tests: `gemapp` (hermético) + `sinatraapp` (Sinatra+Puma HTTP).
-
-**Fase B (preload de app) concluída**: `calisto.toml` (`[run] preload =
-"entrypoint"`) → daemon dedicado por app (socket `apps/<hash>`) com boot
-congelado: bundler ativo + `load` do entrypoint no boot, fork por comando.
-Fork-safe: desconexão de conexões ActiveRecord pós-boot (reconnect lazy no
-child) + entrypoint registrado em `$LOADED_FEATURES` (sem isso, Rails re-roda
-`environment.rb` no child → initialize! duplo). `status`/`stop`/`doctor` na app.
-Marco medido com Rails 8.1 + sqlite3 real: `rails runner` 1º = 447ms (boot),
-2º = **44ms**, com query no DB = 85ms (alvo <500ms). Golden tests: `preloadapp`
-(boot 2s simulado, hermético) + `railsapp` (gated em bundle install).
-
-**Fase C (Rails mínimo) concluída**: `bin/rails server` (Puma) roda como child
-do fork do daemon da app — GET `/up` → 200 em **<500ms** do spawn (daemon
-quente: 138-372ms, incl. boot do Puma); `bin/rails console` (IRB) roda no
-contexto da app via stdin pipe. Golden tests em `test/app.rs` (gated em
-`bundle install` no `railsapp`): runner <500ms + SELECT 1 fork-safe, dev
-server 200 <500ms, console. O fixture `railsapp` (Rails 8.1 + sqlite3 + puma)
-é o degrau 3 da escada da Fase D.
-
-**Fase D, degrau 4 (Maybe Finance) concluído**: app open source real (Rails
-7.2.2 + Sidekiq 8 + Postgres + Redis, 74 gems) roda via calisto: boot 1º =
-1520ms, 2º comando = **127ms**, query no Postgres = 157ms (reconnect
-fork-safe). **Sidekiq roda como child do fork**: `CalistoProbeJob` enfileirado
-no Redis é processado pelo worker em ~900ms (threads + Redis + Rails bootado
-no child). Golden test `test/realapps.rs` gated em checkout do Maybe (gitignored)
-+ bundle install + docker compose (postgres:16/redis:7 nas portas 5433/6380,
-sobe sozinho quando há docker). Ajustes do fixture: pin ruby 3.4.10 no
-Gemfile.lock/.ruby-version, `active_job.queue_adapter = :sidekiq` (dev default
-é :async) via initializer do fixture, `bin/sidekiq` próprio (CLI do Sidekiq 8
-exige `-r <dir>`; no child o require é no-op via `$LOADED_FEATURES`).
-
-**Fase D, degrau 5 (Chatwoot) concluído**: maior app da escada (Rails 7.1.5 +
-~155 gems + pgvector + Sidekiq) roda via calisto: boot 1º = 2183ms, 2º
-comando = **105ms**, dev server = 154ms até responder. Golden test
-`test/realapps.rs` (gated em checkout + bundle + compose postgres:16/
-redis:7, portas 5434/6381): **login** (devise_token_auth POST /auth/sign_in →
-200), **conversas** (GET /api/v1/accounts/1/conversations autenticado → 200) e
-**ActionCable** (WebSocket handshake /cable → 101). **Bug real resolvido**: o
-`listen` gem (EventedFileUpdateChecker, inotify) no boot do daemon quebrava o
-2º fork (rc=1 silencioso — o child herdava watchers) → fixture usa
-`FileUpdateChecker` (sem watch; hot reload é Fase E). Outros ajustes do
-fixture: pin 3.4.10, scout_apm removido (não compila no 3.4.10), migration
-`Taggable::Cache`→`Caching`, imagem pgvector. **A escada da Fase D está
-completa** — do trivial ao Chatwoot, tudo vira fork do boot congelado.
-Próximo: **Fase E — produto Bun** (`calisto test`/`task`/`serve`, watch, .env).
+- **Memória**: daemon com Chatwoot pré-carregado ≈ 500MB+ RSS (preço do preload)
+- **Daemon single-connection**: com um child de longa duração rodando (server/sidekiq), o `wait_for` atual bloqueia novos RUNs — precisa do accept loop multi-conexão (select + waitpid WNOHANG) para o uso Bun real (server + comandos simultâneos)
+- **Watch/fork**: o listen (inotify) quebra o 2º fork (descoberto no Chatwoot) — watch da Fase E precisa de watcher fork-safe
+- **C exts no build**: limitação estrutural da Fase F
+- **Windows**: impossível (fork)
+- **Não fazer**: reimplementar Bundler, reimplementar o CRuby, bundle de C exts no curto prazo
