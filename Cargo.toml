@@ -37,6 +37,10 @@ path = "test/preload.rs"
 name = "build"
 path = "test/build.rs"
 
+[[test]]
+name = "ruby_upstream"
+path = "test/ruby_upstream.rs"
+
 [profile.release]
 lto = true
 strip = true

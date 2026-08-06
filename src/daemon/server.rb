@@ -184,9 +184,8 @@ def handle_run(io, reader, fields)
     setup_data(script) if File.file?(script)
     begin
       load script
-      exit 0
-    rescue SystemExit => e
-      exit(e.status)
+    rescue SystemExit
+      raise # propaga: o runtime usa o status e roda at_exit hooks UMA vez
     rescue Exception => e # rubocop:disable Lint/RescueException -- mimic `ruby script`
       daemon_path = File.expand_path(__FILE__)
       bt = e.backtrace || []
