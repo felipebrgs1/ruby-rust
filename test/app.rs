@@ -159,18 +159,9 @@ fn rails_runner_frozen_boot() {
     // congelado. Gated: exige `bundle install` previo no fixture (rede).
     let dir = runtime_dir("railsapp");
     let app = fixture("railsapp");
-    let vendor_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/current/bin");
-    let check = std::process::Command::new(vendor_bin.join("bundle"))
-        .env("PATH", format!("{}:{}", vendor_bin.display(), env!("PATH")))
-        .arg("check")
-        .current_dir(&app)
-        .output();
-    match check {
-        Ok(out) if out.status.success() => {}
-        _ => {
-            eprintln!("SKIP rails_runner_frozen_boot: rode `bundle install` em test/fixtures/railsapp");
-            return;
-        }
+    if !rails_bundle_installed(&app) {
+        eprintln!("SKIP rails_runner_frozen_boot: rode `bundle install` em test/fixtures/railsapp");
+        return;
     }
 
     let runner = ["run", "bin/rails", "runner", "puts \"RAILS_OK\""];
@@ -203,5 +194,134 @@ fn rails_runner_frozen_boot() {
     );
     assert!(db.status.success(), "{}", String::from_utf8_lossy(&db.stderr));
     assert_eq!(String::from_utf8_lossy(&db.stdout).trim(), "1");
+    stop_app(&dir, "railsapp");
+}
+
+/// Gems do fixture Rails instaladas? (bundle install com rede; senão skip).
+fn rails_bundle_installed(app: &Path) -> bool {
+    let vendor_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/current/bin");
+    std::process::Command::new(vendor_bin.join("bundle"))
+        .env("PATH", format!("{}:{}", vendor_bin.display(), env!("PATH")))
+        .arg("check")
+        .current_dir(app)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn rails_dev_server_serves_http() {
+    // Fase C: `bin/rails server` roda como child do fork do daemon da app;
+    // GET /up -> 200 com o app ja bootado (<500ms do spawn a resposta).
+    let dir = runtime_dir("railsserver");
+    let app = fixture("railsapp");
+    if !rails_bundle_installed(&app) {
+        eprintln!("SKIP rails_dev_server_serves_http: rode `bundle install` em test/fixtures/railsapp");
+        return;
+    }
+
+    // aquece o daemon da app (o boot em si ja e medido no runner test)
+    let warm = app_run(&dir, "railsapp", &["run", "bin/rails", "runner", "puts 1"], &[]);
+    assert!(warm.status.success(), "{}", String::from_utf8_lossy(&warm.stderr));
+
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let t0 = Instant::now();
+    let mut child = common::calisto(&dir)
+        .arg("run")
+        .arg("bin/rails")
+        .args(["server", "-p"])
+        .arg(port.to_string())
+        .args(["-b", "127.0.0.1"])
+        .current_dir(&app)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn rails server");
+
+    use std::io::{Read, Write};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let body = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(mut s) => {
+                s.write_all(b"GET /up HTTP/1.1\r\nHost: calisto.test\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                let mut resp = String::new();
+                s.read_to_string(&mut resp).unwrap();
+                break resp;
+            }
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("rails server nao subiu: {e}");
+            }
+        }
+    };
+    let ms = t0.elapsed().as_millis();
+    assert!(ms < 500, "server deve responder em <500ms (meta Fase C): {ms}ms");
+    assert!(
+        body.contains("200") && body.contains("green"),
+        "health /up deve responder 200 up: {body}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    stop_app(&dir, "railsapp");
+}
+
+#[test]
+fn rails_console_runs_in_app_context() {
+    // Fase C: console (IRB) roda no contexto da app pre-carregada via stdin.
+    let dir = runtime_dir("railsconsole");
+    let app = fixture("railsapp");
+    if !rails_bundle_installed(&app) {
+        eprintln!("SKIP rails_console_runs_in_app_context: rode `bundle install` em test/fixtures/railsapp");
+        return;
+    }
+
+    use std::io::{Read, Write};
+    let mut child = common::calisto(&dir)
+        .args(["run", "bin/rails", "console"])
+        .current_dir(&app)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn rails console");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"puts 1+1\nputs Rails.env\nexit\n")
+        .unwrap();
+    drop(child.stdin.take());
+
+    // le o stdout com timeout (console que nao sai = fail, nao pendura)
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        stdout.read_to_string(&mut out).unwrap();
+        tx.send(out).unwrap();
+    });
+    let out = match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(o) => o,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("console nao terminou em 20s");
+        }
+    };
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    assert!(
+        out.contains("\n2\n") && out.contains("development"),
+        "console deve rodar no contexto da app: {out}"
+    );
     stop_app(&dir, "railsapp");
 }

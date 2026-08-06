@@ -5,8 +5,9 @@
 Calisto is a Bun-like runtime for **Ruby**: a single Rust binary that embeds and manages a pinned CRuby 3.4.10, gives it near-instant startup via a warm fork-based daemon, and can bundle stdlib-only apps into a single self-contained file. No third-party gems — stdlib only, by design. Linux-only (relies on `fork`).
 
 Status: Fases 1-2 (runtime + fast startup, bundler stdlib-only), Fase A (gems via
-Bundler) e Fase B (preload de app — boot congelado via calisto.toml) do
-ROADMAP.md done. Next: Fase C — Rails mínimo end-to-end (rails new + dev server).
+Bundler), Fase B (preload de app) e Fase C (Rails mínimo: dev server + console)
+do ROADMAP.md done. Next: Fase D — escada de apps reais (golden tests), com
+degrau 4 (app com Sidekiq) e Chatwoot.
 Phases posteriores: `test` runner, `task` runner, HTTP `serve`, `sqlite`,
 `tooling` (watch/.env) — scaffolds já existem como crates vazios.
 
@@ -113,6 +114,6 @@ Coverage contract:
 - `build.rs` — bundle parity with original sources (renames the source tree away to prove self-contained), `DATA` emulation, `__FILE__`/`__dir__` preservation, stdlib delegation, bundle under `calisto run`.
 - `ruby_upstream.rs` — **parity contract**: each of the 17 upstream ruby/ruby (tag v3_4_10) runtime tests must produce the same test-unit summary (tests/failures/errors) and exit code as plain `ruby -I tool/lib -I test/lib`. Uses `--seed=1` + filter `-n '!/memory_leak/'` (upstream tests have implicit `require` deps and RSS-based tests that are flaky even on pure ruby), and retries against environment flakiness. Always run upstream tests with `--preload 0`.
 - `bundler.rs` — **Fase A (Gemfile activation)**: fixture `gemapp` (5 default/bundled gems, `Gemfile.lock` commitado → hermético, sem rede nem `bundle install`) prova ativação via `$LOAD_PATH`; `cold_and_warm_agree` com bundle; Gemfile com gem faltando falha como `bundle exec` (GemNotFound, script não roda); `BUNDLE_GEMFILE` env é honrado; `.ruby-version` divergente → warning (exit 0) vs 3.4.10 → silêncio; golden Sinatra HTTP **gated** em `bundle install` prévio no fixture (`test/fixtures/sinatraapp`) — skipa com aviso se as gems não estiverem instaladas.
-- `app.rs` — **Fase B (preload de app)**: fixture `preloadapp` (boot simulado 2s + contador, hermético) prova que o boot roda UMA vez no daemon e o 2º `run` <500ms; daemon da app isolado do genérico; `calisto.toml` inválido (entrypoint inexistente/sintaxe) → erro claro apontando o problema; golden Rails **gated** (`test/fixtures/railsapp`, Rails 8 + sqlite3): `bin/rails runner` 2º run <500ms e query `SELECT 1` reconecta no child (fork-safe).
+- `app.rs` — **Fase B (preload de app)**: fixture `preloadapp` (boot simulado 2s + contador, hermético) prova que o boot roda UMA vez no daemon e o 2º `run` <500ms; daemon da app isolado do genérico; `calisto.toml` inválido (entrypoint inexistente/sintaxe) → erro claro apontando o problema; golden Rails **gated** (`test/fixtures/railsapp`, Rails 8 + sqlite3): `bin/rails runner` 2º run <500ms e query `SELECT 1` reconecta no child (fork-safe). **Fase C (Rails mínimo)**: `bin/rails server` responde GET `/up` → 200 em <500ms do spawn (servidor roda como child do fork; o cliente killado derruba o Puma via client-death kill) e `bin/rails console` roda IRB no contexto da app via stdin pipe.
 
 QA rule of thumb: for any change to `run` semantics, the acceptance test is `cold_and_warm_agree` plus the upstream parity harness — if pure `ruby` and calisto diverge, it's a bug in calisto.

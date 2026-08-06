@@ -112,4 +112,14 @@ child) + entrypoint registrado em `$LOADED_FEATURES` (sem isso, Rails re-roda
 Marco medido com Rails 8.1 + sqlite3 real: `rails runner` 1º = 447ms (boot),
 2º = **44ms**, com query no DB = 85ms (alvo <500ms). Golden tests: `preloadapp`
 (boot 2s simulado, hermético) + `railsapp` (gated em bundle install).
-Próximo: **Fase C** — Rails mínimo end-to-end (`rails new` + dev server + console).
+
+**Fase C (Rails mínimo) concluída**: `bin/rails server` (Puma) roda como child
+do fork do daemon da app — GET `/up` → 200 em **<500ms** do spawn (daemon
+quente: 138-372ms, incl. boot do Puma); `bin/rails console` (IRB) roda no
+contexto da app via stdin pipe. Golden tests em `test/app.rs` (gated em
+`bundle install` no `railsapp`): runner <500ms + SELECT 1 fork-safe, dev
+server 200 <500ms, console. O fixture `railsapp` (Rails 8.1 + sqlite3 + puma)
+é o degrau 3 da escada da Fase D.
+Próximo: **Fase D** — escada de apps reais: degrau 4 (app média com Sidekiq:
+fork-safe com jobs + threads) e degrau 5 (Chatwoot: boot + login + conversas +
+ActionCable com Postgres/Redis via docker).
