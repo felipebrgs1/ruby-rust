@@ -183,6 +183,11 @@ def handle_run(io, reader, fields)
     ARGV.replace(args)
     setup_data(script) if File.file?(script)
     begin
+      # Ativa o Gemfile do cwd (walk up, como `bundle exec`): fora de bundle e
+      # no-op, entao rodar sem Gemfile continua identico a `ruby <script>`.
+      # Nao da para usar RUBYOPT=-rbundler/setup aqui: RUBYOPT so e lido no
+      # boot do interpretador, e um child de fork nao re-boota.
+      require "bundler/setup"
       load script
     rescue SystemExit
       raise # propaga: o runtime usa o status e roda at_exit hooks UMA vez

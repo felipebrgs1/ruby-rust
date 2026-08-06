@@ -1,0 +1,11 @@
+# frozen_string_literal: true
+
+# Golden test da Fase A: app Sinatra servindo HTTP via `calisto run`.
+# Requer `bundle install` previo (rede) — o teste de integracao skipa sem ele.
+
+source "https://rubygems.org"
+
+gem "sinatra"
+
+gem "rackup", "~> 2.3"
+gem "puma", "~> 8.0"

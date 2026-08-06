@@ -95,6 +95,14 @@ como a suíte upstream de hoje (`test/ruby_upstream.rs`).
   (fork)
 
 ## Estado atual (2026-08-06)
+
 Feito: runtime pinado + daemon fork (startup 3-4×), `calisto build` stdlib-only,
-suíte própria (32 testes) + 17 arquivos de teste do ruby/ruby v3_4_10 com paridade.
-Próximo: **Fase A**.
+suíte própria + 17 arquivos de teste do ruby/ruby v3_4_10 com paridade.
+**Fase A (gems) concluída**: `calisto run` ativa o Gemfile do cwd via
+`Bundler.setup` (semântica `bundle exec`; cold com `-rbundler/setup`), warn de
+`.ruby-version` divergente, preload stdlib desativado quando há Gemfile
+(conflito default-gem versão diferente, ex. base64 0.2→0.3 do Sinatra 4).
+Golden tests: `test/fixtures/gemapp` (5 gems default/bundled, hermético, lock
+commitado) + `test/fixtures/sinatraapp` (Sinatra+Puma servindo HTTP via
+`calisto run` + curl; gated em `bundle install` prévio).
+Próximo: **Fase B** (preload de app — boot congelado + fork-safe).

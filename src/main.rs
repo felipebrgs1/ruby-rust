@@ -16,6 +16,7 @@ const DEFAULT_PRELOAD: &str = concat!(
     "net/http,ostruct,set,csv,stringio,logger,socket"
 );
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const PINNED_RUBY: &str = "3.4.10";
 
 // ---- raw sendmsg with SCM_RIGHTS (fd passing over unix sockets) ---------------
 // Enough Linux x86_64/aarch64 ABI: msghdr + cmsg laid out by hand, no libc dep.
@@ -325,11 +326,19 @@ fn cmd_run(args: &[String]) -> i32 {
         return 1;
     }
 
+    check_ruby_version();
+
     let ruby = ruby_path();
     let preload = match &preload_opt {
         Some(v) => normalize_preload(v),
-        None => env::var("CALISTO_PRELOAD")
-            .map_or_else(|_| DEFAULT_PRELOAD.to_string(), |v| normalize_preload(&v)),
+        None => {
+            if has_gemfile() {
+                String::new() // Gemfile: bundler ativa as gems; preload colidiria
+            } else {
+                env::var("CALISTO_PRELOAD")
+                    .map_or_else(|_| DEFAULT_PRELOAD.to_string(), |v| normalize_preload(&v))
+            }
+        }
     };
 
     let t0 = Instant::now();
@@ -352,8 +361,56 @@ fn normalize_preload(v: &str) -> String {
     }
 }
 
+/// Sobe do cwd ate a raiz procurando um arquivo (mesma busca do Bundler).
+fn find_in_parents(name: &str) -> Option<PathBuf> {
+    let cwd = env::current_dir().ok()?;
+    let mut dir: Option<&Path> = Some(cwd.as_path());
+    while let Some(d) = dir {
+        let cand = d.join(name);
+        if cand.is_file() {
+            return Some(cand);
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Um Gemfile no cwd (ou BUNDLE_GEMFILE) significa que o Bundler.setup do
+/// child vai ativar as gems do app — preload de stdlib nao pode coexistir:
+/// se o Gemfile pina uma default gem ja preloaded (ex.: base64 0.2 vs 0.3 do
+/// Sinatra 4), o Bundler aborta com "already activated". Com Gemfile, o
+/// preload fica vazio e o bundler ativa o necessario (interpretador "fresco",
+/// como o `bundle exec`).
+fn has_gemfile() -> bool {
+    if env::var_os("BUNDLE_GEMFILE").is_some() {
+        return true;
+    }
+    find_in_parents("Gemfile").is_some() || find_in_parents("gems.rb").is_some()
+}
+
+/// Warn (sem abortar) se um `.ruby-version` encontrado subindo do cwd divergir
+/// do pin unico do calisto. Mesma busca do Bundler/rbenv: cwd -> pais.
+fn check_ruby_version() {
+    let Some(file) = find_in_parents(".ruby-version") else { return };
+    if let Ok(content) = fs::read_to_string(file) {
+        let want = content.lines().next().unwrap_or("").trim();
+        let want = want.strip_prefix("ruby-").unwrap_or(want).trim();
+        if !want.is_empty() && want != PINNED_RUBY {
+            eprintln!(
+                "calisto: warning: .ruby-version pede {want}, mas o calisto usa o pin unico {PINNED_RUBY}"
+            );
+        }
+    }
+}
+
 fn run_cold(ruby: &Path, script: &str, args: &[String]) -> i32 {
-    match Command::new(ruby).arg(script).args(args).status() {
+    // -rbundler/setup: ativa o Gemfile do cwd (como `bundle exec ruby`);
+    // no-op fora de bundle, mantendo a paridade com o daemon warm.
+    match Command::new(ruby)
+        .arg("-rbundler/setup")
+        .arg(script)
+        .args(args)
+        .status() {
         Ok(st) => exit_code(st),
         Err(e) => {
             eprintln!("calisto: cannot execute {}: {e}", ruby.display());
@@ -546,6 +603,8 @@ USAGE:
           directly for baseline comparison.
           --preload LIST overrides the stdlib the daemon preloads (\"0\" disables;
           default: {DEFAULT_PRELOAD}).
+          A Gemfile do diretorio atual (buscando para cima) e ativada como em
+          `bundle exec ruby`; instale as gems com `bundle install` normal.
   build   empacota <app.rb> e seus requires (arquivos do projeto, stdlib-only)
           num arquivo unico self-contained. Arquivos fora da raiz (stdlib)
           nao sao embutidos. --root define a raiz do projeto (default: o
@@ -559,7 +618,8 @@ CONFIG:
   CALISTO_PRELOAD     comma-separated stdlib preload list
   CALISTO_RUNTIME_DIR daemon socket/pid location (default: $XDG_RUNTIME_DIR/calisto)
 
-NOTE: calisto run is equivalent to `ruby <script>` with no VM flags (-e/-E/...).
+NOTE: calisto run is equivalent to `bundle exec ruby <script>` with no VM flags
+(-e/-E/...); fora de Gemfile, identico a `ruby <script>`.
 Linux only (fork)."
     );
 }

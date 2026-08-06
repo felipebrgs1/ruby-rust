@@ -1,0 +1,34 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    cgi (0.4.2)
+    csv (3.3.2)
+    date (3.4.1)
+    erb (4.0.4.1)
+      cgi (>= 0.3.3)
+    minitest (5.25.4)
+    power_assert (2.0.5)
+    psych (5.2.2)
+      date
+      stringio
+    rake (13.2.1)
+    rdoc (6.14.0)
+      erb
+      psych (>= 4.0.0)
+    stringio (3.1.2)
+    test-unit (3.6.7)
+      power_assert
+
+PLATFORMS
+  ruby
+  x86_64-linux
+
+DEPENDENCIES
+  csv
+  minitest
+  rake
+  rdoc
+  test-unit
+
+BUNDLED WITH
+   2.6.9

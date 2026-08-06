@@ -1,0 +1,13 @@
+# frozen_string_literal: true
+
+# Fase A: 5 gems resolviveis offline — todas default/bundled gems do pin
+# 3.4.10 (vivem no GEM_HOME do vendor build, sem rede e sem bundle install).
+# O lock fixa as versoes para o golden test ser deterministico.
+
+source "https://rubygems.org"
+
+gem "minitest"
+gem "test-unit"
+gem "rake"
+gem "rdoc"
+gem "csv"
