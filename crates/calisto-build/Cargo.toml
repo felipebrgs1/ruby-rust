@@ -1,0 +1,8 @@
+[package]
+name = "calisto-build"
+version = "0.1.0"
+edition = "2021"
+description = "calisto build: empacota apps Ruby stdlib-only num arquivo unico"
+
+[lib]
+path = "src/lib.rs"

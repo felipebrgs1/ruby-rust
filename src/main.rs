@@ -109,6 +109,7 @@ fn main() {
     let argv: Vec<String> = env::args().skip(1).collect();
     let code = match argv.first().map(String::as_str) {
         Some("run") => cmd_run(&argv[1..]),
+        Some("build") => cmd_build(&argv[1..]),
         Some("status") => cmd_status(),
         Some("stop") => cmd_stop(),
         Some("doctor") => cmd_doctor(),
@@ -412,6 +413,75 @@ fn exit_code(st: ExitStatus) -> i32 {
     st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0))
 }
 
+fn cmd_build(args: &[String]) -> i32 {
+    let mut out = PathBuf::from("bundle.rb");
+    let mut root: Option<PathBuf> = None;
+    let mut entry: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--out" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => out = PathBuf::from(v),
+                    None => {
+                        eprintln!("calisto: -o precisa de um valor");
+                        return 1;
+                    }
+                }
+            }
+            "--root" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => root = Some(PathBuf::from(v)),
+                    None => {
+                        eprintln!("calisto: --root precisa de um valor");
+                        return 1;
+                    }
+                }
+            }
+            s if s.starts_with('-') => {
+                eprintln!("calisto: flag desconhecida '{s}'");
+                return 1;
+            }
+            s => {
+                if entry.is_none() {
+                    entry = Some(PathBuf::from(s));
+                } else {
+                    eprintln!("calisto: argumento inesperado '{s}'");
+                    return 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    let Some(entry) = entry else {
+        eprintln!("calisto: build precisa de um entrypoint: calisto build app.rb [-o out.rb]");
+        return 1;
+    };
+    if !entry.is_file() {
+        eprintln!("calisto: cannot open {}: no such file", entry.display());
+        return 1;
+    }
+    let root = root.unwrap_or_else(|| {
+        entry
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+    let ruby = ruby_path();
+    match calisto_build::bundle(&ruby, &entry, &out, &root) {
+        Ok(stats) => {
+            println!("calisto: bundled {} arquivo(s) -> {}", stats.files, out.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("calisto build: {e}");
+            1
+        }
+    }
+}
+
 fn cmd_status() -> i32 {
     let dir = runtime_dir();
     match daemon_connect() {
@@ -419,7 +489,7 @@ fn cmd_status() -> i32 {
             let ok = send_cmd(&mut s, "PING", &[]).is_ok()
                 && read_line(&mut s).map(|l| l == "OK").unwrap_or(false);
             if ok {
-                let pid = fs::read_to_string(dir.join("daemon.pid")).unwrap_or_default();
+                let pid = fs::read_to_string(dir.join("calisto.pid")).unwrap_or_default();
                 println!("daemon: running (pid {})", pid.trim());
             } else {
                 println!("daemon: socket present but unresponsive (stale)");
@@ -468,6 +538,7 @@ fn print_help() {
 
 USAGE:
   calisto run [--cold] [--time] [--preload LIST] <script.rb> [args...]
+  calisto build <app.rb> [-o out.rb] [--root DIR]
   calisto status | stop | doctor | help
 
   run     executes <script.rb> on the pinned CRuby. Default: warm daemon that
@@ -475,6 +546,10 @@ USAGE:
           directly for baseline comparison.
           --preload LIST overrides the stdlib the daemon preloads (\"0\" disables;
           default: {DEFAULT_PRELOAD}).
+  build   empacota <app.rb> e seus requires (arquivos do projeto, stdlib-only)
+          num arquivo unico self-contained. Arquivos fora da raiz (stdlib)
+          nao sao embutidos. --root define a raiz do projeto (default: o
+          diretorio do entrypoint).
   status  shows whether the warm daemon is running
   stop    stops the warm daemon
   doctor  prints environment, pinned ruby version and daemon state
