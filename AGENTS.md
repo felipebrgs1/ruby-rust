@@ -4,8 +4,9 @@
 
 Calisto is a Bun-like runtime for **Ruby**: a single Rust binary that embeds and manages a pinned CRuby 3.4.10, gives it near-instant startup via a warm fork-based daemon, and can bundle stdlib-only apps into a single self-contained file. No third-party gems — stdlib only, by design. Linux-only (relies on `fork`).
 
-Status: Fases 1-2 (runtime + fast startup, bundler stdlib-only) e Fase A do
-ROADMAP.md (gems via Bundler) done. Next: Fase B — preload de app (boot congelado).
+Status: Fases 1-2 (runtime + fast startup, bundler stdlib-only), Fase A (gems via
+Bundler) e Fase B (preload de app — boot congelado via calisto.toml) do
+ROADMAP.md done. Next: Fase C — Rails mínimo end-to-end (rails new + dev server).
 Phases posteriores: `test` runner, `task` runner, HTTP `serve`, `sqlite`,
 `tooling` (watch/.env) — scaffolds já existem como crates vazios.
 
@@ -25,6 +26,8 @@ src/main.rs (Rust CLI, zero deps)
 
 Fase A: `calisto run` ativa Gemfile via Bundler com semântica de `bundle exec` — o child (fork) faz `require "bundler/setup"` (RUBYOPT não funciona: só é lido no boot do interpretador) e o cold mode passa `-rbundler/setup`. Sem instalador próprio: gems instalam com `bundle install` normal. `.ruby-version` divergente do pin → warning sem abortar. **Gemfile presente (walk-up do cwd, ou `BUNDLE_GEMFILE`) desativa o preload stdlib** — preload + bundle colidiriam se o Gemfile pinar default gems em versões diferentes (ex.: base64 0.2 do pin vs 0.3 que o Sinatra 4 exige → `Gem::LoadError "already activated"`); sem preload, o `Bundler.setup` ativa o bundle num interpretador "fresco", como o `bundle exec`.
 
+Fase B (preload de app): `calisto.toml` na raiz da app (walk-up do cwd) com `[run] preload = "entrypoint"` faz o `run` usar um **daemon dedicado da app** (socket em `<runtime>/apps/<fnv1a(app_root+preload)>`, como Spring/Zeus). O daemon da app boota com `-rbundler/setup` + cwd na raiz da app e `load`a o entrypoint no boot (preload stdlib vazio); cada RUN é fork do boot congelado. Fork-safe: conexões ActiveRecord são desconectadas após o boot (o child reconecta lazy) e o entrypoint é registrado em `$LOADED_FEATURES` — `load` não registra, e sem isso o Rails re-roda `config/environment.rb` no child via `require_environment!` (initialize! duplo → "Application has been already initialized"). Daemon stale após editar o entrypoint: `calisto stop` na app (hot reload é Fase E). `status`/`stop`/`doctor` operam no daemon da app quando o cwd está numa app.
+
 **Wire protocol** (RESP-style over unix socket): `"<OP> <n>\r\n"` then n fields `"$<len>\r\n<data>"`. Commands: `PING` → `OK`, `STOP` → `BYE`, `RUN` → `STATUS <code>`. Fields are base64 (hand-rolled encoder, no crates).
 
 **`calisto build` flow**: `build.rb` parses static `require`/`require_relative` with Ripper (the real lexer), BFS-collects project files under the root, emits a bundle where each file is evaluated via `eval(code, TOPLEVEL_BINDING, original_path, 1)` (preserves `__FILE__`/`__dir__`/`require_relative`) and a loader monkey-patches `Kernel#require`/`require_relative` against an index. Files outside the root (stdlib like `json`) are NOT bundled — delegated to real `require`.
@@ -36,7 +39,7 @@ Fase A: `calisto run` ativa Gemfile via Bundler com semântica de `bundle exec` 
 | `src/` | Rust CLI (`main.rs`) + embedded Ruby daemon (`daemon/server.rb`) |
 | `crates/calisto-build/` | First real workspace crate: `src/lib.rs` (spawns bundler) + `src/build.rb` (Ripper bundler, embedded) |
 | `crates/calisto-{test,task,serve,sqlite,tooling,cli,runtime}/` | Planned modules, only `.gitkeep` — do not implement until they get a `Cargo.toml` |
-| `test/` | Integration suite (`common/mod.rs` harness, `cli.rs`, `stdio.rs`, `daemon.rs`, `preload.rs`, `build.rs`, `ruby_upstream.rs`, `bundler.rs`), `fixtures/` (inclui `gemapp/` e `sinatraapp/` da Fase A), `vendor/ruby/` (upstream ruby/ruby tests) |
+| `test/` | Integration suite (`common/mod.rs` harness, `cli.rs`, `stdio.rs`, `daemon.rs`, `preload.rs`, `build.rs`, `ruby_upstream.rs`, `bundler.rs`, `app.rs`), `fixtures/` (inclui `gemapp/`, `sinatraapp/` da Fase A e `preloadapp/`, `railsapp/` da Fase B), `vendor/ruby/` (upstream ruby/ruby tests) |
 | `scripts/` | `build-ruby.sh` — builds the pinned CRuby |
 | `examples/` | `hello.rb` (preload smoke), `bench.rb` (stdlib workload for `--time`) |
 | `vendor/` | Pinned CRuby install + sources. **Gitignored** — never commit; reproduce with `scripts/build-ruby.sh` |
@@ -110,5 +113,6 @@ Coverage contract:
 - `build.rs` — bundle parity with original sources (renames the source tree away to prove self-contained), `DATA` emulation, `__FILE__`/`__dir__` preservation, stdlib delegation, bundle under `calisto run`.
 - `ruby_upstream.rs` — **parity contract**: each of the 17 upstream ruby/ruby (tag v3_4_10) runtime tests must produce the same test-unit summary (tests/failures/errors) and exit code as plain `ruby -I tool/lib -I test/lib`. Uses `--seed=1` + filter `-n '!/memory_leak/'` (upstream tests have implicit `require` deps and RSS-based tests that are flaky even on pure ruby), and retries against environment flakiness. Always run upstream tests with `--preload 0`.
 - `bundler.rs` — **Fase A (Gemfile activation)**: fixture `gemapp` (5 default/bundled gems, `Gemfile.lock` commitado → hermético, sem rede nem `bundle install`) prova ativação via `$LOAD_PATH`; `cold_and_warm_agree` com bundle; Gemfile com gem faltando falha como `bundle exec` (GemNotFound, script não roda); `BUNDLE_GEMFILE` env é honrado; `.ruby-version` divergente → warning (exit 0) vs 3.4.10 → silêncio; golden Sinatra HTTP **gated** em `bundle install` prévio no fixture (`test/fixtures/sinatraapp`) — skipa com aviso se as gems não estiverem instaladas.
+- `app.rs` — **Fase B (preload de app)**: fixture `preloadapp` (boot simulado 2s + contador, hermético) prova que o boot roda UMA vez no daemon e o 2º `run` <500ms; daemon da app isolado do genérico; `calisto.toml` inválido (entrypoint inexistente/sintaxe) → erro claro apontando o problema; golden Rails **gated** (`test/fixtures/railsapp`, Rails 8 + sqlite3): `bin/rails runner` 2º run <500ms e query `SELECT 1` reconecta no child (fork-safe).
 
 QA rule of thumb: for any change to `run` semantics, the acceptance test is `cold_and_warm_agree` plus the upstream parity harness — if pure `ruby` and calisto diverge, it's a bug in calisto.

@@ -1,0 +1,11 @@
+# fixture Rails — artefatos gerados em runtime/install (nunca commitar)
+/log/*
+!/log/.keep
+/tmp/*
+!/tmp/.keep
+/storage/*
+!/storage/.keep
+/config/master.key
+/db/*.sqlite3*
+.bundle/
+vendor/bundle/

@@ -37,6 +37,35 @@ preload.each do |name|
   end
 end
 
+# ---- boot: app preload (Fase B) ----------------------------------------------
+# Com calisto.toml o daemon e o daemon DA APP: o entrypoint (ex.:
+# config/environment.rb) e carregado aqui no boot, com o Gemfile da app ativo
+# (o cliente spawna com `-rbundler/setup` e cwd na raiz da app). Cada RUN e um
+# fork deste boot congelado — por isso e que um comando Rails cai de ~2s para
+# centenas de ms. Conexoes de DB abertas pelo boot sao desconectadas em
+# seguida (padrao Zeus/Spring): o fork nao herda sockets do banco, e o child
+# reconecta lazy no primeiro uso.
+APP_PRELOAD = ENV["CALISTO_APP_PRELOAD"]
+if APP_PRELOAD
+  begin
+    load APP_PRELOAD
+  rescue SystemExit
+    raise
+  rescue Exception => e # rubocop:disable Lint/RescueException -- boot da app
+    warn "calisto: app preload falhou (#{APP_PRELOAD}): #{e.class}: #{e.message}"
+    warn(e.backtrace.first(8).join("\n")) if e.backtrace
+    exit 1
+  end
+  if defined?(ActiveRecord::Base) && ActiveRecord::Base.respond_to?(:connection_handler)
+    ActiveRecord::Base.connection_handler.clear_all_connections!
+  end
+  # `load` nao registra em $LOADED_FEATURES. No child, o Rails re-roda o boot
+  # via require_environment! (`require config/environment`) — sem este registro
+  # ele executaria environment.rb de novo e o initialize! duplo aborta com
+  # "Application has been already initialized".
+  $LOADED_FEATURES << File.expand_path(APP_PRELOAD)
+end
+
 # ---- boot: bind --------------------------------------------------------------
 def live?
   UNIXSocket.new(SOCKET).close

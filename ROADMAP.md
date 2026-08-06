@@ -96,13 +96,20 @@ como a suíte upstream de hoje (`test/ruby_upstream.rs`).
 
 ## Estado atual (2026-08-06)
 
-Feito: runtime pinado + daemon fork (startup 3-4×), `calisto build` stdlib-only,
-suíte própria + 17 arquivos de teste do ruby/ruby v3_4_10 com paridade.
+Feito: runtime pinado + daemon fork, `calisto build` stdlib-only, suíte própria
++ 17 arquivos de teste do ruby/ruby v3_4_10 com paridade.
 **Fase A (gems) concluída**: `calisto run` ativa o Gemfile do cwd via
 `Bundler.setup` (semântica `bundle exec`; cold com `-rbundler/setup`), warn de
-`.ruby-version` divergente, preload stdlib desativado quando há Gemfile
-(conflito default-gem versão diferente, ex. base64 0.2→0.3 do Sinatra 4).
-Golden tests: `test/fixtures/gemapp` (5 gems default/bundled, hermético, lock
-commitado) + `test/fixtures/sinatraapp` (Sinatra+Puma servindo HTTP via
-`calisto run` + curl; gated em `bundle install` prévio).
-Próximo: **Fase B** (preload de app — boot congelado + fork-safe).
+`.ruby-version` divergente, preload stdlib desativado quando há Gemfile.
+Golden tests: `gemapp` (hermético) + `sinatraapp` (Sinatra+Puma HTTP).
+
+**Fase B (preload de app) concluída**: `calisto.toml` (`[run] preload =
+"entrypoint"`) → daemon dedicado por app (socket `apps/<hash>`) com boot
+congelado: bundler ativo + `load` do entrypoint no boot, fork por comando.
+Fork-safe: desconexão de conexões ActiveRecord pós-boot (reconnect lazy no
+child) + entrypoint registrado em `$LOADED_FEATURES` (sem isso, Rails re-roda
+`environment.rb` no child → initialize! duplo). `status`/`stop`/`doctor` na app.
+Marco medido com Rails 8.1 + sqlite3 real: `rails runner` 1º = 447ms (boot),
+2º = **44ms**, com query no DB = 85ms (alvo <500ms). Golden tests: `preloadapp`
+(boot 2s simulado, hermético) + `railsapp` (gated em bundle install).
+Próximo: **Fase C** — Rails mínimo end-to-end (`rails new` + dev server + console).

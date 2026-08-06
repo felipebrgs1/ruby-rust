@@ -45,6 +45,10 @@ path = "test/ruby_upstream.rs"
 name = "bundler"
 path = "test/bundler.rs"
 
+[[test]]
+name = "app"
+path = "test/app.rs"
+
 [profile.release]
 lto = true
 strip = true

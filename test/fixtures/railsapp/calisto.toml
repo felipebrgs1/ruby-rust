@@ -1,0 +1,5 @@
+# calisto.toml — Fase B: preload do boot Rails no daemon.
+# `calisto run bin/rails ...` vira um fork do boot congelado.
+
+[run]
+preload = "config/environment.rb"

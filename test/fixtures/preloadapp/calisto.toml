@@ -1,0 +1,6 @@
+# calisto.toml — configuracao por app (Fase B).
+# O daemon vira o daemon da app e pre-carrega este entrypoint no boot:
+# cada `calisto run` e um fork do boot congelado.
+
+[run]
+preload = "config/environment.rb"
