@@ -29,8 +29,8 @@ LIBYAML_URL="https://github.com/yaml/libyaml/releases/download/${LIBYAML_VERSION
 PREFIX="$VENDOR/ruby-$RUBY_VERSION"
 mkdir -p "$SRC"
 
-log() { printf '\033[1;34m[rbun]\033[0m %s\n' "$*"; }
-fail() { printf '\033[1;31m[rbun]\033[0m error: %s\n' "$*" >&2; exit 1; }
+log() { printf '\033[1;34m[calisto]\033[0m %s\n' "$*"; }
+fail() { printf '\033[1;31m[calisto]\033[0m error: %s\n' "$*" >&2; exit 1; }
 
 # --- downloads (idempotent; verifies sha256) ---------------------------------
 fetch() { # url, file, sha256

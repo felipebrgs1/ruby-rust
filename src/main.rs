@@ -49,6 +49,19 @@ const SCM_RIGHTS: i32 = 1;
 
 unsafe extern "C" {
     fn sendmsg(fd: i32, msg: *const MsgHdr, flags: i32) -> isize;
+    fn signal(signum: i32, handler: usize) -> usize;
+}
+
+const SIGPIPE: i32 = 13;
+const SIG_DFL: usize = 0;
+
+/// Comportamento Unix padrao: morrer silenciosamente com SIGPIPE quando o
+/// consumidor fecha o pipe (ex.: `calisto doctor | head`), em vez de panicar
+/// com EPIPE (Rust ignora SIGPIPE por padrao).
+fn reset_sigpipe() {
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
 }
 
 fn align8(n: usize) -> usize {
@@ -92,6 +105,7 @@ fn send_with_fds(stream: &mut UnixStream, data: &[u8], fds: &[RawFd]) -> io::Res
 }
 
 fn main() {
+    reset_sigpipe();
     let argv: Vec<String> = env::args().skip(1).collect();
     let code = match argv.first().map(String::as_str) {
         Some("run") => cmd_run(&argv[1..]),
@@ -103,7 +117,7 @@ fn main() {
             0
         }
         Some(other) => {
-            eprintln!("rbun: unknown command '{other}'");
+            eprintln!("calisto: unknown command '{other}'");
             print_help();
             1
         }
@@ -152,24 +166,29 @@ fn uid() -> u32 {
 }
 
 fn runtime_dir() -> PathBuf {
+    if let Ok(d) = env::var("CALISTO_RUNTIME_DIR") {
+        let d = PathBuf::from(d);
+        fs::create_dir_all(&d).ok();
+        return d;
+    }
     if let Ok(x) = env::var("XDG_RUNTIME_DIR") {
-        let d = PathBuf::from(x).join("rbun");
+        let d = PathBuf::from(x).join("calisto");
         if fs::create_dir_all(&d).is_ok() {
             return d;
         }
     }
-    let d = PathBuf::from(format!("/tmp/rbun-{}", uid()));
+    let d = PathBuf::from(format!("/tmp/calisto-{}", uid()));
     fs::create_dir_all(&d).ok();
     d
 }
 
 fn ruby_path() -> PathBuf {
-    if let Ok(p) = env::var("RBUN_RUBY") {
+    if let Ok(p) = env::var("CALISTO_RUBY") {
         let pb = PathBuf::from(&p);
         if pb.is_file() {
             return pb;
         }
-        eprintln!("rbun: warning: RBUN_RUBY={p} is not a file; ignoring");
+        eprintln!("calisto: warning: CALISTO_RUBY={p} is not a file; ignoring");
     }
     if let Ok(exe) = env::current_exe() {
         let mut dir = exe.parent().map(Path::to_path_buf);
@@ -185,7 +204,7 @@ fn ruby_path() -> PathBuf {
     if rel.is_file() {
         return rel;
     }
-    eprintln!("rbun: warning: no pinned ruby found (run scripts/build-ruby.sh); falling back to PATH");
+    eprintln!("calisto: warning: no pinned ruby found (run scripts/build-ruby.sh); falling back to PATH");
     PathBuf::from("ruby")
 }
 
@@ -228,22 +247,22 @@ fn read_line(stream: &mut UnixStream) -> io::Result<String> {
 }
 
 fn daemon_connect() -> Option<UnixStream> {
-    UnixStream::connect(runtime_dir().join("daemon.sock")).ok()
+    UnixStream::connect(runtime_dir().join("calisto.sock")).ok()
 }
 
 fn connect_or_spawn_daemon(ruby: &Path, preload: &str) -> Result<UnixStream, String> {
     let dir = runtime_dir();
-    let sock = dir.join("daemon.sock");
+    let sock = dir.join("calisto.sock");
     if let Ok(s) = UnixStream::connect(&sock) {
         return Ok(s);
     }
-    let rb = dir.join("daemon.rb");
+    let rb = dir.join("calisto.rb");
     fs::write(&rb, DAEMON_RB).map_err(|e| format!("cannot write daemon script: {e}"))?;
     let mut child = Command::new(ruby)
         .arg(&rb)
-        .env("RBUN_SOCKET", &sock)
-        .env("RBUN_PIDFILE", dir.join("daemon.pid"))
-        .env("RBUN_PRELOAD", preload)
+        .env("CALISTO_SOCKET", &sock)
+        .env("CALISTO_PIDFILE", dir.join("calisto.pid"))
+        .env("CALISTO_PRELOAD", preload)
         .stdin(Stdio::null())
         .spawn()
         .map_err(|e| format!("cannot start daemon with {}: {e}", rb.display()))?;
@@ -281,13 +300,13 @@ fn cmd_run(args: &[String]) -> i32 {
                 match args.get(i) {
                     Some(v) => preload_opt = Some(v.clone()),
                     None => {
-                        eprintln!("rbun: --preload needs a value");
+                        eprintln!("calisto: --preload needs a value");
                         return 1;
                     }
                 }
             }
             other => {
-                eprintln!("rbun: unknown flag '{other}'");
+                eprintln!("calisto: unknown flag '{other}'");
                 return 1;
             }
         }
@@ -295,20 +314,20 @@ fn cmd_run(args: &[String]) -> i32 {
     }
     let rest = &args[i..];
     let Some(script) = rest.first() else {
-        eprintln!("rbun: run needs a script: rbun run [flags] script.rb [args...]");
+        eprintln!("calisto: run needs a script: calisto run [flags] script.rb [args...]");
         return 1;
     };
     let script_args = &rest[1..];
 
     if !Path::new(script).is_file() {
-        eprintln!("rbun: cannot open {script}: no such file");
+        eprintln!("calisto: cannot open {script}: no such file");
         return 1;
     }
 
     let ruby = ruby_path();
     let preload = match &preload_opt {
         Some(v) => normalize_preload(v),
-        None => env::var("RBUN_PRELOAD")
+        None => env::var("CALISTO_PRELOAD")
             .map_or_else(|_| DEFAULT_PRELOAD.to_string(), |v| normalize_preload(&v)),
     };
 
@@ -319,7 +338,7 @@ fn cmd_run(args: &[String]) -> i32 {
         run_fast(&ruby, script, script_args, &preload)
     };
     if show_time {
-        eprintln!("rbun: elapsed: {:?}", t0.elapsed());
+        eprintln!("calisto: elapsed: {:?}", t0.elapsed());
     }
     code
 }
@@ -336,7 +355,7 @@ fn run_cold(ruby: &Path, script: &str, args: &[String]) -> i32 {
     match Command::new(ruby).arg(script).args(args).status() {
         Ok(st) => exit_code(st),
         Err(e) => {
-            eprintln!("rbun: cannot execute {}: {e}", ruby.display());
+            eprintln!("calisto: cannot execute {}: {e}", ruby.display());
             1
         }
     }
@@ -346,7 +365,7 @@ fn run_fast(ruby: &Path, script: &str, args: &[String], preload: &str) -> i32 {
     let mut stream = match connect_or_spawn_daemon(ruby, preload) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("rbun: {e}");
+            eprintln!("calisto: {e}");
             return 1;
         }
     };
@@ -354,7 +373,12 @@ fn run_fast(ruby: &Path, script: &str, args: &[String], preload: &str) -> i32 {
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_default();
     let env_blob = env::vars()
-        .filter(|(k, _)| !k.starts_with("RBUN_"))
+        .filter(|(k, _)| {
+            !matches!(
+                k.as_str(),
+                "CALISTO_RUNTIME_DIR" | "CALISTO_SOCKET" | "CALISTO_PIDFILE" | "CALISTO_PRELOAD" | "CALISTO_RUBY"
+            )
+        })
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("\u{1e}");
@@ -362,7 +386,7 @@ fn run_fast(ruby: &Path, script: &str, args: &[String], preload: &str) -> i32 {
     fields.extend(args.iter().map(|a| b64(a)));
     let bytes = build_cmd("RUN", &fields);
     if let Err(e) = send_with_fds(&mut stream, &bytes, &[0, 1, 2]) {
-        eprintln!("rbun: cannot talk to daemon: {e} (run 'rbun status')");
+        eprintln!("calisto: cannot talk to daemon: {e} (run 'calisto status')");
         return 1;
     }
     match read_line(&mut stream) {
@@ -370,15 +394,15 @@ fn run_fast(ruby: &Path, script: &str, args: &[String], preload: &str) -> i32 {
             if let Some(code) = line.strip_prefix("STATUS ") {
                 code.trim().parse().unwrap_or(1)
             } else if let Some(msg) = line.strip_prefix("ERR ") {
-                eprintln!("rbun: daemon error: {msg}");
+                eprintln!("calisto: daemon error: {msg}");
                 1
             } else {
-                eprintln!("rbun: unexpected daemon response: {line}");
+                eprintln!("calisto: unexpected daemon response: {line}");
                 1
             }
         }
         Err(e) => {
-            eprintln!("rbun: daemon closed connection: {e}");
+            eprintln!("calisto: daemon closed connection: {e}");
             1
         }
     }
@@ -427,12 +451,12 @@ fn cmd_stop() -> i32 {
 
 fn cmd_doctor() -> i32 {
     let ruby = ruby_path();
-    println!("rbun doctor");
+    println!("calisto doctor");
     println!("  pinned ruby: {}", ruby.display());
     let _ = Command::new(&ruby).arg("-v").status();
     println!(
         "  preload: {}",
-        env::var("RBUN_PRELOAD").unwrap_or_else(|_| DEFAULT_PRELOAD.to_string())
+        env::var("CALISTO_PRELOAD").unwrap_or_else(|_| DEFAULT_PRELOAD.to_string())
     );
     cmd_status();
     0
@@ -440,11 +464,11 @@ fn cmd_doctor() -> i32 {
 
 fn print_help() {
     println!(
-        "rbun - a Bun-like runtime for Ruby (pinned CRuby + fork-based fast startup)
+        "calisto - a Bun-like runtime for Ruby (pinned CRuby + fork-based fast startup)
 
 USAGE:
-  rbun run [--cold] [--time] [--preload LIST] <script.rb> [args...]
-  rbun status | stop | doctor | help
+  calisto run [--cold] [--time] [--preload LIST] <script.rb> [args...]
+  calisto status | stop | doctor | help
 
   run     executes <script.rb> on the pinned CRuby. Default: warm daemon that
           forks a child per run (fast startup). --cold spawns the interpreter
@@ -456,10 +480,11 @@ USAGE:
   doctor  prints environment, pinned ruby version and daemon state
 
 CONFIG:
-  RBUN_RUBY      path to a ruby binary (default: vendor/current/bin/ruby)
-  RBUN_PRELOAD   comma-separated stdlib preload list
+  CALISTO_RUBY        path to a ruby binary (default: vendor/current/bin/ruby)
+  CALISTO_PRELOAD     comma-separated stdlib preload list
+  CALISTO_RUNTIME_DIR daemon socket/pid location (default: $XDG_RUNTIME_DIR/calisto)
 
-NOTE: rbun run is equivalent to `ruby <script>` with no VM flags (-e/-E/...).
+NOTE: calisto run is equivalent to `ruby <script>` with no VM flags (-e/-E/...).
 Linux only (fork)."
     );
 }

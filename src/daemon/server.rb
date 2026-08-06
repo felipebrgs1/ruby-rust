@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# rbun daemon -- a warmed Ruby VM that forks one child per run request.
+# calisto daemon -- a warmed Ruby VM that forks one child per run request.
 #
 # Wire protocol (RESP-style bulk strings over a unix socket):
 #   client -> daemon: "<OP> <n>\r\n" then n fields, each "$<len>\r\n<data>\r\n"
@@ -17,23 +17,23 @@
 #   RUN <cwd> <env> <script> <args...>   (each field base64) -> STATUS <code>
 #
 # Env:
-#   RBUN_SOCKET   unix socket path
-#   RBUN_PIDFILE  pid file path
-#   RBUN_PRELOAD  comma-separated stdlib names required at boot (children inherit them)
+#   CALISTO_SOCKET   unix socket path
+#   CALISTO_PIDFILE  pid file path
+#   CALISTO_PRELOAD  comma-separated stdlib names required at boot (children inherit them)
 
 require "socket"
 require "base64"
 
-SOCKET = ENV.fetch("RBUN_SOCKET")
-PIDFILE = ENV["RBUN_PIDFILE"]
+SOCKET = ENV.fetch("CALISTO_SOCKET")
+PIDFILE = ENV["CALISTO_PIDFILE"]
 
 # ---- boot: preload -----------------------------------------------------------
-preload = ENV.fetch("RBUN_PRELOAD", "").split(",").map(&:strip).reject(&:empty?)
+preload = ENV.fetch("CALISTO_PRELOAD", "").split(",").map(&:strip).reject(&:empty?)
 preload.each do |name|
   begin
     require name
   rescue LoadError, StandardError => e
-    warn "rbun: preload '#{name}' failed: #{e.class}: #{e.message}"
+    warn "calisto: preload '#{name}' failed: #{e.class}: #{e.message}"
   end
 end
 
@@ -58,7 +58,7 @@ File.write(PIDFILE, Process.pid) if PIDFILE
 
 # Detach our own stdio: children get the client's real fds via SCM_RIGHTS.
 # Without this, a long-lived daemon holds the spawning process's stdout pipe
-# open forever (breaking `rbun run ... | head` and friends).
+# open forever (breaking `calisto run ... | head` and friends).
 STDIN.reopen(File::NULL)
 STDOUT.reopen(File::NULL)
 STDERR.reopen(File::NULL)
@@ -131,6 +131,26 @@ rescue Errno::EPIPE, Errno::ECONNRESET, IOError
 end
 
 # ---- child stdio --------------------------------------------------------------
+# `load` (diferente do main script do CLI) nao define DATA. Emula o CLI:
+# acha o marcador __END__ com o mesmo lexer do ruby (Ripper) e abre o IO
+# apontando para o conteudo apos a linha do marcador.
+def setup_data(script)
+  src = File.binread(script)
+  return unless src.include?("__END__")
+  require "ripper"
+  line = nil
+  Ripper.lex(src).each { |(l, _c), event, _tok, _st| line = l if event == :on___end__ }
+  return unless line
+  pos = 0
+  line.times do
+    nl = src.index("\n", pos)
+    pos = nl ? nl + 1 : src.bytesize
+  end
+  io = File.open(script, "rb")
+  io.seek(pos)
+  Object.const_set(:DATA, io)
+end
+
 def dup_into_stdio(fds)
   stdin_fd, stdout_fd, stderr_fd = fds
   STDIN.reopen(IO.new(stdin_fd, autoclose: false)) if stdin_fd
@@ -161,6 +181,7 @@ def handle_run(io, reader, fields)
     ENV.replace(env_pairs.to_h)
     $0 = script
     ARGV.replace(args)
+    setup_data(script) if File.file?(script)
     begin
       load script
       exit 0
@@ -184,7 +205,7 @@ def handle_run(io, reader, fields)
   end
 end
 
-# Waits for the child; if the client disconnects first (rbun killed), kills the child.
+# Waits for the child; if the client disconnects first (calisto killed), kills the child.
 def wait_for(pid, io)
   loop do
     done, status = Process.waitpid2(pid, Process::WNOHANG)
