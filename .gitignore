@@ -3,3 +3,4 @@
 .bundle/
 vendor/bundle/
 test/fixtures/preloadapp/boot_count
+test/fixtures/maybe/

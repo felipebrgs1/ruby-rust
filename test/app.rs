@@ -159,7 +159,7 @@ fn rails_runner_frozen_boot() {
     // congelado. Gated: exige `bundle install` previo no fixture (rede).
     let dir = runtime_dir("railsapp");
     let app = fixture("railsapp");
-    if !rails_bundle_installed(&app) {
+    if !common::bundle_check(&app) {
         eprintln!("SKIP rails_runner_frozen_boot: rode `bundle install` em test/fixtures/railsapp");
         return;
     }
@@ -197,25 +197,13 @@ fn rails_runner_frozen_boot() {
     stop_app(&dir, "railsapp");
 }
 
-/// Gems do fixture Rails instaladas? (bundle install com rede; senão skip).
-fn rails_bundle_installed(app: &Path) -> bool {
-    let vendor_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/current/bin");
-    std::process::Command::new(vendor_bin.join("bundle"))
-        .env("PATH", format!("{}:{}", vendor_bin.display(), env!("PATH")))
-        .arg("check")
-        .current_dir(app)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 #[test]
 fn rails_dev_server_serves_http() {
     // Fase C: `bin/rails server` roda como child do fork do daemon da app;
     // GET /up -> 200 com o app ja bootado (<500ms do spawn a resposta).
     let dir = runtime_dir("railsserver");
     let app = fixture("railsapp");
-    if !rails_bundle_installed(&app) {
+    if !common::bundle_check(&app) {
         eprintln!("SKIP rails_dev_server_serves_http: rode `bundle install` em test/fixtures/railsapp");
         return;
     }
@@ -279,7 +267,7 @@ fn rails_console_runs_in_app_context() {
     // Fase C: console (IRB) roda no contexto da app pre-carregada via stdin.
     let dir = runtime_dir("railsconsole");
     let app = fixture("railsapp");
-    if !rails_bundle_installed(&app) {
+    if !common::bundle_check(&app) {
         eprintln!("SKIP rails_console_runs_in_app_context: rode `bundle install` em test/fixtures/railsapp");
         return;
     }

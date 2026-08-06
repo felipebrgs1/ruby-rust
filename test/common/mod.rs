@@ -29,6 +29,19 @@ pub fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Gems do Gemfile instaladas (bundle check)? Gate dos golden tests que
+/// dependem de `bundle install` previo (rede/C exts).
+pub fn bundle_check(app: &Path) -> bool {
+    let vendor_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/current/bin");
+    Command::new(vendor_bin.join("bundle"))
+        .env("PATH", format!("{}:{}", vendor_bin.display(), env!("PATH")))
+        .arg("check")
+        .current_dir(app)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub fn calisto(dir: &Path) -> Command {
     let mut c = Command::new(BIN);
     c.env("CALISTO_RUNTIME_DIR", dir);

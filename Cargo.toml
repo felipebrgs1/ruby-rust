@@ -49,6 +49,10 @@ path = "test/bundler.rs"
 name = "app"
 path = "test/app.rs"
 
+[[test]]
+name = "realapps"
+path = "test/realapps.rs"
+
 [profile.release]
 lto = true
 strip = true

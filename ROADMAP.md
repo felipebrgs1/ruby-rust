@@ -120,6 +120,17 @@ contexto da app via stdin pipe. Golden tests em `test/app.rs` (gated em
 `bundle install` no `railsapp`): runner <500ms + SELECT 1 fork-safe, dev
 server 200 <500ms, console. O fixture `railsapp` (Rails 8.1 + sqlite3 + puma)
 é o degrau 3 da escada da Fase D.
-Próximo: **Fase D** — escada de apps reais: degrau 4 (app média com Sidekiq:
-fork-safe com jobs + threads) e degrau 5 (Chatwoot: boot + login + conversas +
-ActionCable com Postgres/Redis via docker).
+
+**Fase D, degrau 4 (Maybe Finance) concluído**: app open source real (Rails
+7.2.2 + Sidekiq 8 + Postgres + Redis, 74 gems) roda via calisto: boot 1º =
+1520ms, 2º comando = **127ms**, query no Postgres = 157ms (reconnect
+fork-safe). **Sidekiq roda como child do fork**: `CalistoProbeJob` enfileirado
+no Redis é processado pelo worker em ~900ms (threads + Redis + Rails bootado
+no child). Golden test `test/realapps.rs` gated em checkout do Maybe (gitignored)
++ bundle install + docker compose (postgres:16/redis:7 nas portas 5433/6380,
+sobe sozinho quando há docker). Ajustes do fixture: pin ruby 3.4.10 no
+Gemfile.lock/.ruby-version, `active_job.queue_adapter = :sidekiq` (dev default
+é :async) via initializer do fixture, `bin/sidekiq` próprio (CLI do Sidekiq 8
+exige `-r <dir>`; no child o require é no-op via `$LOADED_FEATURES`).
+Próximo: **degrau 5 — Chatwoot** (~100+ gems): boot + login + conversas +
+ActionCable com Postgres/Redis via docker.
