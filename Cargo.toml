@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "A Bun-like runtime for Ruby: pinned CRuby 3.4 + fork-based fast startup"
 
+# Workspace futuro: cada modulo em crates/calisto-<modulo> vira um crate quase
+# independente (build/test isolados), agregado pelo binario calisto-cli.
+# Members entram aqui quando cada crate ganhar Cargo.toml.
+[workspace]
+members = []
+
 [[bin]]
 name = "calisto"
 path = "src/main.rs"
