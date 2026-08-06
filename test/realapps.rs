@@ -234,3 +234,222 @@ fn maybe_sidekiq_job_in_forked_worker() {
         },
     );
 }
+
+// ---- degrau 5: Chatwoot -----------------------------------------------------
+
+/// HTTP request via TcpStream (sem deps): retorna (status, headers, body).
+fn http_request(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: Option<&str>) -> Option<(u16, String, String)> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: calisto.test\r\nConnection: close\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    if let Some(b) = body {
+        req.push_str(&format!("Content-Length: {}\r\n", b.len()));
+    }
+    req.push_str("\r\n");
+    if let Some(b) = body {
+        req.push_str(b);
+    }
+    s.write_all(req.as_bytes()).ok()?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).ok()?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status: u16 = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())?;
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    Some((status, head.to_string(), body.to_string()))
+}
+
+#[test]
+fn chatwoot_backend_serves_api_and_cable() {
+    // Degrau 5 da escada: Chatwoot (Rails 7.1, ~155 gems) — boot + login
+    // (devise_token_auth) + conversas (API v1) + ActionCable WebSocket.
+    // Gated em checkout + bundle + postgres/redis (compose 5434/6381).
+    let dir = runtime_dir("chatwoot");
+    let app = fixture("chatwoot");
+    let env: Vec<(&str, &str)> = vec![
+        ("POSTGRES_HOST", "127.0.0.1"),
+        ("POSTGRES_PORT", "5434"),
+        ("POSTGRES_USERNAME", "chatwoot"),
+        ("POSTGRES_PASSWORD", "chatwoot_password"),
+        ("POSTGRES_DATABASE", "chatwoot_dev"),
+        ("REDIS_URL", "redis://127.0.0.1:6381"),
+        ("SECRET_KEY_BASE", "calisto-chatwoot-test-secret-key-base-0123456789abcdef"),
+        ("FRONTEND_URL", "http://localhost:3000"),
+        ("ACTIVE_STORAGE_SERVICE", "local"),
+    ];
+
+    if !app.join("calisto.toml").is_file() {
+        eprintln!(
+            "SKIP chatwoot_backend_serves_api_and_cable: checkout Chatwoot ausente — \
+             `git clone --depth 1 https://github.com/chatwoot/chatwoot.git test/fixtures/chatwoot`"
+        );
+        return;
+    }
+    if !bundle_check(&app) {
+        eprintln!(
+            "SKIP chatwoot_backend_serves_api_and_cable: rode `bundle install` em test/fixtures/chatwoot \
+             (pg/psych precisam de libpq/libyaml; scout_apm removido — nao compila no 3.4.10)"
+        );
+        return;
+    }
+    if !port_open(5434) || !port_open(6381) {
+        let up = std::process::Command::new("docker")
+            .args(["compose", "-f", "compose.calisto.yml", "up", "-d", "--wait"])
+            .current_dir(&app)
+            .output();
+        match up {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!(
+                    "SKIP chatwoot_backend_serves_api_and_cable: suba a infra — \
+                     `docker compose -f test/fixtures/chatwoot/compose.calisto.yml up -d`"
+                );
+                return;
+            }
+        }
+    }
+    if !wait_port(5434, 30) || !wait_port(6381, 30) {
+        eprintln!("SKIP chatwoot_backend_serves_api_and_cable: postgres/redis nao subiram");
+        return;
+    }
+
+        let prep = app_run(&dir, "chatwoot", &["run", "bin/rails", "db:prepare"], &env);
+    assert!(prep.status.success(), "db:prepare: {}", String::from_utf8_lossy(&prep.stderr));
+    let count = app_run(&dir, "chatwoot", &["run", "bin/rails", "runner", "print User.count"], &env);
+    assert!(count.status.success(), "{}", String::from_utf8_lossy(&count.stderr));
+    if String::from_utf8_lossy(&count.stdout).trim().parse::<u32>().unwrap_or(1) == 0 {
+        let seed = app_run(&dir, "chatwoot", &["run", "bin/rails", "db:seed"], &env);
+        assert!(seed.status.success(), "db:seed: {}", String::from_utf8_lossy(&seed.stderr));
+    }
+
+        let t0 = Instant::now();
+    let boot = app_run(&dir, "chatwoot", &["run", "bin/rails", "runner", "puts Rails.env"], &env);
+    assert!(boot.status.success(), "{}", String::from_utf8_lossy(&boot.stderr));
+    assert!(
+        t0.elapsed().as_millis() < 500,
+        "2o comando deve ser <500ms: {}ms",
+        t0.elapsed().as_millis()
+    );
+
+    // dev server (child do fork) + login + conversas + ActionCable
+        let _ = std::fs::remove_file(app.join("tmp/pids/server.pid"));
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut server = calisto(&dir)
+        .arg("run")
+        .arg("bin/rails")
+        .args(["server", "-p"])
+        .arg(port.to_string())
+        .args(["-b", "127.0.0.1"])
+        .current_dir(&app)
+        .envs(env.clone())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn rails server");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !port_open(port) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+assert!(port_open(port), "rails server do Chatwoot nao subiu");
+    
+    // login (devise_token_auth)
+    let (status, head, _) = http_request(
+        port,
+        "POST",
+        "/auth/sign_in",
+        &[("Content-Type", "application/json")],
+        Some(r#"{"email":"john@acme.inc","password":"Password1!"}"#),
+    )
+    .expect("login request");
+    assert_eq!(status, 200, "login deve dar 200: {head}");
+    let token = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("access-token:"))
+        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+        .expect("access-token no header");
+    let uid = "john@acme.inc";
+    let client = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("client:"))
+        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+        .expect("client no header do login");
+
+    // conversas (API v1 autenticada)
+    let (status, head, body) = http_request(
+        port,
+        "GET",
+        "/api/v1/accounts/1/conversations",
+        &[
+            ("access-token", token.as_str()),
+            ("uid", uid),
+            ("client", client.as_str()),
+            ("Content-Type", "application/json"),
+        ],
+        None,
+    )
+    .expect("conversations request");
+    assert_eq!(status, 200, "conversations deve dar 200: {head} {body}");
+
+    // ActionCable WebSocket handshake
+    use std::io::{Read, Write};
+    let mut ws = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    ws.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let key = base64_key();
+    ws.write_all(
+        format!(
+            "GET /cable HTTP/1.1\r\nHost: localhost:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut buf = [0u8; 2048];
+    let n = ws.read(&mut buf).unwrap(); // um chunk: o WS fica aberto (sem EOF)
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        resp.contains("101"),
+        "cable deve fazer upgrade (101): {}",
+        resp.lines().next().unwrap_or("")
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = run_opt(
+        &dir,
+        RunOpts {
+            args: &["stop"],
+            env: &[],
+            stdin: None,
+            cwd: Some(&app),
+            timeout: 10,
+        },
+    );
+}
+
+fn base64_key() -> String {
+    // Sec-WebSocket-Key: 16 bytes aleatorios em base64 (sem deps)
+    let mut key = String::new();
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for i in 0..22 {
+        let b = ((std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64)
+            .wrapping_mul(2654435761)
+            .wrapping_add(i as u64 * 7919))
+            % 256;
+        key.push(B64[(b & 63) as usize] as char);
+    }
+    key.push('=');
+    key.push('=');
+    key
+}

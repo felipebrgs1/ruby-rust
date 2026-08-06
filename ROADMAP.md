@@ -132,5 +132,18 @@ sobe sozinho quando há docker). Ajustes do fixture: pin ruby 3.4.10 no
 Gemfile.lock/.ruby-version, `active_job.queue_adapter = :sidekiq` (dev default
 é :async) via initializer do fixture, `bin/sidekiq` próprio (CLI do Sidekiq 8
 exige `-r <dir>`; no child o require é no-op via `$LOADED_FEATURES`).
-Próximo: **degrau 5 — Chatwoot** (~100+ gems): boot + login + conversas +
-ActionCable com Postgres/Redis via docker.
+
+**Fase D, degrau 5 (Chatwoot) concluído**: maior app da escada (Rails 7.1.5 +
+~155 gems + pgvector + Sidekiq) roda via calisto: boot 1º = 2183ms, 2º
+comando = **105ms**, dev server = 154ms até responder. Golden test
+`test/realapps.rs` (gated em checkout + bundle + compose postgres:16/
+redis:7, portas 5434/6381): **login** (devise_token_auth POST /auth/sign_in →
+200), **conversas** (GET /api/v1/accounts/1/conversations autenticado → 200) e
+**ActionCable** (WebSocket handshake /cable → 101). **Bug real resolvido**: o
+`listen` gem (EventedFileUpdateChecker, inotify) no boot do daemon quebrava o
+2º fork (rc=1 silencioso — o child herdava watchers) → fixture usa
+`FileUpdateChecker` (sem watch; hot reload é Fase E). Outros ajustes do
+fixture: pin 3.4.10, scout_apm removido (não compila no 3.4.10), migration
+`Taggable::Cache`→`Caching`, imagem pgvector. **A escada da Fase D está
+completa** — do trivial ao Chatwoot, tudo vira fork do boot congelado.
+Próximo: **Fase E — produto Bun** (`calisto test`/`task`/`serve`, watch, .env).
