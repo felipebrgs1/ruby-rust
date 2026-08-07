@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use std::io::{BufRead, Write};
+use std::io::BufRead;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -168,28 +168,33 @@ fn daemon_runs_embedded_in_process() {
     stop(&dir);
 }
 
-/// Fase L: CALISTO_NO_EMBED=1 forca o modo legado (spawn do ruby externo) —
-/// fallback para rubies sem libruby.so (ex.: builds pre --enable-shared).
+/// Fase S: ruby sem libruby.so (build pre --enable-shared — instalacoes
+/// antigas) e ERRO claro com o comando de rebuild — o daemon legado (spawn
+/// do ruby externo rodando server.rb) morreu; o embutido e o unico modo.
 #[test]
-fn daemon_legacy_fallback_with_no_embed() {
-    let dir = runtime_dir("embedlegacy");
+fn ruby_without_libruby_so_errors_clearly() {
+    let dir = runtime_dir("embednoso");
+    // ruby fake via CALISTO_RUBY: bin/ruby existe (resolve), mas lib/ nao
+    // tem libruby.so — a porta de entrada de um install pre-shared.
+    let fake = dir.join("fakeruby");
+    std::fs::create_dir_all(fake.join("bin")).unwrap();
+    std::fs::write(fake.join("bin/ruby"), "#!/bin/sh\nexit 0\n").unwrap();
     let out = run_opt(
         &dir,
         RunOpts {
             args: &["run", "-e", "puts RUBY_VERSION"],
-            env: &[("CALISTO_NO_EMBED", "1")],
+            env: &[("CALISTO_RUBY", fake.join("bin/ruby").to_str().unwrap())],
             stdin: None,
             cwd: None,
             timeout: 30,
         },
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3.4.10");
-
-    let pid = std::fs::read_to_string(dir.join("calisto.pid")).expect("pidfile");
-    let pid = pid.trim().parse::<u32>().expect("pid numerico");
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).expect("exe do daemon");
-    let exe = exe.to_string_lossy().into_owned();
-    assert!(exe.contains("/bin/ruby"), "daemon legado deve ser o ruby externo: {exe}");
-    stop(&dir);
+    assert!(!out.status.success(), "deveria falhar sem libruby.so: {:?}", out.status.code());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("libruby.so"), "erro deve citar a libruby: {err}");
+    assert!(err.contains("scripts/build-ruby.sh"), "erro deve citar o rebuild: {err}");
+    assert!(
+        !dir.join("calisto.sock").exists(),
+        "sem daemon spawnado sem .so"
+    );
 }

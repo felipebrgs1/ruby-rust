@@ -114,6 +114,21 @@ else
   ( cd "$SRC/ruby-$RUBY_VERSION" && make install --quiet )
 fi
 
+# Fix do stdbool.h do ruby 3.4.4 (bug corrigido no 3.4.10): com
+# HAVE_STDBOOL_H ausente e HAVE__BOOL setado, o header antigo nao define
+# `bool` em NENHUM branch — extensoes compiladas com `-std=c99` (bootsnap,
+# commonmarker, nokogiri, unf_ext, skylight... forcam c99 nos proprios
+# extconfs) quebram com "unknown type name 'bool'" em gcc 15+ (default
+# c23; o <stdbool.h> do gcc 16 nao define mais `bool` por si). Porta o
+# header fixado do 3.4.10 (incondicional + idempotente: o cp do arquivo
+# correto sobre ele mesmo e no-op; rodar de novo nao corrompe).
+if [[ -f "$VENDOR/ruby-3.4.10/include/ruby-3.4.0/ruby/internal/stdbool.h" && \
+      -f "$PREFIX/include/ruby-3.4.0/ruby/internal/stdbool.h" ]]; then
+  cp "$VENDOR/ruby-3.4.10/include/ruby-3.4.0/ruby/internal/stdbool.h" \
+     "$PREFIX/include/ruby-3.4.0/ruby/internal/stdbool.h"
+  log "stdbool.h: fix do ruby 3.4.4 portado do 3.4.10 (c99 + gcc15+)"
+fi
+
 # vendor/current e o DEFAULT (pin): so e repontado quando o alvo e o default
 # ou quando ainda nao existe — construir uma versao extra (Fase I) nao troca
 # o default que o calisto usa sem .ruby-version/Gemfile.

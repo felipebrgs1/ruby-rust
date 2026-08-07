@@ -223,3 +223,33 @@ fn app_daemon_separated_per_version() {
     assert_eq!(n, 2, "apps/ deve ter um daemon por versao");
     let _ = run_in(&dir, &project, &["stop"]);
 }
+
+/// Fase S: o 3.4.4 (rebuildado com --enable-shared) roda o daemon EMBUTIDO —
+/// o processo do daemon e o proprio binario calisto. Antes do rebuild, o
+/// 3.4.4 era o unico caso do server.rb legado (build pre-shared); a Fase S
+/// fechou esse gap: pidfile -> /proc/<pid>/exe == calisto em TODAS as
+/// versoes.
+#[test]
+fn ruby344_daemon_runs_embedded() {
+    if !have_ruby("3.4.4") {
+        eprintln!("SKIP ruby344_daemon_runs_embedded: rode RUBY_VERSION=3.4.4 scripts/build-ruby.sh");
+        return;
+    }
+    let dir = runtime_dir("rvembed344");
+    let project = dir.join("proj344");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join(".ruby-version"), "3.4.4\n").unwrap();
+
+    let out = run_in(&dir, &project, &["run", "-e", "puts RUBY_VERSION"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3.4.4");
+
+    // daemon 3.4.4 vivo e o binario calisto (daemon generico por versao:
+    // runtime_dir/ruby-3.4.4/calisto.pid)
+    let pid = std::fs::read_to_string(dir.join("ruby-3.4.4/calisto.pid")).expect("pidfile do daemon 3.4.4");
+    let pid = pid.trim().parse::<u32>().expect("pid numerico");
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).expect("exe do daemon");
+    let bin = std::fs::canonicalize(BIN).expect("binario calisto");
+    assert_eq!(exe, bin, "daemon 3.4.4 deve ser o proprio calisto (embutido)");
+    let _ = run_in(&dir, &project, &["stop"]);
+}

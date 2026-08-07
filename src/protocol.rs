@@ -32,7 +32,7 @@ unsafe extern "C" {
 
 
 /// Primeiro recvmsg de uma conexao: dados + fds SCM_RIGHTS (stdio do
-/// cliente) — espelho do RequestReader#fill (scm_rights: true) do server.rb.
+/// cliente).
 
 
 #[repr(C)]
@@ -256,7 +256,7 @@ pub fn client_fill(c: &mut DaemonClient) -> Result<(), CommandErr> {
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(CommandErr::Partial),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(CommandErr::Partial),
-            Err(_) => Err(CommandErr::Eof), // 0 bytes ou erro: "eof" do server.rb
+            Err(_) => Err(CommandErr::Eof), // 0 bytes ou erro: fim da conexao
         }
     } else {
         let mut data = [0u8; 65_536];
@@ -332,7 +332,7 @@ pub fn client_read_command(c: &mut DaemonClient) -> Result<(String, Vec<Vec<u8>>
 
 
 
-/// TERM -> (200ms) -> KILL -> wait bloqueante (kill_child do server.rb).
+/// TERM -> (200ms) -> KILL -> wait bloqueante.
 pub fn kill_child(pid: i32) -> Option<i32> {
     unsafe { kill(pid, SIGTERM) };
     std::thread::sleep(Duration::from_millis(200));

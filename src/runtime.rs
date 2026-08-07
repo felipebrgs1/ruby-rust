@@ -11,7 +11,6 @@ use std::os::unix::net::{UnixStream};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use crate::appconfig::*;
-use crate::daemon::*;
 use crate::protocol::*;
 
 
@@ -247,30 +246,26 @@ pub fn connect_or_spawn_daemon_in(
         return Ok(s);
     }
     fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    // Fase L: com libruby.so disponivel o daemon roda EMBUTIDO — o proprio
-    // binario calisto vira o processo do daemon (VM in-process via dlopen),
-    // sem spawnar o interpretador externo nem rodar o server.rb (o accept
-    // loop vive em Rust — Fase L.4). CALISTO_NO_EMBED=1 forca o modo legado
-    // (spawn `ruby <daemon.rb>`) — ex.: rubies antigos sem .so, ou debug.
-    // flags sao repassadas como `-r<gem>` do boot em ambos os modos
-    // (`-rbundler/setup` antes do script continua sendo flag de verdade).
-    let embedded = env::var_os("CALISTO_NO_EMBED").is_none() && calisto_ruby::libruby_path(ruby).is_some();
-    let mut cmd = if embedded {
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("cannot resolve own executable: {e}"))?;
-        let mut c = Command::new(exe);
-        c.arg("daemon").arg("--internal").args(flags);
-        c.env("CALISTO_EMBED_RUBY", ruby);
-        c
-    } else {
-        let rb = dir.join("calisto.rb");
-        fs::write(&rb, DAEMON_RB).map_err(|e| format!("cannot write daemon script: {e}"))?;
-        let mut c = Command::new(ruby);
-        // flags ANTES do script: `ruby -r... <daemon.rb>` — depois do script seria
-        // ARGV do daemon, nao flag do interpretador
-        c.args(flags).arg(&rb);
-        c
-    };
+    // Fase S: modo unico de daemon — o proprio binario calisto vira o
+    // processo do daemon com a VM CRuby in-process (dlopen da libruby via
+    // crates/calisto-ruby; accept loop em Rust). Ruby sem libruby.so (build
+    // pre --enable-shared — instalacoes antigas) e erro claro com o comando
+    // de rebuild: o daemon legado morreu na Fase S. flags sao
+    // repassadas como `-r<gem>` do boot (`-rbundler/setup` antes do script
+    // continua sendo flag de verdade).
+    let _ = calisto_ruby::libruby_path(ruby).ok_or_else(|| {
+        let version = ruby_version_of(ruby).unwrap_or_else(|| PINNED_RUBY.to_string());
+        format!(
+            "{} nao tem libruby.so (build pre --enable-shared); \
+             rode CALISTO_REBUILD=1 RUBY_VERSION={version} scripts/build-ruby.sh",
+            ruby.display()
+        )
+    })?;
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot resolve own executable: {e}"))?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("daemon").arg("--internal").args(flags);
+    cmd.env("CALISTO_EMBED_RUBY", ruby);
     cmd.env("CALISTO_SOCKET", &sock)
         .env("CALISTO_PIDFILE", dir.join("calisto.pid"))
         .env("CALISTO_PRELOAD", preload)

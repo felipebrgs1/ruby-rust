@@ -465,9 +465,9 @@ fn base64_key() -> String {
 /// metade compartilhada, constante nos dois modos). Mede via `calisto doctor`
 /// (smaps_rollup do daemon + child de probe): boot do daemon com
 /// CALISTO_COMPACT=0 (baseline fragmentado), mede; stop; boot default
-/// (compact on), mede. O Chatwoot pina 3.4.4, entao o daemon roda no modo
-/// legado (server.rb) — o teste cobre o hook de compactacao do daemon legado
-/// tambem. Gated como os outros goldens.
+/// (compact on), mede. O Chatwoot pina 3.4.4 — desde a Fase S (3.4.4
+/// rebuildado com --enable-shared) o daemon roda EMBUTIDO, entao o teste
+/// cobre o hook de compactacao Rust. Gated como os outros goldens.
 #[test]
 fn chatwoot_compaction_cuts_probe_child_pss() {
     let dir = runtime_dir("chatwootcompact");

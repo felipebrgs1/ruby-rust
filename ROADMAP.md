@@ -31,7 +31,7 @@ graph LR
     N --> O
     P --> Q[Fase Q: distribuicao ✅]
     Q --> R[Fase R: paridade de CLI ✅]
-    R --> S[Fase S: runtime 100% Rust — fim do server.rb]
+    R --> S[Fase S: runtime 100% Rust — fim do server.rb ✅]
 ```
 
 ## Estado — ciclos fechados
@@ -52,6 +52,11 @@ graph LR
   distribuição (tarballs, curl|sh, upgrade com rubies pré-compilados,
   `CALISTO_HOME`); **R**: paridade de CLI (`-I/-r/-w/-W/-c/-E/-v` com
   paridade cold/warm).
+- **Fase S** ✅ — runtime **100% Rust**: 3.4.4 rebuildado com
+  `--enable-shared`; modo único de daemon (`CALISTO_NO_EMBED` some, ruby
+  sem `.so` → erro claro com o rebuild); `server.rb` + `include_str!`
+  deletados; goldens maybe/chatwoot **ativos** sob o daemon Rust (hook de
+  compactação Rust: Private_Dirty −58%).
 
 ## Números de hoje (marcos)
 
@@ -60,11 +65,14 @@ graph LR
   railsapp **<1s** quente.
 - `calisto run -e` quente **36ms** (<50ms); scaffold do init **33ms**;
   `run db:migrate` 135ms; `task db:migrate` 530 → 98ms.
-- Fase M: Private_Dirty de child do Chatwoot **−46%** (compactação + CoW).
+- Fase M: Private_Dirty de child do Chatwoot **−58%** (compactação + CoW,
+  revalidado no daemon Rust na Fase S; era −46% no legado).
 - Fase N: 1º request `/cpu` 119–188ms → **6–13ms** com YJIT + warmup.
 - Fase P: sha256 100MB **6.9×** o `Digest::SHA256` (SHA-NI).
 - Fase L: `run -e` **37ms** no daemon embutido — o processo do daemon **é**
   o binário calisto.
+- Fase S: 3.4.4 embutido (mesmo daemon, `run -e` e goldens); goldens
+  maybe/chatwoot ativos — o `server.rb` legado morreu.
 
 ## Cobertura vs `ruby`
 
@@ -84,49 +92,47 @@ graph LR
 | `gem` (instalação) | ⚠️ delegado ao `bundle install` (decisão Fase A) |
 | `-n/-p/-a/-F/-l/-0/-i/-s/-S/-x/-C` | ❌ não-fazer documentado (`ruby` do vendor via PATH/--cold) |
 
-## Próximo ciclo — Fase S: runtime 100% Rust (fim do server.rb)
+## Fase S — runtime 100% Rust (fim do server.rb) ✅
 
-> O `src/daemon/server.rb` (daemon legado em Ruby) só sobrevive para rubies
-> sem `libruby.so` — o único caso real é o `vendor/ruby-3.4.4`, construído
+> O `src/daemon/server.rb` (daemon legado em Ruby) só sobrevivia para rubies
+> sem `libruby.so` — o único caso real era o `vendor/ruby-3.4.4`, construído
 > **antes** do `--enable-shared` (Fase L.1). Com o 3.4.4 rebuildado com
-> shared, o daemon Rust embutido cobre **todas** as versões e o legado morre.
+> shared, o daemon Rust embutido cobre **todas** as versões e o legado morreu.
 
-- [ ] **S.1 — rebuild do 3.4.4 com libruby.so**:
-      `CALISTO_REBUILD=1 RUBY_VERSION=3.4.4 scripts/build-ruby.sh` (rebuild
-      **destrutivo** — rm -rf do prefixo — e o script atual já aplica
-      `--enable-shared`). Verificar
-      `vendor/ruby-3.4.4/lib/libruby.so.3.4.4` + symlinks. C-exts dos
-      fixtures (chatwoot/maybe, compiladas contra o 3.4.4) seguem
-      compatíveis — mesma versão, mesmo ABI; o GEM_PATH (`vendor/bundle`)
-      não é tocado.
-- [ ] **S.2 — modo único de daemon**: `runtime.rs` decide só por
-      `libruby_path()` — `CALISTO_NO_EMBED` some. Ruby sem `.so` → **erro
-      claro** com o comando de rebuild (porta de entrada: instalações
-      antigas pré-shared; quebra intencional, documentada).
-- [ ] **S.3 — deletar o legado**: `src/daemon/server.rb` (único arquivo do
-      dir — o dir some junto com o `include_str!`), o branch
-      `Command::new(ruby)` do spawn (runtime.rs) e os comentários "espelho
-      do server.rb" (daemon.rs/child.rs/protocol.rs) — o espelho vira
-      referência histórica do git.
-- [ ] **S.4 — testes**: `daemon_legacy_fallback_with_no_embed`
-      (test/daemon.rs) vira teste do **erro claro** com um ruby fake sem
-      `.so` (via `CALISTO_RUBY`); o 3.4.4 gated (versions.rs) passa a
-      provar o **embutido** sob `.ruby-version` 3.4.4 (pidfile → exe ==
-      calisto); o golden do chatwoot (realapps.rs — pina 3.4.4) passa a
-      cobrir o hook de compactação **Rust** (antes cobria o legado). Grep
-      final: `server.rb`/`CALISTO_NO_EMBED` = 0 em `src/`.
-- [ ] **S.5 — docs**: AGENTS.md — remove `daemon/server.rb` da tabela de
-      arquivos, o aviso "after editing server.rb rebuild", `CALISTO_NO_EMBED`
-      dos env vars e o contrato de cobertura do daemon.rs (fallback legado)
-      — o runtime 100% Rust vira o único caminho descrito.
+- [x] **S.1 — rebuild do 3.4.4 com libruby.so**:
+      `CALISTO_REBUILD=1 RUBY_VERSION=3.4.4 scripts/build-ruby.sh` —
+      `vendor/ruby-3.4.4/lib/libruby.so.3.4.4` + symlinks presentes. As
+      C-exts dos fixtures (compiladas contra o 3.4.4 estático antigo) eram
+      ABI-compatíveis, mas os dirs `extensions/.../3.4.0-static/` ficaram
+      invisíveis ao ruby shared (o rbconfig muda o sufixo) — os bundles dos
+      fixtures foram regenerados com `bundle install` sob o ruby novo
+      (libpq vendored em `vendor/src/postgresql-16.6`, libyaml vendored).
+      Extra: `build-ruby.sh` porta o fix do `stdbool.h` do 3.4.10 para
+      prefixos 3.4.4 (gcc 15+/c99 — ver AGENTS.md armadilhas).
+- [x] **S.2 — modo único de daemon**: `runtime.rs` decide só por
+      `libruby_path()` — `CALISTO_NO_EMBED` sumiu. Ruby sem `.so` → **erro
+      claro** com o comando de rebuild (teste
+      `ruby_without_libruby_so_errors_clearly`).
+- [x] **S.3 — deletar o legado**: `src/daemon/server.rb` + `include_str!`,
+      o branch `Command::new(ruby)` do spawn (runtime.rs) e os comentários
+      "espelho do server.rb" (daemon.rs/child.rs/protocol.rs) removidos.
+- [x] **S.4 — testes**: `daemon_legacy_fallback_with_no_embed` virou o
+      teste do **erro claro** com ruby fake sem `.so`; o 3.4.4 gated
+      (versions.rs) ganhou `ruby344_daemon_runs_embedded` (pidfile → exe ==
+      calisto); o golden do chatwoot cobre o hook de compactação **Rust**
+      (Private_Dirty **−58%**, ≥30% no assert); grep final:
+      `server.rb`/`CALISTO_NO_EMBED` = 0 em `src/`. Extra (fork-safety):
+      o daemon desativa o `DEBUGGER__::SESSION` pós-boot — o debug gem
+      (Bundler.require do Rails dev) não sobrevive ao fork e o child
+      travava no 1º script compilado (bug real achado pelo golden do maybe).
+- [x] **S.5 — docs**: AGENTS.md atualizado (tabela, env vars, contrato de
+      cobertura, armadilhas novas).
 - Marco ✅: suíte inteira verde com o legado removido; 3.4.4 embutido
   (pidfile → exe == binário calisto, gated em `vendor/ruby-3.4.4`); `run -e`
-  e goldens sob 3.4.4 no daemon Rust; ruby sem `.so` → erro claro com o
-  comando de rebuild.
-- Estimativa: 3–5 dias (o build do 3.4.4 domina; o resto é remoção +
-  ajuste de testes).
+  e goldens (maybe + chatwoot) sob 3.4.4 no daemon Rust; ruby sem `.so` →
+  erro claro com o comando de rebuild.
 
-## Depois da S
+## Próximos passos
 
 - **APIs nativas novas** — `calisto.*` além de hash/sqlite (o `Bun.*` do Ruby).
 - **Degraus reais completos** — validar `calisto run`/build no Chatwoot

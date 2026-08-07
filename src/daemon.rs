@@ -44,20 +44,16 @@ unsafe extern "C" {
 /// libc, avisa e segue (o fork volta ao comportamento racy anterior).
 
 /// Primeiro recvmsg de uma conexao: dados + fds SCM_RIGHTS (stdio do
-/// cliente) — espelho do RequestReader#fill (scm_rights: true) do server.rb.
+/// cliente).
 
 
-pub const DAEMON_RB: &str = include_str!("daemon/server.rb");
-
-
-
-/// Uso interno (Fase L): `calisto daemon --internal [-r<gem>...]` — o daemon
-/// EMBUTIDO: VM CRuby in-process (dlopen libruby) com o accept loop em Rust
-/// (L.4 — sem server.rb). Spawnado pelo proprio cliente quando o ruby
-/// resolvido tem libruby.so; `CALISTO_EMBED_RUBY` aponta esse ruby (para
-/// achar a .so). Boot: require das flags `-r` (ex.: `-rbundler/setup`),
-/// preload de `CALISTO_PRELOAD`, entrypoint de `CALISTO_APP_PRELOAD`; depois
-/// o loop atende PING/RUN/EVAL/STOP com fork por request. Nao retorna ate o
+/// Uso interno (Fase S): `calisto daemon --internal [-r<gem>...]` — o daemon
+/// EMBUTIDO: VM CRuby in-process (dlopen libruby) com o accept loop em Rust.
+/// Spawnado pelo proprio cliente — unico modo desde a Fase S (o daemon
+/// legado morreu); `CALISTO_EMBED_RUBY` aponta o ruby resolvido (para achar
+/// a .so). Boot: require das flags `-r` (ex.: `-rbundler/setup`), preload de
+/// `CALISTO_PRELOAD`, entrypoint de `CALISTO_APP_PRELOAD`; depois o loop
+/// atende PING/RUN/EVAL/STOP com fork por request. Nao retorna ate o
 /// shutdown.
 // ---- fork-safety do stdio do glibc (Fase N) ----------------------------------
 // O child do fork pode herdar um FILE lock do glibc (stdin/stdout/stderr)
@@ -187,10 +183,10 @@ pub fn cmd_daemon(args: &[String]) -> i32 {
 
 
 
-// ---- Fase L.4: daemon embutido — accept loop em Rust --------------------------
-// Espelho 1:1 do server.rb (preload, bind com stale-socket recovery, detach,
+// ---- daemon embutido — accept loop em Rust ------------------------------------
+// Protocolo do daemon: preload, bind com stale-socket recovery, detach,
 // traps, RequestReader SCM_RIGHTS, select multi-conexao, waitpid WNOHANG,
-// client-death kill TERM->KILL, STOP derruba children, STATUS por child).
+// client-death kill TERM->KILL, STOP derruba children, STATUS por child.
 
 pub const SIGINT: i32 = 2;
 
@@ -289,7 +285,7 @@ pub fn install_daemon_signal_handlers() {
 
 
 
-/// Boot + accept loop do daemon embutido. Espelho do server.rb:
+/// Boot + accept loop do daemon embutido:
 /// preload -> app preload -> bind (stale socket) -> pidfile -> detach ->
 /// traps -> loop (select 10ms, accept, comandos, waitpid WNOHANG).
 pub fn daemon_main(vm: &calisto_ruby::Ruby, requires: &[String]) -> Result<i32, String> {
@@ -389,6 +385,27 @@ end
             Ok(_) => {}
         }
     }
+    // Fase S.4: fork-safety do debug gem. O boot da app (Bundler.require do
+    // Rails dev) roda `require "debug"` -> DEBUGGER__::SESSION inicia com
+    // TracePoint :script_compiled + threads de UI. O fork do child mata as
+    // threads; o 1o script compilado no child (bin/rails...) dispara o
+    // TracePoint herdado e o child trava esperando comando de um UI morto.
+    // Desativa a sessao pos-boot (deactivate desliga os TracePoints e o UI);
+    // o debugger lazy (binding.break no child) continua funcionando — a
+    // sessao inicia fresca no processo do child, onde as threads vivem.
+    if let Err(e) = vm.eval(
+        r#"
+if defined?(DEBUGGER__::SESSION)
+  begin
+    DEBUGGER__::SESSION.deactivate
+  rescue Exception => e
+    warn "calisto: deactivate do debug session falhou: #{e.class}: #{e.message}"
+  end
+end
+"#,
+    ) {
+        eprintln!("calisto: debug session: {}", vm.error_summary(e));
+    }
     // Fase M.1: compactacao pre-fork (pos-boot, antes do bind). GC.start +
     // GC.compact densificam o heap -> os children (fork) nascem com quase
     // todas as paginas compartilhadas via CoW (o que o child escreve depois
@@ -433,8 +450,8 @@ end
             }
         }
     }
-    // traps (pos-boot, como o server.rb): INT sobrevive Ctrl-C; TERM/HUP ->
-    // shutdown. Sobrescreve os handlers que a VM instalou no init.
+    // traps (pos-boot): INT sobrevive Ctrl-C; TERM/HUP -> shutdown.
+    // Sobrescreve os handlers que a VM instalou no init.
     install_daemon_signal_handlers();
     // ---- accept loop multi-conexao (select 10ms + waitpid WNOHANG) ----
     let mut clients: Vec<DaemonClient> = Vec::new();

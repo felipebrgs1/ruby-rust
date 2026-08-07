@@ -29,13 +29,8 @@ unsafe extern "C" {
 
 
 
-/// Primeiro recvmsg de uma conexao: dados + fds SCM_RIGHTS (stdio do
-/// cliente) — espelho do RequestReader#fill (scm_rights: true) do server.rb.
-
-
-
-/// Erro no child: espelho do report_child_error — full_message sem highlight
-/// com os frames do proprio daemon embutido cortados (marcador "eval:" — os
+/// Erro no child: full_message sem highlight com os frames do proprio daemon
+/// embutido cortados (marcador "eval:" — os
 /// snippets gerados pelo calisto rodam com filename "eval"). Se o report
 /// falhar, deixa a VM imprimir (ruby_cleanup TAG_RAISE com o errinfo).
 /// Nunca retorna.
@@ -131,10 +126,10 @@ fn syntax_check(vm: &calisto_ruby::Ruby, is_eval: bool, subject: &str) -> Result
 
 
 
-/// Corpo do child (RUN/EVAL) — espelho do child_enter + start_child do
-/// server.rb: traps default, stdio do cliente, hygiene de fds, cwd, env do
-/// RUN (ENV.replace), bundler/setup, CALISTO_LOAD_PATH, $0/ARGV, setup_data,
-/// load/eval com semantica de `ruby <script>`/`ruby -e`. Nunca retorna.
+/// Corpo do child (RUN/EVAL): traps default, stdio do cliente, hygiene de
+/// fds, cwd, env do RUN (ENV.replace), bundler/setup, CALISTO_LOAD_PATH,
+/// $0/ARGV, setup_data, load/eval com semantica de `ruby <script>`/`ruby -e`.
+/// Nunca retorna.
 pub fn child_main(
     vm: &calisto_ruby::Ruby,
     is_eval: bool,
