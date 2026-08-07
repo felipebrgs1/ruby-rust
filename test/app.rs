@@ -153,6 +153,91 @@ fn invalid_app_config_fails_clearly() {
     );
 }
 
+/// Fase M.1: compactacao pre-fork. O daemon da app roda GC.start + GC.compact
+/// pos-boot por default (preload presente); o child de fork herda o contador
+/// do GC — `GC.stat(:compact_count) >= 1` prova que o boot foi compactado.
+/// CALISTO_COMPACT=0 desliga (daemon respawnado: flag de perf nao entra no
+/// hash do socket). Semantica intacta: compactacao e performance, os outros
+/// testes de boot congelado cobrem a paridade.
+#[test]
+fn app_daemon_compacts_heap_by_default() {
+    let dir = runtime_dir("appcompact");
+    let bc = dir.join("boot_count");
+    let env = [("BOOT_COUNT_FILE", bc.to_str().unwrap())];
+
+    // daemon da app com compactacao default on (preload presente)
+    let first = app_run(&dir, "preloadapp", &["run", "main.rb"], &env);
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    let out = app_run(&dir, "preloadapp", &["run", "-e", "puts GC.stat(:compact_count)"], &env);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let n: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+    assert!(n >= 1, "daemon da app deve compactar o heap no boot: compact_count={}", String::from_utf8_lossy(&out.stdout));
+
+    // desligado por override: stop + run com CALISTO_COMPACT=0
+    stop_app(&dir, "preloadapp");
+    let env_off = [("BOOT_COUNT_FILE", bc.to_str().unwrap()), ("CALISTO_COMPACT", "0")];
+    let out = app_run(&dir, "preloadapp", &["run", "-e", "puts GC.stat(:compact_count)"], &env_off);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let n: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(99);
+    assert_eq!(n, 0, "CALISTO_COMPACT=0 deve desligar a compactacao: {}", String::from_utf8_lossy(&out.stdout));
+    stop_app(&dir, "preloadapp");
+}
+
+/// Fase M.1: `[run] compact` no calisto.toml — valor invalido falha com a
+/// linha apontada; `compact = "false"` desliga (e o default-on cobre o true).
+#[test]
+fn compact_flag_in_toml_is_parsed_and_validated() {
+    let dir = runtime_dir("appcompactflag");
+    let project = dir.join("compactapp");
+    std::fs::create_dir_all(project.join("config")).unwrap();
+    std::fs::write(project.join("script.rb"), "puts :ok\n").unwrap();
+    std::fs::write(project.join("config/boot.rb"), "# boot barato\n").unwrap();
+
+    // booleano TOML puro invalido -> erro apontando a linha
+    std::fs::write(
+        project.join("calisto.toml"),
+        "[run]\npreload = \"config/boot.rb\"\ncompact = banana\n",
+    )
+    .unwrap();
+    let out = run_opt(
+        &dir,
+        RunOpts { args: &["run", "script.rb"], env: &[], stdin: None, cwd: Some(&project), timeout: 30 },
+    );
+    assert_ne!(out.status.code(), Some(0));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("calisto.toml:3") && err.contains("compact"),
+        "erro deve apontar a linha e a chave: {err}"
+    );
+
+    // false explicito no toml desliga a compactacao do daemon da app
+    std::fs::write(
+        project.join("calisto.toml"),
+        "[run]\npreload = \"config/boot.rb\"\ncompact = \"false\"\n",
+    )
+    .unwrap();
+    let out = run_opt(
+        &dir,
+        RunOpts {
+            args: &["run", "-e", "puts GC.stat(:compact_count)"],
+            env: &[],
+            stdin: None,
+            cwd: Some(&project),
+            timeout: 30,
+        },
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "0",
+        "compact = false no calisto.toml"
+    );
+    let _ = run_opt(
+        &dir,
+        RunOpts { args: &["stop"], env: &[], stdin: None, cwd: Some(&project), timeout: 10 },
+    );
+}
+
 #[test]
 fn rails_runner_frozen_boot() {
     // Golden test do marco: `rails runner` em app Rails 8 + sqlite3 com boot

@@ -39,7 +39,7 @@ graph LR
 - [x] **Fase J (Ciclo de vida: init / upgrade / completions)** — `calisto init [name]` (scaffold como `bun init`: calisto.toml com `[scripts] start = "./hello.rb"` + hello.rb executável com shebang + .gitignore; nunca sobrescreve sem `--force`), `calisto run` **bare** roda o `start` do calisto.toml (convenção npm/bun — sem `start`, erro de uso como antes), `calisto upgrade [version]` (roda `scripts/build-ruby.sh`: rebuild do pin ou build de `vendor/ruby-<v>`; idempotente; versão sem sha conhecido → erro claro antes de spawnar; exit code do script propaga), `calisto completions bash|zsh` (scripts instaláveis). Marco: `calisto init meu-app` → `calisto run` **33ms** quente no scaffold.
 - [x] **Fase K (deps: o bun add do Ruby)** — `calisto add/remove/lock` = **wrapper fino** do `bundle add/remove/lock` com o ruby da versão certa (Fase I) e cwd na raiz do projeto (walk-up do Gemfile); PATH prefixado com o bin dir do ruby (trap do restart do bundler). Marco: `calisto add sinatra` num projeto → `calisto run` ativa sem passos manuais (Sinatra 4.2.1 no daemon quente).
 
-Números de hoje: Rails runner 2162ms → **108ms (20×)** no Chatwoot; 1527→177ms (8.6×) no Maybe; boot Rails 2.2s → 105ms; `calisto test` no railsapp: suite de 2 arquivos **<1s** quente (boot pago uma vez, <500ms/arquivo); `calisto task db:migrate` idempotente: 530ms frio → **98ms** quente; `calisto run -e 'puts 1+1'` quente **36ms** (marco <50ms); `calisto exec sidekiq -r <app>` no Maybe processa o `CalistoProbeJob` (golden realapps); `calisto run db:migrate` quente **135ms** e `calisto run test <filtro>` **74ms** no railsapp (Fase H); sob 3.4.4 (Fase I): maybe 2º comando **203ms**, chatwoot **134ms**, `run -e` **34ms**; scaffold do `calisto init` (Fase J): 2º `run` **33ms**, `run -e` **22ms**; bundle com C-ext (Fase F): `sqlite3` (require dinâmico) e `puma` rodam com `GEM_PATH` vazio; `calisto add sinatra` → `calisto run` ativa (Fase K). Golden tests gated em `test/{bundler,app,realapps,testcmd,exec,scripts,versions,tooling,deps}.rs`.
+Números de hoje: Rails runner 2162ms → **108ms (20×)** no Chatwoot; 1527→177ms (8.6×) no Maybe; boot Rails 2.2s → 105ms; `calisto test` no railsapp: suite de 2 arquivos **<1s** quente (boot pago uma vez, <500ms/arquivo); `calisto task db:migrate` idempotente: 530ms frio → **98ms** quente; `calisto run -e 'puts 1+1'` quente **36ms** (marco <50ms); `calisto exec sidekiq -r <app>` no Maybe processa o `CalistoProbeJob` (golden realapps); `calisto run db:migrate` quente **135ms** e `calisto run test <filtro>` **74ms** no railsapp (Fase H); sob 3.4.4 (Fase I): maybe 2º comando **203ms**, chatwoot **134ms**, `run -e` **34ms**; scaffold do `calisto init` (Fase J): 2º `run` **33ms**, `run -e` **22ms**; bundle com C-ext (Fase F): `sqlite3` (require dinâmico) e `puma` rodam com `GEM_PATH` vazio; compactação pré-fork (Fase M): **Private_Dirty do child do Chatwoot −46%** (96.9→52.3 MiB; Pss −15% — a metade compartilhada dilui o Pss), medido pelo `calisto doctor` (smaps_rollup do daemon + child de probe); `calisto add sinatra` → `calisto run` ativa (Fase K). Golden tests gated em `test/{bundler,app,realapps,testcmd,exec,scripts,versions,tooling,deps}.rs`.
 
 ## Fases futuras — em partes
 
@@ -197,26 +197,47 @@ Hoje o daemon é `spawn vendor/ruby server.rb`. Esta fase move o daemon para
 - Estimativa: 3–4 semanas (é a fundação; L.1–L.3 entregam valor sem L.4,
   que pode ser L-bis).
 
-### Fase M — Memória e copy-on-write (o preço do preload)
+### Fase M — Memória e copy-on-write (o preço do preload) ✅
 O daemon com Chatwoot preloaded passa de 500MB RSS; cada fork compartilha
 páginas até a primeira escrita. Com a VM embutida (Fase L) o calisto
 controla o heap **antes** de aceitar conexões.
 
-- [ ] **M.1 — compactação pré-fork**: após o boot (preload + entrypoint),
+- [x] **M.1 — compactação pré-fork**: após o boot (preload + entrypoint),
       `GC.start` + `GC.compact` no daemon → heap denso e read-only na
       prática → children compartilham quase tudo via CoW. Flag
-      `[run] compact = true` (default on quando há daemon de app).
-- [ ] **M.2 — medição real**: `calisto doctor` reporta RSS/Pss do daemon e
+      `[run] compact = true` (default on quando há daemon de app; booleano
+      TOML puro ou `"true"`/`"false"` entre aspas; `CALISTO_COMPACT=0/1`
+      sobrepõe para operação/testes). O hook roda antes do bind, nos dois
+      modos de daemon (embutido em `daemon_main`, legado no server.rb), e é
+      best-effort: falha avisa e segue. Não entra no hash do socket (flag de
+      performance, como scripts — mudar não reinicia o daemon).
+- [x] **M.2 — medição real**: `calisto doctor` reporta RSS/Pss do daemon e
       de um child de probe (`/proc/<pid>/smaps_rollup`), separando
-      `Shared_Clean`/`Private_Dirty` — o número que prova o CoW.
-- [ ] **M.3 — arenas e GVL**: `MALLOC_ARENA_MAX=2` no spawn do daemon
+      `Shared_Clean`/`Private_Dirty` — o número que prova o CoW. O probe é
+      um EVAL no daemon quente que escreve o pid, **suja páginas de verdade**
+      (300k objetos + `GC.start` — sem trabalho, o child medido dormindo não
+      diferencia fragmentação de densidade), sinaliza `DONE` e dorme enquanto
+      o doctor lê o smaps. Linhas: `daemon memory:` e `probe child memory:`
+      (RSS | Pss | Shared_Clean | Private_Dirty, em MiB).
+- [x] **M.3 — arenas e GVL**: `MALLOC_ARENA_MAX=2` no spawn do daemon
       (glibc fragmenta o heap do preload em arenas por thread que o child
-      nunca usa); avaliar `--yjit-mem-size` (guarda para a Fase N).
-- Marco: Pss de um child do Chatwoot cai **≥30%** vs. baseline medido no
-  M.2 (teste gated realapps lendo smaps_rollup); nenhum teste de paridade
-  quebra (compactação não pode mudar semântica — invariante coberto pela
-  suíte existente).
-- Estimativa: 1 semana.
+      nunca usa). `--yjit-mem-size` fica para a Fase N (é guarda do YJIT,
+      não da fragmentação).
+- Marco ✅: **Private_Dirty de um child do Chatwoot cai 96.9 → 52.3 MiB
+  (−46%)** vs. baseline sem compactação (Pss 160.8 → 135.9, −15% — o Pss
+  carrega a metade compartilhada, constante nos dois modos, e dilui o
+  efeito; o número que prova o CoW é o Private_Dirty). Medido via `calisto
+  doctor` no Chatwoot (que pina 3.4.4 → o daemon legado/server.rb — o hook
+  de compactação dos dois modos é coberto). Teste gated em `test/realapps.rs`
+  (`chatwoot_compaction_cuts_probe_child_pss`): baseline com
+  `CALISTO_COMPACT=0` → stop → default on → cortes ≥30% (Private_Dirty) e
+  Pss estritamente menor. Suíte inteira verde (15 targets) com o compact on
+  por default nos daemons de app — paridade cold/warm e upstream intactas
+  (compactação não muda semântica). Hermético: `GC.stat(:compact_count)` do
+  child prova o compact no boot (default on ≥1; `CALISTO_COMPACT=0`/`[run]
+  compact = "false"` → 0; valor inválido → erro apontando a linha) em
+  `test/app.rs`; doctor com/sem daemon em `test/cli.rs`.
+- Estimativa: ~~1 semana~~ (concluída).
 
 ### Fase N — YJIT quente no fork (o que só essa arquitetura permite)
 YJIT aquece **por processo**: num `ruby` normal os primeiros requests são

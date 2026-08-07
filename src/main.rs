@@ -391,6 +391,7 @@ fn connect_or_spawn_daemon_in(
     preload: &str,
     flags: &[&str],
     setup: impl FnOnce(&mut Command),
+    compact: bool,
 ) -> Result<UnixStream, String> {
     let sock = dir.join("calisto.sock");
     if let Ok(s) = UnixStream::connect(&sock) {
@@ -424,6 +425,14 @@ fn connect_or_spawn_daemon_in(
     cmd.env("CALISTO_SOCKET", &sock)
         .env("CALISTO_PIDFILE", dir.join("calisto.pid"))
         .env("CALISTO_PRELOAD", preload)
+        // Fase M.3: limita as arenas do glibc no daemon — o heap do preload
+        // fragmenta em arenas por thread que os children (fork single-thread,
+        // pos rb_thread_atfork) nunca usam. 2 arenas cobrem main + timer
+        // thread da VM; o child herda a config ja lida pelo glibc.
+        .env("MALLOC_ARENA_MAX", "2")
+        // Fase M.1: compactacao pre-fork (GC.start + GC.compact pos-boot) —
+        // default on no daemon de app; ver `app_compact`.
+        .env("CALISTO_COMPACT", if compact { "1" } else { "0" })
         .stdin(Stdio::null());
     setup(&mut cmd);
     let mut child = cmd
@@ -448,7 +457,9 @@ fn connect_or_spawn_daemon_in(
 }
 
 fn connect_or_spawn_daemon(ruby: &Path, preload: &str) -> Result<UnixStream, String> {
-    connect_or_spawn_daemon_in(ruby, &daemon_dir_for(ruby), preload, &[], |_| {})
+    // Daemon generico: sem app, sem compactacao (heap pequeno; o default on
+    // e do daemon de app — `[run] compact` nao faz sentido aqui).
+    connect_or_spawn_daemon_in(ruby, &daemon_dir_for(ruby), preload, &[], |_| {}, false)
 }
 
 fn connect_or_spawn_app_daemon(ruby: &Path, app: &AppConfig) -> Result<UnixStream, String> {
@@ -469,6 +480,7 @@ fn connect_or_spawn_app_daemon_in(
     dir: &Path,
     envs: &[(&str, &str)],
 ) -> Result<UnixStream, String> {
+    let compact = app_compact(app)?;
     let preload = app.preload.as_ref().map(|p| p.display().to_string());
     // Daemon da app: boota com o Gemfile ativo (-rbundler/setup ANTES do
     // script — flag real) e cwd na raiz da app, e o entrypoint e carregado
@@ -481,7 +493,7 @@ fn connect_or_spawn_app_daemon_in(
         for (k, v) in envs {
             cmd.env(k, v);
         }
-    })
+    }, compact)
 }
 
 /// Uso interno (Fase L): `calisto daemon --internal [-r<gem>...]` — o daemon
@@ -862,6 +874,16 @@ $LOADED_FEATURES << File.expand_path($calisto_app_preload)
             Err(e) if vm.is_system_exit(e) => return Ok(vm.cleanup(vm.system_exit_status(e))),
             Err(e) => return Err(format!("app preload: {}", vm.error_summary(e))),
             Ok(_) => {}
+        }
+    }
+    // Fase M.1: compactacao pre-fork (pos-boot, antes do bind). GC.start +
+    // GC.compact densificam o heap -> os children (fork) nascem com quase
+    // todas as paginas compartilhadas via CoW (o que o child escreve depois
+    // custa paginas privadas). Best-effort como o preload: falha avisa e
+    // segue — performance, nao semantica.
+    if env::var("CALISTO_COMPACT").as_deref() == Ok("1") {
+        if let Err(e) = vm.eval("GC.start\nGC.compact\n") {
+            eprintln!("calisto: compact falhou: {}", vm.error_summary(e));
         }
     }
     // bind com stale-socket recovery (EADDRINUSE -> live? -> exit 0 | unlink)
@@ -1421,8 +1443,28 @@ struct AppConfig {
     root: PathBuf,
     /// entrypoint a pre-carregar no daemon (ex.: config/environment.rb)
     preload: Option<PathBuf>,
+    /// `[run] compact` (Fase M): compacta o heap pos-boot (GC.start +
+    /// GC.compact) antes de aceitar conexoes. None = default (on quando ha
+    /// preload, ou seja, daemon de app). Flag de performance — nao entra no
+    /// hash do socket (mudar nao reinicia o daemon, como scripts).
+    compact: Option<bool>,
     /// `[scripts]` nome -> comando (ordem do arquivo; Fase H)
     scripts: Vec<(String, String)>,
+}
+
+/// `[run] compact` efetivo: CALISTO_COMPACT (override de operacao/testes) >
+/// calisto.toml > default on quando ha preload (daemon de app). O daemon
+/// compacta o heap apos o boot — os children (fork) compartilham quase todas
+/// as paginas via CoW (Fase M.1).
+fn app_compact(app: &AppConfig) -> Result<bool, String> {
+    if let Ok(v) = env::var("CALISTO_COMPACT") {
+        return match v.as_str() {
+            "1" | "true" => Ok(true),
+            "0" | "false" => Ok(false),
+            _ => Err(format!("CALISTO_COMPACT deve ser 0/1/true/false (achei '{v}')")),
+        };
+    }
+    Ok(app.compact.unwrap_or(app.preload.is_some()))
 }
 
 impl AppConfig {
@@ -1474,6 +1516,7 @@ fn split_command(s: &str) -> Result<Vec<String>, String> {
 
 fn parse_calisto_toml(content: &str, base: &Path) -> Result<AppConfig, String> {
     let mut preload: Option<PathBuf> = None;
+    let mut compact: Option<bool> = None;
     let mut scripts: Vec<(String, String)> = Vec::new();
     let mut section = "run"; // chave sem secao = [run] (backwards compat)
     for (i, raw) in content.lines().enumerate() {
@@ -1493,22 +1536,41 @@ fn parse_calisto_toml(content: &str, base: &Path) -> Result<AppConfig, String> {
             return Err(format!("calisto.toml:{}: linha invalida: {raw}", i + 1));
         };
         let k = k.trim();
-        let Some(value) = v.trim().strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
-            return Err(format!("calisto.toml:{}: {k} precisa ser \"valor\"", i + 1));
+        // chaves do [run] aceitam booleano TOML puro (true/false sem aspas),
+        // como no TOML de verdade; o resto do subset exige "valor" entre aspas
+        let bare = k == "compact";
+        let value = match v.trim().strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            Some(s) => s.to_string(),
+            None if bare => v.trim().to_string(),
+            None => {
+                return Err(format!("calisto.toml:{}: {k} precisa ser \"valor\"", i + 1));
+            }
         };
         match section {
-            "run" => {
-                if k != "preload" {
+            "run" => match k {
+                "preload" => {
+                    if value.is_empty() {
+                        return Err(format!("calisto.toml:{}: preload vazio", i + 1));
+                    }
+                    preload = Some(base.join(&value));
+                }
+                "compact" => match value.as_str() {
+                    "true" => compact = Some(true),
+                    "false" => compact = Some(false),
+                    _ => {
+                        return Err(format!(
+                            "calisto.toml:{}: compact precisa ser true/false (achei '{value}')",
+                            i + 1
+                        ));
+                    }
+                },
+                _ => {
                     return Err(format!(
                         "calisto.toml:{}: chave desconhecida '{k}' (scripts vao na secao [scripts])",
                         i + 1
                     ));
                 }
-                if value.is_empty() {
-                    return Err(format!("calisto.toml:{}: preload vazio", i + 1));
-                }
-                preload = Some(base.join(value));
-            }
+            },
             _ => {
                 // [scripts]: nome -> comando (validado na resolucao do run)
                 scripts.push((k.to_string(), value.to_string()));
@@ -1523,7 +1585,7 @@ fn parse_calisto_toml(content: &str, base: &Path) -> Result<AppConfig, String> {
             ));
         }
     }
-    Ok(AppConfig { root: base.to_path_buf(), preload, scripts })
+    Ok(AppConfig { root: base.to_path_buf(), preload, compact, scripts })
 }
 
 /// Detecta app do cwd (walk up, como Gemfile). Erro de parse e estrito no
@@ -1714,7 +1776,12 @@ fn send_run_request(
         .filter(|(k, _)| {
             !matches!(
                 k.as_str(),
-                "CALISTO_RUNTIME_DIR" | "CALISTO_SOCKET" | "CALISTO_PIDFILE" | "CALISTO_PRELOAD" | "CALISTO_RUBY"
+                "CALISTO_RUNTIME_DIR"
+                    | "CALISTO_SOCKET"
+                    | "CALISTO_PIDFILE"
+                    | "CALISTO_PRELOAD"
+                    | "CALISTO_COMPACT"
+                    | "CALISTO_RUBY"
             )
         })
         .map(|(k, v)| format!("{k}={v}"))
@@ -2972,6 +3039,115 @@ fn cmd_stop() -> i32 {
     0
 }
 
+/// Memoria do processo (Fase M.2): smaps_rollup do /proc (uma linha por
+/// categoria, barato — nao soma o smaps inteiro). Separar Shared_Clean de
+/// Private_Dirty e o que prova o CoW: paginas compartilhadas (herdadas do
+/// fork) vs o custo real de cada child.
+struct MemStats {
+    rss_kb: u64,
+    pss_kb: u64,
+    shared_clean_kb: u64,
+    private_dirty_kb: u64,
+}
+
+fn read_smaps_rollup(pid: i32) -> Option<MemStats> {
+    let content = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+    let mut m = MemStats { rss_kb: 0, pss_kb: 0, shared_clean_kb: 0, private_dirty_kb: 0 };
+    for line in content.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(k), Some(v)) = (it.next(), it.next()) else { continue };
+        let Ok(kb) = v.parse::<u64>() else { continue };
+        match k.trim_end_matches(':') {
+            "Rss" => m.rss_kb = kb,
+            "Pss" => m.pss_kb = kb,
+            "Shared_Clean" => m.shared_clean_kb = kb,
+            "Private_Dirty" => m.private_dirty_kb = kb,
+            _ => {}
+        }
+    }
+    (m.rss_kb > 0).then_some(m)
+}
+
+fn fmt_mib(kb: u64) -> String {
+    format!("{:.1} MiB", kb as f64 / 1024.0)
+}
+
+fn print_mem_line(label: &str, m: &MemStats) {
+    println!(
+        "  {label}: RSS {} | Pss {} | Shared_Clean {} | Private_Dirty {}",
+        fmt_mib(m.rss_kb),
+        fmt_mib(m.pss_kb),
+        fmt_mib(m.shared_clean_kb),
+        fmt_mib(m.private_dirty_kb)
+    );
+}
+
+/// Codigo do child de probe: escreve o pid, suja paginas de verdade
+/// (alocacao + GC espalham as escritas pelo heap — e isso que o CoW mede),
+/// sinaliza `DONE` e dorme enquanto o doctor le o smaps_rollup (o child so
+/// existe vivo durante o RUN).
+const PROBE_CODE: &str = r#"
+File.write(ENV.fetch("CALISTO_PROBE_PID"), Process.pid.to_s)
+a = 300_000.times.map { Object.new }
+GC.start
+a = nil
+File.write(ENV.fetch("CALISTO_PROBE_DONE"), "1")
+sleep 3
+"#;
+
+fn report_daemon_memory() {
+    let dir = current_runtime_dir();
+    let Some(pid) = fs::read_to_string(dir.join("calisto.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+    else {
+        return;
+    };
+    if let Some(m) = read_smaps_rollup(pid) {
+        print_mem_line("daemon memory", &m);
+    }
+    let Some(mut s) = daemon_connect_at(&dir) else { return };
+    // child de probe via EVAL no daemon quente (thread: o STATUS so chega no
+    // fim do sleep — a leitura acontece no meio, via pid/done files)
+    let probe_pid = std::env::temp_dir().join(format!(
+        "calisto-probe-{}-{}.pid",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let probe_done = probe_pid.with_extension("done");
+    let (pid_path, done_path) = (probe_pid.display().to_string(), probe_done.display().to_string());
+    let handle = std::thread::spawn(move || {
+        let cwd = env::current_dir()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let extra = [
+            ("CALISTO_PROBE_PID", pid_path.as_str()),
+            ("CALISTO_PROBE_DONE", done_path.as_str()),
+        ];
+        let _ = eval_request_full(&mut s, &cwd, &extra, PROBE_CODE, &[]);
+    });
+    // pid aparece em ~10ms; DONE depois do trabalho do probe (alocacao + GC)
+    let mut child: Option<i32> = None;
+    for _ in 0..200 {
+        if probe_done.is_file() {
+            child = fs::read_to_string(&probe_pid).ok().and_then(|p| p.trim().parse().ok());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if let Some(child_pid) = child {
+        if let Some(m) = read_smaps_rollup(child_pid) {
+            print_mem_line("probe child memory", &m);
+        }
+    }
+    let _ = handle.join();
+    let _ = fs::remove_file(&probe_pid);
+    let _ = fs::remove_file(&probe_done);
+}
+
 fn cmd_doctor() -> i32 {
     let Some(ruby) = ruby_or_err() else {
         return 1;
@@ -2987,6 +3163,11 @@ fn cmd_doctor() -> i32 {
         ),
     }
     cmd_status();
+    // Fase M.2: memoria do daemon + child de probe (CoW) — so quando o daemon
+    // esta vivo (doctor nao spawna daemon: diagnostico, nao boot)
+    if daemon_connect_at(&current_runtime_dir()).is_some() {
+        report_daemon_memory();
+    }
     0
 }
 
@@ -3089,6 +3270,10 @@ CONFIG:
   CALISTO_RUBY        path to a ruby binary (default: vendor/current/bin/ruby)
   CALISTO_PRELOAD     comma-separated stdlib preload list
   CALISTO_RUNTIME_DIR daemon socket/pid location (default: $XDG_RUNTIME_DIR/calisto)
+  CALISTO_COMPACT     [run].compact override (0/1): compacta o heap do daemon
+                      pos-boot (GC.start + GC.compact — Fase M) para os forks
+                      compartilharem paginas via CoW; default on no daemon de
+                      app (calisto.toml com [run].preload)
 
 NOTE: calisto run is equivalent to `bundle exec ruby <script>` with -e/-E VM
 flags (alem de -e) ainda nao suportados; fora de Gemfile, identico a

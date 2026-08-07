@@ -102,6 +102,19 @@ if APP_PRELOAD
   $LOADED_FEATURES << File.expand_path(APP_PRELOAD)
 end
 
+# ---- boot: compactacao pre-fork (Fase M) --------------------------------------
+# GC.start + GC.compact apos o boot: heap denso -> os children (fork do
+# daemon) nascem com quase todas as paginas compartilhadas via CoW. Espelho
+# do daemon embutido (main.rs): best-effort — falha avisa e segue.
+if ENV["CALISTO_COMPACT"] == "1"
+  begin
+    GC.start
+    GC.compact
+  rescue StandardError, NotImplementedError => e
+    warn "calisto: compact falhou: #{e.class}: #{e.message}"
+  end
+end
+
 # ---- boot: bind --------------------------------------------------------------
 def live?
   UNIXSocket.new(SOCKET).close

@@ -458,3 +458,126 @@ fn base64_key() -> String {
     key.push('=');
     key
 }
+
+/// Fase M (marco): a compactacao pre-fork (GC.start + GC.compact pos-boot)
+/// corta o **Private_Dirty** do child do Chatwoot em >=30% vs o baseline sem
+/// compactacao — o numero que prova o CoW dos forks (o Pss e diluido pela
+/// metade compartilhada, constante nos dois modos). Mede via `calisto doctor`
+/// (smaps_rollup do daemon + child de probe): boot do daemon com
+/// CALISTO_COMPACT=0 (baseline fragmentado), mede; stop; boot default
+/// (compact on), mede. O Chatwoot pina 3.4.4, entao o daemon roda no modo
+/// legado (server.rb) — o teste cobre o hook de compactacao do daemon legado
+/// tambem. Gated como os outros goldens.
+#[test]
+fn chatwoot_compaction_cuts_probe_child_pss() {
+    let dir = runtime_dir("chatwootcompact");
+    let app = fixture("chatwoot");
+    let env: Vec<(&str, &str)> = vec![
+        ("POSTGRES_HOST", "127.0.0.1"),
+        ("POSTGRES_PORT", "5434"),
+        ("POSTGRES_USERNAME", "chatwoot"),
+        ("POSTGRES_PASSWORD", "chatwoot_password"),
+        ("POSTGRES_DATABASE", "chatwoot_dev"),
+        ("REDIS_URL", "redis://127.0.0.1:6381"),
+        ("SECRET_KEY_BASE", "calisto-chatwoot-compact-test-secret-key-base-0123456789abcdef"),
+        ("FRONTEND_URL", "http://localhost:3000"),
+        ("ACTIVE_STORAGE_SERVICE", "local"),
+    ];
+
+    // gates (os mesmos do chatwoot_backend_serves_api_and_cable)
+    if !app.join("calisto.toml").is_file() {
+        eprintln!(
+            "SKIP chatwoot_compaction_cuts_probe_child_pss: checkout Chatwoot ausente — \
+             `git clone --depth 1 https://github.com/chatwoot/chatwoot.git test/fixtures/chatwoot`"
+        );
+        return;
+    }
+    if !bundle_check(&app) {
+        eprintln!(
+            "SKIP chatwoot_compaction_cuts_probe_child_pss: rode `bundle install` em test/fixtures/chatwoot"
+        );
+        return;
+    }
+    if !port_open(5434) || !port_open(6381) {
+        let up = std::process::Command::new("docker")
+            .args(["compose", "-f", "compose.calisto.yml", "up", "-d", "--wait"])
+            .current_dir(&app)
+            .output();
+        match up {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!(
+                    "SKIP chatwoot_compaction_cuts_probe_child_pss: suba a infra — \
+                     `docker compose -f test/fixtures/chatwoot/compose.calisto.yml up -d`"
+                );
+                return;
+            }
+        }
+    }
+    if !wait_port(5434, 30) || !wait_port(6381, 30) {
+        eprintln!("SKIP chatwoot_compaction_cuts_probe_child_pss: postgres/redis nao subiram");
+        return;
+    }
+
+    // Pss/Private_Dirty do child de probe reportados pelo doctor (linha
+    // "probe child memory:"). O marco e o Private_Dirty: o Pss inclui a
+    // metade compartilhada (constante nos dois modos — a compactacao nao
+    // encolhe o heap) e dilui o efeito; o Private_Dirty e o custo exclusivo
+    // do child, o numero que prova o CoW.
+    let probe_mem = |out: &std::process::Output, key: &str| -> f64 {
+        let s = String::from_utf8_lossy(&out.stdout);
+        let l = s
+            .lines()
+            .find(|l| l.contains("probe child memory:"))
+            .unwrap_or_else(|| panic!("doctor deveria reportar o probe child: {s}"));
+        let toks: Vec<&str> = l.split_whitespace().collect();
+        let i = toks.iter().position(|t| *t == key).expect("chave na linha");
+        toks[i + 1].parse().expect("valor numerico")
+    };
+
+    // baseline: daemon sem compactacao (heap fragmentado)
+    let mut env_off = env.clone();
+    env_off.push(("CALISTO_COMPACT", "0"));
+    let boot = app_run(&dir, "chatwoot", &["run", "bin/rails", "runner", "puts :ok"], &env_off);
+    assert!(boot.status.success(), "boot baseline: {}", String::from_utf8_lossy(&boot.stderr));
+    let doc_off = run_opt(
+        &dir,
+        RunOpts { args: &["doctor"], env: &[], stdin: None, cwd: Some(&app), timeout: 60 },
+    );
+    assert!(doc_off.status.success(), "{}", String::from_utf8_lossy(&doc_off.stderr));
+    let (baseline_pd, baseline_pss) = (probe_mem(&doc_off, "Private_Dirty"), probe_mem(&doc_off, "Pss"));
+    assert!(baseline_pd > 0.0, "baseline de Private_Dirty invalido: {baseline_pd}");
+    let _ = run_opt(
+        &dir,
+        RunOpts { args: &["stop"], env: &[], stdin: None, cwd: Some(&app), timeout: 10 },
+    );
+
+    // compactado: daemon default (compact on no daemon de app)
+    let boot = app_run(&dir, "chatwoot", &["run", "bin/rails", "runner", "puts :ok"], &env);
+    assert!(boot.status.success(), "boot compactado: {}", String::from_utf8_lossy(&boot.stderr));
+    let doc_on = run_opt(
+        &dir,
+        RunOpts { args: &["doctor"], env: &[], stdin: None, cwd: Some(&app), timeout: 60 },
+    );
+    assert!(doc_on.status.success(), "{}", String::from_utf8_lossy(&doc_on.stderr));
+    let (compacted_pd, compacted_pss) = (probe_mem(&doc_on, "Private_Dirty"), probe_mem(&doc_on, "Pss"));
+
+    let _ = run_opt(
+        &dir,
+        RunOpts { args: &["stop"], env: &[], stdin: None, cwd: Some(&app), timeout: 10 },
+    );
+    eprintln!(
+        "chatwoot probe child: Private_Dirty {baseline_pd:.1} -> {compacted_pd:.1} MiB ({:.0}% de corte); \
+         Pss {baseline_pss:.1} -> {compacted_pss:.1} MiB ({:.0}%)",
+        (1.0 - compacted_pd / baseline_pd) * 100.0,
+        (1.0 - compacted_pss / baseline_pss) * 100.0
+    );
+    assert!(
+        compacted_pd <= baseline_pd * 0.7,
+        "compactacao deveria cortar >=30% do Private_Dirty do child (baseline {baseline_pd:.1} MiB -> {compacted_pd:.1} MiB)"
+    );
+    assert!(
+        compacted_pss < baseline_pss,
+        "Pss do child tambem deveria cair (baseline {baseline_pss:.1} MiB -> {compacted_pss:.1} MiB)"
+    );
+}
