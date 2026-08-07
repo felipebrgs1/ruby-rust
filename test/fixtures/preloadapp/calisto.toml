@@ -4,3 +4,7 @@
 
 [run]
 preload = "config/environment.rb"
+
+# Fase H: scripts rodam no daemon da app (fork do boot congelado).
+[scripts]
+hello = "bin/hello"

@@ -3,3 +3,11 @@
 
 [run]
 preload = "config/environment.rb"
+
+# Fase H: scripts (o package.json do Ruby). `calisto run dev` sobe o server,
+# `calisto run test` roda a suite, `calisto run db:migrate` migra — todos no
+# daemon da app (dev), com args do CLI no final.
+[scripts]
+dev = "bin/rails server"
+test = "bin/rails test"
+db:migrate = "bin/rails db:migrate"

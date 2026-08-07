@@ -29,12 +29,51 @@ pub fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Bundler do ruby certo para a app (Fase I): respeita `.ruby-version`/
+/// `ruby "x.y.z"` do Gemfile como o calisto resolve; fallback vendor/current.
+/// O `bundle check` precisa rodar no mesmo ruby da app — o lock regenerado
+/// sob outra versao (ex.: base64 0.2.0 no 3.4.4 vs 0.3.0 no 3.4.10) falha o
+/// check com RubyVersionMismatch.
+pub fn app_bundle(app: &Path) -> PathBuf {
+    let vendor = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor");
+    let want = std::fs::read_to_string(app.join(".ruby-version"))
+        .ok()
+        .and_then(|s| {
+            let v = s.lines().next()?.trim().trim_start_matches("ruby-").trim();
+            (!v.is_empty()).then(|| v.to_string())
+        })
+        .or_else(|| {
+            std::fs::read_to_string(app.join("Gemfile")).ok().and_then(|g| {
+                g.lines().find_map(|l| {
+                    let rest = l.trim().strip_prefix("ruby")?.trim_start();
+                    rest.strip_prefix('"')
+                        .and_then(|s| s.split('"').next())
+                        .or_else(|| rest.strip_prefix('\'').and_then(|s| s.split('\'').next()))
+                        .filter(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit()))
+                        .map(str::to_string)
+                })
+            })
+        });
+    match want {
+        Some(v) => {
+            let cand = vendor.join(format!("ruby-{v}/bin/bundle"));
+            if cand.is_file() {
+                cand
+            } else {
+                vendor.join("current/bin/bundle")
+            }
+        }
+        None => vendor.join("current/bin/bundle"),
+    }
+}
+
 /// Gems do Gemfile instaladas (bundle check)? Gate dos golden tests que
 /// dependem de `bundle install` previo (rede/C exts).
 pub fn bundle_check(app: &Path) -> bool {
-    let vendor_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/current/bin");
-    Command::new(vendor_bin.join("bundle"))
-        .env("PATH", format!("{}:{}", vendor_bin.display(), env!("PATH")))
+    let bundle = app_bundle(app);
+    let bin = bundle.parent().unwrap_or(Path::new("."));
+    Command::new(&bundle)
+        .env("PATH", format!("{}:{}", bin.display(), env!("PATH")))
         .arg("check")
         .current_dir(app)
         .output()

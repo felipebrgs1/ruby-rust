@@ -4,11 +4,14 @@
 #
 #   - Pin: RUBY_VERSION (default 3.4.10), verified against SHA-256.
 #   - Vendors libyaml when the system has no yaml-0.1 (needed by stdlib psych/yaml).
-#   - Installs into vendor/ruby-<version>/ and symlinks vendor/current -> it.
+#   - Installs into vendor/ruby-<version>/ and symlinks vendor/current -> the
+#     DEFAULT pin (3.4.10). Building uma versao extra (Fase I: multi-versoes)
+#     nao troca o vendor/current — o calisto seleciona por .ruby-version/Gemfile.
 #
 # Usage:
 #   scripts/build-ruby.sh            # build pinned 3.4.10
-#   RUBY_VERSION=3.4.0 scripts/build-ruby.sh   # override pin
+#   RUBY_VERSION=3.4.4 scripts/build-ruby.sh   # build 3.4.4 (sha conhecido)
+#   RUBY_VERSION=3.4.0 RUBY_SHA256=... scripts/build-ruby.sh  # qualquer versao
 #
 # Requirements: gcc, make, pkg-config, autoconf, bison, curl, tar, xz.
 set -euo pipefail
@@ -18,8 +21,14 @@ VENDOR="$ROOT/vendor"
 SRC="$VENDOR/src"
 JOBS="${JOBS:-$(nproc)}"
 
+DEFAULT_RUBY_VERSION="${DEFAULT_RUBY_VERSION:-3.4.10}"
 RUBY_VERSION="${RUBY_VERSION:-3.4.10}"
-RUBY_SHA256="${RUBY_SHA256:-ecee2d072a14f2d14347dd56dfd8fe5c3130abf5117bfaacbda0f4ef9cc429ec}"
+# sha256 conhecidos (o calisto ainda nao tem instalador proprio); sobrescreva
+# com RUBY_SHA256 para versoes fora desta lista.
+case "$RUBY_VERSION" in
+  3.4.10) RUBY_SHA256="${RUBY_SHA256:-ecee2d072a14f2d14347dd56dfd8fe5c3130abf5117bfaacbda0f4ef9cc429ec}" ;;
+  3.4.4)  RUBY_SHA256="${RUBY_SHA256:-a0597bfdf312e010efd1effaa8d7f1d7833146fdc17950caa8158ffa3dcbfa85}" ;;
+esac
 RUBY_URL="https://cache.ruby-lang.org/pub/ruby/3.4/ruby-${RUBY_VERSION}.tar.gz"
 
 LIBYAML_VERSION="0.2.5"
@@ -92,6 +101,12 @@ else
   ( cd "$SRC/ruby-$RUBY_VERSION" && make install --quiet )
 fi
 
-ln -sfn "$PREFIX" "$VENDOR/current"
+# vendor/current e o DEFAULT (pin): so e repontado quando o alvo e o default
+# ou quando ainda nao existe — construir uma versao extra (Fase I) nao troca
+# o default que o calisto usa sem .ruby-version/Gemfile.
+if [[ "$RUBY_VERSION" == "$DEFAULT_RUBY_VERSION" || ! -e "$VENDOR/current" ]]; then
+  ln -sfn "$PREFIX" "$VENDOR/current"
+  log "current -> ruby-$RUBY_VERSION (default)"
+fi
 log "done: $PREFIX"
 "$PREFIX/bin/ruby" -v

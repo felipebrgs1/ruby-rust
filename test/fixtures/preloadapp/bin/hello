@@ -1,0 +1,6 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Alvo do script `hello` do calisto.toml da preloadapp (Fase H): roda como
+# fork do boot congelado do daemon da app.
+puts "hello #{$0} ARGV=#{ARGV.join(',')} cwd=#{Dir.pwd}"

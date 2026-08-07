@@ -189,30 +189,148 @@ fn runtime_dir() -> PathBuf {
     d
 }
 
-fn ruby_path() -> PathBuf {
+/// Dir que contem `vendor/` (subindo do proprio executavel, mesma busca do
+/// ruby_path antigo) — a base dos rubies empacotados.
+fn vendor_root() -> Option<PathBuf> {
+    let mut dir = env::current_exe().ok()?.parent().map(Path::to_path_buf);
+    while let Some(d) = dir {
+        if d.join("vendor").is_dir() {
+            return Some(d.join("vendor"));
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    let rel = PathBuf::from("vendor");
+    rel.is_dir().then_some(rel)
+}
+
+fn vendor_ruby(vendor: &Option<PathBuf>, version: &str) -> Option<PathBuf> {
+    let cand = vendor.as_ref()?.join(format!("ruby-{version}/bin/ruby"));
+    cand.is_file().then_some(cand)
+}
+
+/// Versao pedida pela primeira linha do `.ruby-version` (rbenv): prefixo
+/// `ruby-` tolerado, linhas vazias ignoradas.
+fn ruby_version_from_file(file: &Path) -> Option<String> {
+    let content = fs::read_to_string(file).ok()?;
+    let v = content
+        .lines()
+        .next()?
+        .trim()
+        .trim_start_matches("ruby-")
+        .trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// Versao pedida pela diretiva `ruby "x.y.z"` do Gemfile (walk up) — ou
+/// `ruby file: ".ruby-version"`, que segue o arquivo. So consultada quando nao
+/// ha `.ruby-version`.
+fn ruby_version_from_gemfile(file: &Path) -> Option<String> {
+    let content = fs::read_to_string(file).ok()?;
+    for line in content.lines() {
+        let Some(rest) = line.trim().strip_prefix("ruby") else {
+            continue; // linha comum (source, gem, group...) — segue procurando
+        };
+        let rest = rest.trim_start();
+        // ruby "3.4.4" | ruby '3.4.4'
+        let quoted = rest
+            .strip_prefix('"')
+            .and_then(|s| s.split('"').next())
+            .or_else(|| rest.strip_prefix('\'').and_then(|s| s.split('\'').next()))
+            .unwrap_or("");
+        if !quoted.is_empty() && quoted.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return Some(quoted.to_string());
+        }
+        // ruby file: ".ruby-version"
+        if let Some(name) = rest.strip_prefix("file:") {
+            if let Some(name) = name.trim().strip_prefix('"').and_then(|s| s.split('"').next()) {
+                return ruby_version_from_file(&file.parent()?.join(name));
+            }
+        }
+    }
+    None
+}
+
+/// Resolve o ruby do calisto (Fase I — multi-versoes):
+///   CALISTO_RUBY (override) > .ruby-version (walk up, rbenv) > diretiva
+///   `ruby "x.y.z"` do Gemfile > vendor/current (pin default).
+/// Versao pedida que nao esta instalada em vendor/ruby-<v> e ERRO claro com o
+/// comando de build (substitui o warning da Fase 1-2).
+fn resolve_ruby() -> Result<PathBuf, String> {
     if let Ok(p) = env::var("CALISTO_RUBY") {
         let pb = PathBuf::from(&p);
         if pb.is_file() {
-            return pb;
+            return Ok(pb);
         }
         eprintln!("calisto: warning: CALISTO_RUBY={p} is not a file; ignoring");
     }
-    if let Ok(exe) = env::current_exe() {
-        let mut dir = exe.parent().map(Path::to_path_buf);
-        while let Some(d) = dir {
-            let cand = d.join("vendor/current/bin/ruby");
-            if cand.is_file() {
-                return cand;
+    let vendor = vendor_root();
+    if let Some(file) = find_in_parents(".ruby-version") {
+        if let Some(want) = ruby_version_from_file(&file) {
+            if let Some(ruby) = vendor_ruby(&vendor, &want) {
+                return Ok(ruby);
             }
-            dir = d.parent().map(Path::to_path_buf);
+            return Err(format!(
+                "calisto: ruby {want} pedido por {} nao esta instalado \
+                 (vendor/ruby-{want} ausente); rode RUBY_VERSION={want} scripts/build-ruby.sh",
+                file.display()
+            ));
         }
     }
-    let rel = PathBuf::from("vendor/current/bin/ruby");
-    if rel.is_file() {
-        return rel;
+    let gemfile = env::var_os("BUNDLE_GEMFILE")
+        .map(PathBuf::from)
+        .or_else(|| find_in_parents("Gemfile"));
+    if let Some(gemfile) = gemfile {
+        if let Some(want) = ruby_version_from_gemfile(&gemfile) {
+            if let Some(ruby) = vendor_ruby(&vendor, &want) {
+                return Ok(ruby);
+            }
+            return Err(format!(
+                "calisto: ruby {want} pedido pelo Gemfile nao esta instalado \
+                 (vendor/ruby-{want} ausente); rode RUBY_VERSION={want} scripts/build-ruby.sh"
+            ));
+        }
+    }
+    if let Some(ruby) = vendor_ruby(&vendor, PINNED_RUBY) {
+        return Ok(ruby);
+    }
+    if let Some(r) = &vendor {
+        let cand = r.join("current/bin/ruby");
+        if cand.is_file() {
+            return Ok(cand);
+        }
     }
     eprintln!("calisto: warning: no pinned ruby found (run scripts/build-ruby.sh); falling back to PATH");
-    PathBuf::from("ruby")
+    Ok(PathBuf::from("ruby"))
+}
+
+/// Resolve o ruby ou imprime o erro e retorna None (callers: `let Some(ruby)
+/// = ruby_or_err() else { return 1 };`).
+fn ruby_or_err() -> Option<PathBuf> {
+    match resolve_ruby() {
+        Ok(ruby) => Some(ruby),
+        Err(e) => {
+            eprintln!("{e}");
+            None
+        }
+    }
+}
+
+/// Versao deduzida do caminho do ruby (`vendor/ruby-<v>/bin/ruby`). None para
+/// o pin default (vendor/current) e para rubies fora do vendor — esses usam os
+/// runtime dirs classicos (sem mudar hashes nem sockets existentes).
+fn ruby_version_of(path: &Path) -> Option<String> {
+    let name = path.parent()?.parent()?.file_name()?.to_str()?;
+    let v = name.strip_prefix("ruby-")?;
+    (v != PINNED_RUBY).then(|| v.to_string())
+}
+
+/// Runtime dir do daemon generico: por versao quando o ruby resolvido nao e o
+/// pin default — daemons de VMs diferentes nao podem dividir o socket.
+fn daemon_dir_for(ruby: &Path) -> PathBuf {
+    match ruby_version_of(ruby) {
+        Some(v) => runtime_dir().join(format!("ruby-{v}")),
+        None => runtime_dir(),
+    }
 }
 
 // ---- wire protocol -------------------------------------------------------------
@@ -261,6 +379,7 @@ fn connect_or_spawn_daemon_in(
     ruby: &Path,
     dir: &Path,
     preload: &str,
+    flags: &[&str],
     setup: impl FnOnce(&mut Command),
 ) -> Result<UnixStream, String> {
     let sock = dir.join("calisto.sock");
@@ -271,7 +390,10 @@ fn connect_or_spawn_daemon_in(
     let rb = dir.join("calisto.rb");
     fs::write(&rb, DAEMON_RB).map_err(|e| format!("cannot write daemon script: {e}"))?;
     let mut cmd = Command::new(ruby);
-    cmd.arg(&rb)
+    // flags ANTES do script: `ruby -r... <daemon.rb>` — depois do script seria
+    // ARGV do daemon, nao flag do interpretador
+    cmd.args(flags)
+        .arg(&rb)
         .env("CALISTO_SOCKET", &sock)
         .env("CALISTO_PIDFILE", dir.join("calisto.pid"))
         .env("CALISTO_PRELOAD", preload)
@@ -299,16 +421,16 @@ fn connect_or_spawn_daemon_in(
 }
 
 fn connect_or_spawn_daemon(ruby: &Path, preload: &str) -> Result<UnixStream, String> {
-    connect_or_spawn_daemon_in(ruby, &runtime_dir(), preload, |_| {})
+    connect_or_spawn_daemon_in(ruby, &daemon_dir_for(ruby), preload, &[], |_| {})
 }
 
 fn connect_or_spawn_app_daemon(ruby: &Path, app: &AppConfig) -> Result<UnixStream, String> {
-    connect_or_spawn_app_daemon_in(ruby, app, &app_runtime_dir(app), &[])
+    connect_or_spawn_app_daemon_in(ruby, app, &app_runtime_dir(app, ruby), &[])
 }
 
 /// Daemon da app em modo teste (RAILS_ENV=test no boot, socket proprio).
 fn connect_or_spawn_test_daemon(ruby: &Path, app: &AppConfig) -> Result<UnixStream, String> {
-    connect_or_spawn_app_daemon_in(ruby, app, &app_test_runtime_dir(app), &[
+    connect_or_spawn_app_daemon_in(ruby, app, &app_test_runtime_dir(app, ruby), &[
         ("RAILS_ENV", "test"),
         ("RACK_ENV", "test"),
     ])
@@ -320,13 +442,15 @@ fn connect_or_spawn_app_daemon_in(
     dir: &Path,
     envs: &[(&str, &str)],
 ) -> Result<UnixStream, String> {
-    let preload = app.preload.display().to_string();
-    // Daemon da app: boota com o Gemfile ativo (-rbundler/setup) e cwd na raiz
-    // da app, e o entrypoint e carregado no boot (CALISTO_APP_PRELOAD).
-    connect_or_spawn_daemon_in(ruby, dir, "", |cmd| {
-        cmd.arg("-rbundler/setup")
-            .current_dir(&app.root)
-            .env("CALISTO_APP_PRELOAD", &preload);
+    let preload = app.preload.as_ref().map(|p| p.display().to_string());
+    // Daemon da app: boota com o Gemfile ativo (-rbundler/setup ANTES do
+    // script — flag real) e cwd na raiz da app, e o entrypoint e carregado
+    // no boot (CALISTO_APP_PRELOAD).
+    connect_or_spawn_daemon_in(ruby, dir, "", &["-rbundler/setup"], |cmd| {
+        cmd.current_dir(&app.root);
+        if let Some(p) = &preload {
+            cmd.env("CALISTO_APP_PRELOAD", p);
+        }
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -385,15 +509,6 @@ fn cmd_run(args: &[String]) -> i32 {
 
     load_dotenv(); // .env do cwd (walk up) entra no env do run/cold/daemon
 
-    if let Some(s) = script {
-        if !Path::new(s).is_file() {
-            eprintln!("calisto: cannot open {s}: no such file");
-            return 1;
-        }
-    }
-
-    check_ruby_version();
-
     let app = match load_app_config() {
         Ok(app) => app,
         Err(e) => {
@@ -402,25 +517,58 @@ fn cmd_run(args: &[String]) -> i32 {
         }
     };
 
-    let ruby = ruby_path();
+    // Fase H: um nome que nao e arquivo resolve para [scripts.NAME] do
+    // calisto.toml (o package.json do Ruby) — arquivo existente sempre vence.
+    let mut script_cmd: Option<Vec<String>> = None;
+    if !eval_mode {
+        let s = rest.first().unwrap();
+        if !Path::new(s).is_file() {
+            match app.as_ref().map(|a| a.script_command(s)) {
+                Some(Ok(Some(argv))) => script_cmd = Some(argv),
+                Some(Err(e)) => {
+                    eprintln!("calisto: {e}");
+                    return 1;
+                }
+                Some(Ok(None)) | None => {
+                    eprintln!(
+                        "calisto: cannot open {s}: no such file (e sem [scripts.{s}] no calisto.toml)"
+                    );
+                    return 1;
+                }
+            }
+        }
+    }
+
+    let Some(ruby) = ruby_or_err() else {
+        return 1;
+    };
     let preload = match &preload_opt {
         Some(v) => normalize_preload(v),
         None => run_preload(&app),
     };
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let t0 = Instant::now();
     let code = if eval_mode {
         let code = eval_parts.join("\n");
         if cold {
             run_cold_eval(&ruby, &code, script_args)
-        } else if let Some(app) = &app {
+        } else if let Some(app) = app_daemon(&app) {
             run_fast_app_eval(&ruby, &code, script_args, app)
         } else {
             run_fast_eval(&ruby, &code, script_args, &preload)
         }
+    } else if let Some(cmd) = &script_cmd {
+        // script do calisto.toml: roda como `calisto exec` no daemon (resolve
+        // o bin no bundle/PATH e carrega in-process), com os args do CLI no
+        // final do comando. --cold roda o shim no interpretador direto
+        // (paridade cold/warm e invariante do run).
+        let mut full = cmd.clone();
+        full.extend(script_args.iter().cloned());
+        exec_argv(&ruby, &app, cold, &full)
     } else if cold {
-        run_cold(&ruby, script.unwrap(), script_args)
-    } else if let Some(app) = &app {
+        run_cold(&ruby, script.unwrap(), script_args, &cwd)
+    } else if let Some(app) = app_daemon(&app) {
         run_fast_app(&ruby, script.unwrap(), script_args, app)
     } else {
         run_fast(&ruby, script.unwrap(), script_args, &preload)
@@ -496,35 +644,73 @@ fn has_gemfile() -> bool {
     find_in_parents("Gemfile").is_some() || find_in_parents("gems.rb").is_some()
 }
 
-/// Warn (sem abortar) se um `.ruby-version` encontrado subindo do cwd divergir
-/// do pin unico do calisto. Mesma busca do Bundler/rbenv: cwd -> pais.
-fn check_ruby_version() {
-    let Some(file) = find_in_parents(".ruby-version") else { return };
-    if let Ok(content) = fs::read_to_string(file) {
-        let want = content.lines().next().unwrap_or("").trim();
-        let want = want.strip_prefix("ruby-").unwrap_or(want).trim();
-        if !want.is_empty() && want != PINNED_RUBY {
-            eprintln!(
-                "calisto: warning: .ruby-version pede {want}, mas o calisto usa o pin unico {PINNED_RUBY}"
-            );
-        }
-    }
-}
-
 // ---- Fase B: preload de app (calisto.toml) --------------------------------
 
 /// Configuracao por app via `calisto.toml`. Subset minimo de TOML:
-/// comentarios `#`, secao `[run]` e `chave = "valor"` (sem escapes).
+/// comentarios `#`, secoes `[run]`/`[scripts]` e `chave = "valor"` (sem
+/// escapes). `preload` e opcional: um calisto.toml so com `[scripts]` (Fase H)
+/// nao vira daemon da app — scripts rodam no daemon generico.
 #[derive(Debug, Clone)]
 struct AppConfig {
     /// dir do calisto.toml (raiz da app; o daemon roda com este cwd)
     root: PathBuf,
     /// entrypoint a pre-carregar no daemon (ex.: config/environment.rb)
-    preload: PathBuf,
+    preload: Option<PathBuf>,
+    /// `[scripts]` nome -> comando (ordem do arquivo; Fase H)
+    scripts: Vec<(String, String)>,
+}
+
+impl AppConfig {
+    /// argv do comando de `[scripts.NAME]` (tokenizado shell-like, sem
+    /// escapes/expansao). Ok(None) = script nao definido; Err = comando
+    /// invalido (vazio ou aspas desbalanceadas).
+    fn script_command(&self, name: &str) -> Result<Option<Vec<String>>, String> {
+        let Some((_, cmd)) = self.scripts.iter().find(|(n, _)| n == name) else {
+            return Ok(None);
+        };
+        let argv = split_command(cmd)?;
+        if argv.is_empty() {
+            return Err(format!("calisto.toml: script '{name}' sem comando"));
+        }
+        Ok(Some(argv))
+    }
+}
+
+/// Tokeniza o comando de um `[scripts]` (shell-like minimo): whitespace
+/// separa palavras e aspas simples/duplas agrupam — sem escapes, sem
+/// expansao de variaveis (subset do TOML que o parser ja usa).
+fn split_command(s: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in s.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.push(c),
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                c if c.is_whitespace() => {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                }
+                c => cur.push(c),
+            },
+        }
+    }
+    if let Some(q) = quote {
+        return Err(format!("calisto.toml: aspas '{q}' nao fechadas em \"{s}\""));
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Ok(out)
 }
 
 fn parse_calisto_toml(content: &str, base: &Path) -> Result<AppConfig, String> {
     let mut preload: Option<PathBuf> = None;
+    let mut scripts: Vec<(String, String)> = Vec::new();
+    let mut section = "run"; // chave sem secao = [run] (backwards compat)
     for (i, raw) in content.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -532,36 +718,47 @@ fn parse_calisto_toml(content: &str, base: &Path) -> Result<AppConfig, String> {
         }
         if line.starts_with('[') {
             let sec = line.trim_start_matches('[').trim_end_matches(']').trim();
-            if sec != "run" {
+            if sec != "run" && sec != "scripts" {
                 return Err(format!("calisto.toml:{}: secao desconhecida '{sec}'", i + 1));
             }
+            section = sec;
             continue;
         }
         let Some((k, v)) = line.split_once('=') else {
             return Err(format!("calisto.toml:{}: linha invalida: {raw}", i + 1));
         };
-        if k.trim() != "preload" {
-            return Err(format!("calisto.toml:{}: chave desconhecida '{}'", i + 1, k.trim()));
-        }
-        let v = v.trim();
-        let Some(v) = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
-            return Err(format!("calisto.toml:{}: preload precisa ser \"caminho\"", i + 1));
+        let k = k.trim();
+        let Some(value) = v.trim().strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+            return Err(format!("calisto.toml:{}: {k} precisa ser \"valor\"", i + 1));
         };
-        if v.is_empty() {
-            return Err(format!("calisto.toml:{}: preload vazio", i + 1));
+        match section {
+            "run" => {
+                if k != "preload" {
+                    return Err(format!(
+                        "calisto.toml:{}: chave desconhecida '{k}' (scripts vao na secao [scripts])",
+                        i + 1
+                    ));
+                }
+                if value.is_empty() {
+                    return Err(format!("calisto.toml:{}: preload vazio", i + 1));
+                }
+                preload = Some(base.join(value));
+            }
+            _ => {
+                // [scripts]: nome -> comando (validado na resolucao do run)
+                scripts.push((k.to_string(), value.to_string()));
+            }
         }
-        preload = Some(base.join(v));
     }
-    let Some(preload) = preload else {
-        return Err("calisto.toml: falta [run] preload = \"entrypoint\"".into());
-    };
-    if !preload.is_file() {
-        return Err(format!(
-            "calisto.toml: preload '{}' nao existe",
-            preload.display()
-        ));
+    if let Some(p) = &preload {
+        if !p.is_file() {
+            return Err(format!(
+                "calisto.toml: preload '{}' nao existe",
+                p.display()
+            ));
+        }
     }
-    Ok(AppConfig { root: base.to_path_buf(), preload })
+    Ok(AppConfig { root: base.to_path_buf(), preload, scripts })
 }
 
 /// Detecta app do cwd (walk up, como Gemfile). Erro de parse e estrito no
@@ -590,28 +787,47 @@ fn fnv1a(s: &str) -> u64 {
 /// do daemon, entao ele so serve aquela app. O hash inclui o entrypoint para
 /// mudancas de calisto.toml ganharem socket novo, e um sal para separar
 /// ambientes (ex.: dev vs teste — o daemon de teste boota com RAILS_ENV=test).
-fn app_runtime_dir_for(app: &AppConfig, salt: &str) -> PathBuf {
-    let key = format!("{}\0{}\0{}", app.root.display(), app.preload.display(), salt);
+fn app_runtime_dir_for(app: &AppConfig, salt: &str, ruby: &Path) -> PathBuf {
+    let preload = app
+        .preload
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let base = format!("{}\0{}\0{}", app.root.display(), preload, salt);
+    // versao no hash: daemons da app de VMs diferentes convivem. O pin default
+    // mantem o hash classico (sem quebrar sockets existentes).
+    let key = match ruby_version_of(ruby) {
+        Some(v) => format!("{base}\0{v}"),
+        None => base,
+    };
     runtime_dir().join("apps").join(format!("{:016x}", fnv1a(&key)))
 }
 
-fn app_runtime_dir(app: &AppConfig) -> PathBuf {
-    app_runtime_dir_for(app, "")
+fn app_runtime_dir(app: &AppConfig, ruby: &Path) -> PathBuf {
+    app_runtime_dir_for(app, "", ruby)
 }
 
 /// Daemon de teste: igual ao da app, mas boota com RAILS_ENV=test/RACK_ENV=test
 /// (o Rails fixa o env no boot; um fork do boot dev nunca enxergaria :test).
-fn app_test_runtime_dir(app: &AppConfig) -> PathBuf {
-    app_runtime_dir_for(app, "test")
+fn app_test_runtime_dir(app: &AppConfig, ruby: &Path) -> PathBuf {
+    app_runtime_dir_for(app, "test", ruby)
 }
 
-fn run_cold(ruby: &Path, script: &str, args: &[String]) -> i32 {
+/// App com daemon dedicado: so quando ha entrypoint para pre-carregar (Fase
+/// B). Um calisto.toml so com `[scripts]` (Fase H) nao justifica daemon da
+/// app — os comandos rodam no daemon generico (preload default).
+fn app_daemon(app: &Option<AppConfig>) -> Option<&AppConfig> {
+    app.as_ref().filter(|a| a.preload.is_some())
+}
+
+fn run_cold(ruby: &Path, script: &str, args: &[String], cwd: &Path) -> i32 {
     // -rbundler/setup: ativa o Gemfile do cwd (como `bundle exec ruby`);
     // no-op fora de bundle, mantendo a paridade com o daemon warm.
     match Command::new(ruby)
         .arg("-rbundler/setup")
         .arg(script)
         .args(args)
+        .current_dir(cwd)
         .status() {
         Ok(st) => exit_code(st),
         Err(e) => {
@@ -934,16 +1150,18 @@ fn cmd_test(args: &[String]) -> i32 {
         return 1;
     }
 
-    let ruby = ruby_path();
+    let Some(ruby) = ruby_or_err() else {
+        return 1;
+    };
     let extra = [
         ("RAILS_ENV", "test"),
         ("RACK_ENV", "test"),
         ("CALISTO_LOAD_PATH", framework.dir()),
     ];
 
-    let dir = match &app {
+    let dir = match app_daemon(&app) {
         Some(a) => {
-            let dir = app_test_runtime_dir(a);
+            let dir = app_test_runtime_dir(a, &ruby);
             if let Err(e) = connect_or_spawn_test_daemon(&ruby, a) {
                 eprintln!("calisto: {e}");
                 return 1;
@@ -956,7 +1174,7 @@ fn cmd_test(args: &[String]) -> i32 {
                 eprintln!("calisto: {e}");
                 return 1;
             }
-            runtime_dir()
+            daemon_dir_for(&ruby)
         }
     };
 
@@ -1059,16 +1277,13 @@ fn cmd_test(args: &[String]) -> i32 {
 /// Preload padrao para daemons nao-app: vazio com Gemfile (bundler ativa as
 /// gems; preload colidiria), senao CALISTO_PRELOAD ou o default.
 fn run_preload(app: &Option<AppConfig>) -> String {
-    match app {
-        Some(_) => String::new(), // app: o entrypoint e o preload (Fase B)
-        None => {
-            if has_gemfile() {
-                String::new()
-            } else {
-                env::var("CALISTO_PRELOAD")
-                    .map_or_else(|_| DEFAULT_PRELOAD.to_string(), |v| normalize_preload(&v))
-            }
-        }
+    if app_daemon(app).is_some() {
+        String::new() // app: o entrypoint e o preload (Fase B)
+    } else if has_gemfile() {
+        String::new()
+    } else {
+        env::var("CALISTO_PRELOAD")
+            .map_or_else(|_| DEFAULT_PRELOAD.to_string(), |v| normalize_preload(&v))
     }
 }
 
@@ -1100,10 +1315,12 @@ fn cmd_task(args: &[String]) -> i32 {
         .map(|a| a.root.clone())
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let ruby = ruby_path();
-    let dir = match &app {
-        Some(a) => app_runtime_dir(a),
-        None => runtime_dir(),
+    let Some(ruby) = ruby_or_err() else {
+        return 1;
+    };
+    let dir = match app_daemon(&app) {
+        Some(a) => app_runtime_dir(a, &ruby),
+        None => daemon_dir_for(&ruby),
     };
     fs::create_dir_all(&dir).ok();
     let shim = dir.join("rake.rb");
@@ -1114,7 +1331,7 @@ fn cmd_task(args: &[String]) -> i32 {
         }
     }
 
-    let mut stream = match &app {
+    let mut stream = match app_daemon(&app) {
         Some(a) => match connect_or_spawn_app_daemon(&ruby, a) {
             Ok(s) => s,
             Err(e) => {
@@ -1217,10 +1434,12 @@ fn cmd_serve(args: &[String]) -> i32 {
         return 1;
     }
 
-    let ruby = ruby_path();
-    let dir = match &app {
-        Some(a) => app_runtime_dir(a),
-        None => runtime_dir(),
+    let Some(ruby) = ruby_or_err() else {
+        return 1;
+    };
+    let dir = match app_daemon(&app) {
+        Some(a) => app_runtime_dir(a, &ruby),
+        None => daemon_dir_for(&ruby),
     };
     fs::create_dir_all(&dir).ok();
     let launcher = dir.join("serve.rb");
@@ -1231,7 +1450,7 @@ fn cmd_serve(args: &[String]) -> i32 {
         }
     }
 
-    let mut stream = match &app {
+    let mut stream = match app_daemon(&app) {
         Some(a) => match connect_or_spawn_app_daemon(&ruby, a) {
             Ok(s) => s,
             Err(e) => {
@@ -1333,34 +1552,24 @@ else
 end
 ";
 
-/// `calisto exec <bin> [args...]` — roda o binario de uma gem no daemon
-/// quente, no contexto da app (Gemfile ativo + boot pre-carregado com
-/// calisto.toml). Resolucao no shim ruby (espelho do `bundle exec`), sem
-/// depender de binstub; binario ruby e `load` in-process.
-fn cmd_exec(args: &[String]) -> i32 {
-    let Some(bin) = args.first() else {
+/// Roda um argv (bin + args) como `calisto exec` no daemon quente: o shim
+/// `exec.rb` resolve o bin (caminho de arquivo -> spec do bundle ativo ->
+/// PATH) e carrega in-process (kernel_load do bundler). Usado por `calisto
+/// exec` e pelos scripts de `[scripts]` do calisto.toml (Fase H). `cold` roda
+/// o shim no interpretador direto com cwd na raiz (paridade com --cold).
+fn exec_argv(ruby: &Path, app: &Option<AppConfig>, cold: bool, argv: &[String]) -> i32 {
+    if argv.is_empty() {
         eprintln!("calisto: exec needs a command: calisto exec <bin> [args...]");
         return 1;
-    };
-    let bin_args = &args[1..];
-
-    load_dotenv(); // .env do cwd (walk up) entra no env do binario
-    let app = match load_app_config() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("calisto: {e}");
-            return 1;
-        }
-    };
+    }
     let root = app
         .as_ref()
         .map(|a| a.root.clone())
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let ruby = ruby_path();
-    let dir = match &app {
-        Some(a) => app_runtime_dir(a),
-        None => runtime_dir(),
+    let dir = match app_daemon(app) {
+        Some(a) => app_runtime_dir(a, ruby),
+        None => daemon_dir_for(ruby),
     };
     fs::create_dir_all(&dir).ok();
     let shim = dir.join("exec.rb");
@@ -1371,15 +1580,19 @@ fn cmd_exec(args: &[String]) -> i32 {
         }
     }
 
-    let mut stream = match &app {
-        Some(a) => match connect_or_spawn_app_daemon(&ruby, a) {
+    if cold {
+        return run_cold(ruby, &shim.to_string_lossy(), argv, &root);
+    }
+
+    let mut stream = match app_daemon(app) {
+        Some(a) => match connect_or_spawn_app_daemon(ruby, a) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("calisto: {e}");
                 return 1;
             }
         },
-        None => match connect_or_spawn_daemon(&ruby, &run_preload(&app)) {
+        None => match connect_or_spawn_daemon(ruby, &run_preload(app)) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("calisto: {e}");
@@ -1387,9 +1600,26 @@ fn cmd_exec(args: &[String]) -> i32 {
             }
         },
     };
-    let mut full_args = vec![bin.clone()];
-    full_args.extend(bin_args.iter().cloned());
-    run_request_full(&mut stream, &root.to_string_lossy(), &[], &shim.to_string_lossy(), &full_args)
+    run_request_full(&mut stream, &root.to_string_lossy(), &[], &shim.to_string_lossy(), argv)
+}
+
+/// `calisto exec <bin> [args...]` — roda o binario de uma gem no daemon
+/// quente, no contexto da app (Gemfile ativo + boot pre-carregado com
+/// calisto.toml). Resolucao no shim ruby (espelho do `bundle exec`), sem
+/// depender de binstub; binario ruby e `load` in-process.
+fn cmd_exec(args: &[String]) -> i32 {
+    load_dotenv(); // .env do cwd (walk up) entra no env do binario
+    let app = match load_app_config() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("calisto: {e}");
+            return 1;
+        }
+    };
+    let Some(ruby) = ruby_or_err() else {
+        return 1;
+    };
+    exec_argv(&ruby, &app, false, args)
 }
 
 // ---- Fase G: calisto repl ----------------------------------------------------
@@ -1420,10 +1650,12 @@ fn cmd_repl(args: &[String]) -> i32 {
         .map(|a| a.root.clone())
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let ruby = ruby_path();
-    let dir = match &app {
-        Some(a) => app_runtime_dir(a),
-        None => runtime_dir(),
+    let Some(ruby) = ruby_or_err() else {
+        return 1;
+    };
+    let dir = match app_daemon(&app) {
+        Some(a) => app_runtime_dir(a, &ruby),
+        None => daemon_dir_for(&ruby),
     };
     fs::create_dir_all(&dir).ok();
     let shim = dir.join("repl.rb");
@@ -1434,7 +1666,7 @@ fn cmd_repl(args: &[String]) -> i32 {
         }
     }
 
-    let mut stream = match &app {
+    let mut stream = match app_daemon(&app) {
         Some(a) => match connect_or_spawn_app_daemon(&ruby, a) {
             Ok(s) => s,
             Err(e) => {
@@ -1511,7 +1743,9 @@ fn cmd_build(args: &[String]) -> i32 {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."))
     });
-    let ruby = ruby_path();
+    let Some(ruby) = ruby_or_err() else {
+        return 1;
+    };
     match calisto_build::bundle(&ruby, &entry, &out, &root, compile) {
         Ok(stats) => {
             println!("calisto: bundled {} arquivo(s) -> {}", stats.files, out.display());
@@ -1525,14 +1759,25 @@ fn cmd_build(args: &[String]) -> i32 {
 }
 
 /// Dir de runtime de status/stop/doctor: o daemon da app quando o cwd esta
-/// numa app com calisto.toml; senao o generico. Parse quebrado -> warning.
+/// Dir de runtime de status/stop/doctor: o daemon da app quando o cwd esta
+/// numa app com calisto.toml; senao o generico (por versao, Fase I). Parse
+/// quebrado ou versao ausente -> warning com o dir generico.
 fn current_runtime_dir() -> PathBuf {
-    match load_app_config() {
-        Ok(Some(app)) => app_runtime_dir(&app),
-        Ok(None) => runtime_dir(),
+    let ruby = match resolve_ruby() {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("calisto: warning: {e}");
-            runtime_dir()
+            return runtime_dir();
+        }
+    };
+    match load_app_config() {
+        Ok(app) => match app_daemon(&app) {
+            Some(a) => app_runtime_dir(a, &ruby),
+            None => daemon_dir_for(&ruby),
+        },
+        Err(e) => {
+            eprintln!("calisto: warning: {e}");
+            daemon_dir_for(&ruby)
         }
     }
 }
@@ -1556,8 +1801,9 @@ fn cmd_status() -> i32 {
     }
     // o daemon de teste da app (RAILS_ENV=test) tambem e reportado
     if let Ok(Some(app)) = load_app_config() {
-        let tdir = app_test_runtime_dir(&app);
-        match daemon_connect_at(&tdir) {
+        if let Ok(ruby) = resolve_ruby() {
+            let tdir = app_test_runtime_dir(&app, &ruby);
+            match daemon_connect_at(&tdir) {
             Some(mut s) => {
                 let ok = send_cmd(&mut s, "PING", &[]).is_ok()
                     && read_line(&mut s).map(|l| l == "OK").unwrap_or(false);
@@ -1569,6 +1815,7 @@ fn cmd_status() -> i32 {
                 }
             }
             None => println!("test daemon: not running"),
+        }
         }
     }
     0
@@ -1587,20 +1834,24 @@ fn cmd_stop() -> i32 {
     let had = daemon_connect_at(&dir).is_some();
     stop_daemon_at(&dir);
     if let Ok(Some(app)) = load_app_config() {
-        stop_daemon_at(&app_test_runtime_dir(&app)); // test daemon tambem
+        if let Ok(ruby) = resolve_ruby() {
+            stop_daemon_at(&app_test_runtime_dir(&app, &ruby)); // test daemon tambem
+        }
     }
     println!("daemon: {}", if had { "stopped" } else { "not running" });
     0
 }
 
 fn cmd_doctor() -> i32 {
-    let ruby = ruby_path();
+    let Some(ruby) = ruby_or_err() else {
+        return 1;
+    };
     println!("calisto doctor");
     println!("  pinned ruby: {}", ruby.display());
     let _ = Command::new(&ruby).arg("-v").status();
-    match load_app_config() {
-        Ok(Some(app)) => println!("  app preload: {}", app.preload.display()),
-        _ => println!(
+    match load_app_config().ok().flatten().and_then(|a| a.preload) {
+        Some(p) => println!("  app preload: {}", p.display()),
+        None => println!(
             "  preload: {}",
             env::var("CALISTO_PRELOAD").unwrap_or_else(|_| DEFAULT_PRELOAD.to_string())
         ),
@@ -1614,7 +1865,7 @@ fn print_help() {
         "calisto - a Bun-like runtime for Ruby (pinned CRuby + fork-based fast startup)
 
 USAGE:
-  calisto run [--cold] [--time] [--preload LIST] [-e 'code' | <script.rb>] [args...]
+  calisto run [--cold] [--time] [--preload LIST] [-e 'code' | <script.rb> | <script>] [args...]
   calisto test [--watch] [file|dir...]
   calisto task <args...>
   calisto serve [-p PORT] [-o HOST]
@@ -1636,6 +1887,17 @@ USAGE:
           Com um calisto.toml no diretorio atual (walk up) o daemon vira o
           daemon da app (socket dedicado) e pre-carrega o entrypoint de
           [run].preload no boot — boot congelado, cada comando roda como fork.
+          Um nome que nao e arquivo resolve para [scripts.NAME] do calisto.toml
+          (Fase H): `calisto run dev` roda o comando de `dev = \"bin/rails
+          server\"` no daemon (como `calisto exec`, com o Gemfile ativo), com
+          os args do CLI no final. Arquivo existente sempre vence; calisto.toml
+          so com [scripts] (sem [run].preload) usa o daemon generico.
+          O ruby usado (Fase I, multi-versoes) vem de: CALISTO_RUBY (override),
+          .ruby-version (walk up, como rbenv) ou a diretiva `ruby \"x.y.z\"` do
+          Gemfile; a versao pedida precisa estar em vendor/ruby-<v>/ (rode
+          RUBY_VERSION=<v> scripts/build-ruby.sh) — senao e erro claro. Sem
+          pedido, o pin default vendor/current ({PINNED_RUBY}). Daemons sao
+          isolados por versao (socket proprio).
   test    roda a suite de testes no daemon quente: detecta minitest
           (test/**/*_test.rb) ou rspec (spec/**/*_spec.rb, via .rspec) e roda
           cada arquivo como um fork — o boot da app (calisto.toml) e pago UMA

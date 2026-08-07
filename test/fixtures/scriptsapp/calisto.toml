@@ -1,0 +1,9 @@
+# Fase H: scripts no calisto.toml (o package.json do Ruby). So [scripts], sem
+# [run] preload — um config so de scripts NAO vira daemon da app (Fase B): os
+# comandos rodam no daemon generico com o preload de stdlib default.
+
+[scripts]
+hello = "bin/hello"
+greet = "bin/hello world"
+quoted = "bin/hello 'a b'"
+empty = ""

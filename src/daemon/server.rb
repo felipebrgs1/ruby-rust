@@ -29,7 +29,36 @@
 #   CALISTO_PRELOAD  comma-separated stdlib names required at boot (children inherit them)
 
 require "socket"
-require "base64"
+
+# SEM `require "base64"` aqui: ativar a default gem antes do Bundler.setup do
+# child/preload dispararia o "already activated" classico quando o bundle da
+# app pinar a gem numa versao diferente da empacotada no ruby em uso (ex.:
+# base64 0.3.0 do 3.4.10 vs 0.2.0 do 3.4.4 — Fase I). O decoder e
+# hand-rolled, mesmo alfabeto/encoding do encoder do cliente Rust.
+B64_TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".bytes
+B64_INDEX = Array.new(256, -1)
+B64_TABLE.each_with_index { |b, i| B64_INDEX[b] = i }
+
+def b64_decode(s)
+  bytes = s.bytes
+  out = String.new(encoding: Encoding::BINARY)
+  i = 0
+  len = bytes.length
+  while i + 1 < len
+    c0 = B64_INDEX[bytes[i]]
+    c1 = B64_INDEX[bytes[i + 1]]
+    break if c0 < 0 || c1 < 0
+    out << ((c0 << 2) | (c1 >> 4))
+    c2 = bytes[i + 2] == 61 ? -1 : B64_INDEX[bytes[i + 2]] # 61 == "="
+    if c2 >= 0
+      out << (((c1 & 0x0f) << 4) | (c2 >> 2))
+      c3 = bytes[i + 3] == 61 ? -1 : B64_INDEX[bytes[i + 3]]
+      out << (((c2 & 0x03) << 6) | c3) if c3 >= 0
+    end
+    i += 4
+  end
+  out
+end
 
 SOCKET = ENV.fetch("CALISTO_SOCKET")
 PIDFILE = ENV["CALISTO_PIDFILE"]
@@ -296,7 +325,7 @@ def close_client_fds(reader)
 end
 
 def start_child(io, reader, fields)
-  cwd, env_blob, script, *args = fields.map { |f| Base64.strict_decode64(f) }
+  cwd, env_blob, script, *args = fields.map { |f| b64_decode(f) }
 
   pid = Process.fork do
     # child: behave like `ruby <script> <args...>`
@@ -323,7 +352,7 @@ end
 # (backtraces idem `ruby -e`), sem DATA. Multiplos -e chegam concatenados
 # com "\n" (o cliente junta), entao __LINE__ segue a concatenacao.
 def start_child_eval(io, reader, fields)
-  cwd, env_blob, code, *args = fields.map { |f| Base64.strict_decode64(f) }
+  cwd, env_blob, code, *args = fields.map { |f| b64_decode(f) }
 
   pid = Process.fork do
     # child: behave like `ruby -e '<code>' <args...>`

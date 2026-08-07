@@ -114,12 +114,13 @@ fn bundle_gemfile_env_is_honored() {
 }
 
 #[test]
-fn ruby_version_mismatch_warns_but_runs() {
-    let dir = runtime_dir("rvwarn");
+fn ruby_version_selects_or_errors() {
+    let dir = runtime_dir("rvsel");
     let script = dir.join("ver.rb");
     std::fs::write(&script, "puts :ok\n").unwrap();
 
-    // .ruby-version divergente -> warning no stderr, exit 0 (nao aborta)
+    // .ruby-version com versao NAO instalada -> erro claro (exit != 0) com o
+    // comando de build (Fase I substituiu o warning da Fase 1-2 pela selecao)
     let mismatch = dir.join("mismatch");
     std::fs::create_dir_all(&mismatch).unwrap();
     std::fs::write(mismatch.join(".ruby-version"), "3.2.1\n").unwrap();
@@ -133,14 +134,14 @@ fn ruby_version_mismatch_warns_but_runs() {
             timeout: 30,
         },
     );
-    assert_eq!(out.status.code(), Some(0));
+    assert_ne!(out.status.code(), Some(0));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("3.2.1") && err.contains(".ruby-version"),
-        "warn esperado no stderr: {err}"
+        err.contains("3.2.1") && err.contains("build-ruby.sh"),
+        "erro deve apontar o build da versao: {err}"
     );
 
-    // .ruby-version 3.4.10 (com prefixo `ruby-`) -> silencioso
+    // .ruby-version 3.4.10 (com prefixo `ruby-`, instalada) -> roda sem warning
     let ok_dir = dir.join("match");
     std::fs::create_dir_all(&ok_dir).unwrap();
     std::fs::write(ok_dir.join(".ruby-version"), "ruby-3.4.10\n").unwrap();
@@ -157,7 +158,7 @@ fn ruby_version_mismatch_warns_but_runs() {
     assert_eq!(out.status.code(), Some(0));
     assert!(
         !String::from_utf8_lossy(&out.stderr).contains("warning"),
-        "versao igual nao deve avisar"
+        "versao instalada nao deve avisar"
     );
 }
 

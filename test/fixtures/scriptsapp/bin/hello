@@ -1,0 +1,8 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Alvo dos scripts do calisto.toml (Fase H): `calisto run <script>` resolve
+# `bin/hello` como caminho de arquivo e carrega in-process (kernel_load do
+# bundler — $0 vira o caminho, ARGV os args). Imprime o cwd para provar que o
+# child roda na raiz da app (dir do calisto.toml), como bun run.
+puts "hello #{$0} ARGV=#{ARGV.join(',')} cwd=#{Dir.pwd}"
