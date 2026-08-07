@@ -70,6 +70,10 @@ name = "tooling"
 path = "test/tooling.rs"
 
 [[test]]
+name = "deps"
+path = "test/deps.rs"
+
+[[test]]
 name = "realapps"
 path = "test/realapps.rs"
 

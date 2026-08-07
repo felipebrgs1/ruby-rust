@@ -5,8 +5,9 @@
 //! projeto sob a raiz, e emite um bundle self-contained com um loader que
 //! intercepta `require`/`require_relative` em runtime.
 //!
-//! Limites da v1: requires dinamicos nao sao embutidos (warning no build);
-//! assets (arquivos nao-Ruby) ficam externos; C extensions (.so) nao embutidas.
+//! Limites da v1: requires dinamicos de .rb nao sao embutidos (warning no
+//! build); assets (arquivos nao-Ruby) ficam externos. C extensions (.so)
+//! embutidas como bytes e extraidas p/ tmpdir no runtime.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -19,7 +20,8 @@ pub struct BundleStats {
 
 /// Roda o bundler: `ruby build.rb <entry> <out> <root> [--compile]`.
 /// O bundler imprime `BUNDLED <n>` no stdout; warnings vao ao stderr ao vivo.
-/// `compile` embute gems pure-Ruby do Gemfile.lock (Fase F).
+/// `compile` embute as gems do Gemfile.lock (Fase F): .rb avaliados + nativos
+/// (.so) de C-ext extraidos no runtime — o bundle roda sem bundle install.
 pub fn bundle(
     ruby: &Path,
     entry: &Path,

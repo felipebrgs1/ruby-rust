@@ -9,20 +9,25 @@ Bundler), Fase B (preload de app), Fase C (Rails mínimo), Fase D completa
 (escada real: Sinatra → Rails → Maybe Finance/Sidekiq → Chatwoot/API+ActionCable),
 **Fase E completa** (test/task/serve/.env/watch; daemon multi-conexão — o
 risco conhecido do accept loop single-connection foi resolvido), **Fase F
-(1º corte)** (build --compile com gems pure-Ruby — marco Sinatra), **Fase G
+completa** (build --compile com gems — pure-Ruby + **C extensions**: .so já
+compilados embutidos como bytes e extraídos p/ tmpdir no runtime; marco
+Sinatra + sqlite3/puma com GEM_PATH vazio), **Fase G
 completa** (`exec`/`run -e`/`repl`), **Fase H completa** (`[scripts]` no
 calisto.toml — `calisto run dev`/`test`/`db:migrate` no railsapp, o
 package.json do Ruby), **Fase I completa** (multi-versões: seleção por
-`.ruby-version`/Gemfile, daemons por versão, maybe/chatwoot nativos em 3.4.4)
-e **Fase J completa** (`init`/`upgrade`/`completions` — scaffold como `bun
+`.ruby-version`/Gemfile, daemons por versão, maybe/chatwoot nativos em 3.4.4),
+**Fase J completa** (`init`/`upgrade`/`completions` — scaffold como `bun
 init`, rebuild do pin via scripts/build-ruby.sh, completions bash/zsh; `calisto
-run` bare roda o `[scripts] start` do calisto.toml, convenção npm/bun)
+run` bare roda o `[scripts] start` do calisto.toml, convenção npm/bun) e
+**Fase K completa** (`add`/`remove`/`lock` — wrapper fino do bundle com o ruby
+da versão certa; `calisto add sinatra` → `calisto run` ativa sem passos
+manuais)
 do ROADMAP.md done. Golden rspec real
 validado no Chatwoot (119 examples: frio 5.0s → quente 0.70s, 7.2×); marco G:
 `calisto exec sidekiq -r <app>` no Maybe processa o `CalistoProbeJob` (golden
 realapps) e `calisto run -e 'puts 1+1'` quente **36ms** (marco <50ms). O
-roadmap mira **K (deps add/remove, wrapper do bundle)** e completar a Fase F
-(C exts são o item "década"; hoje avisam e delegam ao bundle).
+roadmap está **completo** (Fases 1-2 + A-K) — itens remanescentes são
+melhorias: compilar C exts do zero no build (mkmf) e `calisto doctor`/UX.
 
 ## Architecture & Data Flow
 
@@ -64,7 +69,7 @@ Fase B (preload de app): `calisto.toml` na raiz da app (walk-up do cwd) com `[ru
 
 **Wire protocol** (RESP-style over unix socket): `"<OP> <n>\r\n"` then n fields `"$<len>\r\n<data>"`. Commands: `PING` → `OK`, `STOP` → `BYE`, `RUN` → `STATUS <code>`, `EVAL` → `STATUS <code>` (idem RUN, mas evala o campo code como `ruby -e`). Fields are base64 (hand-rolled encoder, no crates).
 
-**`calisto build` flow**: `build.rb` parses static `require`/`require_relative`/`autoload` with Ripper (the real lexer), BFS-collects project files under the root, emits a bundle where each file is evaluated via `eval(code, TOPLEVEL_BINDING, original_path, 1)` (preserves `__FILE__`/`__dir__`/`require_relative`) and a loader monkey-patches `Kernel#require`/`require_relative` against an index. Files outside the root (stdlib like `json`) are NOT bundled — delegated to real `require`. `--compile` (Fase F) também embute gems pure-Ruby do Gemfile.lock: specs resolvidas via `Gem::Specification.find_by_name` com o GEM_PATH do app (`vendor/bundle`), C extensions avisam e delegam. O loader pré-carrega os alvos dos `autoload` antes do arquivo registrador (bug do CRuby 3.4: autoload via `eval` dispara na definição do const) em rodadas com retry; `require_relative` de arquivo não embutido delega com caminho absoluto.
+**`calisto build` flow**: `build.rb` parses static `require`/`require_relative`/`autoload` with Ripper (the real lexer), BFS-collects project files under the root, emits a bundle where each file is evaluated via `eval(code, TOPLEVEL_BINDING, original_path, 1)` (preserves `__FILE__`/`__dir__`/`require_relative`) and a loader monkey-patches `Kernel#require`/`require_relative` against an index. Files outside the root (stdlib like `json`) are NOT bundled — delegated to real `require`. `--compile` (Fase F) também embute gems do Gemfile.lock: specs resolvidas via `Gem::Specification.find_by_name` com o GEM_PATH do app (`vendor/bundle`); `.rb` avaliados e **C extensions** embutidas como base64 no `$calisto_native` (loader extrai p/ `/tmp/calisto-native/<abs sanitizado>/` e `require` absoluto → dlopen). Nativos vêm dos require_paths (gems precompiladas, ex.: sqlite3-x86_64-linux) e dos dirs `extensions/` compilados pelo bundle install (puma/nio4r/json); requires **dinâmicos** de nativos (sqlite3: `require "sqlite3/#{RUBY_VERSION}/sqlite3_native"`) são cobertos por **pré-índice** do nome canônico (relativo ao require_path, sem extensão); o BFS resolve `.so`/`.bundle` como candidatos de require. Compilar do zero continua com o `bundle install` (sem toolchain própria). Armadilha do Ruby 3.4: `Hash#each` com bloco de aridade 1 entrega `[k, v]` — o coletor usa `each_key`. O loader pré-carrega os alvos dos `autoload` antes do arquivo registrador (bug do CRuby 3.4: autoload via `eval` dispara na definição do const) em rodadas com retry; `require_relative` de arquivo não embutido delega com caminho absoluto.
 
 ## Key Directories
 
@@ -73,7 +78,7 @@ Fase B (preload de app): `calisto.toml` na raiz da app (walk-up do cwd) com `[ru
 | `src/` | Rust CLI (`main.rs`) + embedded Ruby daemon (`daemon/server.rb`) |
 | `crates/calisto-build/` | First real workspace crate: `src/lib.rs` (spawns bundler) + `src/build.rb` (Ripper bundler, embedded) |
 | `crates/calisto-{test,task,serve,sqlite,tooling,cli,runtime}/` | Planned modules, only `.gitkeep` — do not implement until they get a `Cargo.toml` |
-|`test/`|Integration suite (`common/mod.rs` harness, `cli.rs`, `stdio.rs`, `daemon.rs`, `preload.rs`, `build.rs`, `ruby_upstream.rs`, `bundler.rs`, `app.rs`, `realapps.rs`, `testcmd.rs`, `exec.rs`, `scripts.rs`, `versions.rs`, `tooling.rs`), `fixtures/` (inclui `gemapp/`, `sinatraapp/` da Fase A, `preloadapp/`, `railsapp/` da Fase B/C e `maybe/`, `chatwoot/` — checkouts gitignored — dos degraus 4/5 da Fase D), `vendor/ruby/` (upstream ruby/ruby tests)|
+|`test/`|Integration suite (`common/mod.rs` harness, `cli.rs`, `stdio.rs`, `daemon.rs`, `preload.rs`, `build.rs`, `ruby_upstream.rs`, `bundler.rs`, `app.rs`, `realapps.rs`, `testcmd.rs`, `exec.rs`, `scripts.rs`, `versions.rs`, `tooling.rs`, `deps.rs`), `fixtures/` (inclui `gemapp/`, `sinatraapp/` da Fase A, `preloadapp/`, `railsapp/` da Fase B/C e `maybe/`, `chatwoot/` — checkouts gitignored — dos degraus 4/5 da Fase D), `vendor/ruby/` (upstream ruby/ruby tests)|
 | `scripts/` | `build-ruby.sh` — builds the pinned CRuby |
 | `examples/` | `hello.rb` (preload smoke), `bench.rb` (stdlib workload for `--time`) |
 | `vendor/` | Pinned CRuby install + sources. **Gitignored** — never commit; reproduce with `scripts/build-ruby.sh` |
@@ -129,9 +134,9 @@ cargo test --test ruby_upstream    # just the ruby/ruby parity harness
 
 | File | Role |
 |---|---|
-|`src/main.rs`|CLI: `run` (`--cold`/`--time`/`--preload LIST`/`-e`), `test` (`--watch`), `task`, `serve` (`-p`/`-o`), `exec`, `repl`, `build` (`-o`/`--root`), `init` (`--force`), `upgrade` (`[version]`), `completions` (bash/zsh), `status`, `stop`, `doctor`, `help`|
+|`src/main.rs`|CLI: `run` (`--cold`/`--time`/`--preload LIST`/`-e`), `test` (`--watch`), `task`, `serve` (`-p`/`-o`), `exec`, `repl`, `build` (`-o`/`--root`/`--compile`), `init` (`--force`), `upgrade` (`[version]`), `completions` (bash/zsh), `add`/`remove`/`lock`, `status`, `stop`, `doctor`, `help`|
 |`src/daemon/server.rb`|Daemon: preload → bind (handles stale socket `EADDRINUSE`) → detach stdio to `/dev/null` → `RequestReader` (recvmsg não-bloqueante + SCM_RIGHTS) → **accept loop multi-conexão** (select + waitpid WNOHANG; client-death kill por conexão; STOP derruba children) → `child_enter` (bootstrap comum) + `start_child`/`start_child_eval` (fork, `dup_into_stdio`, `setup_data`, `CALISTO_LOAD_PATH`, eval `-e`). **Sem `require "base64"` no boot** (Fase I): decoder hand-rolled (`b64_decode`) — ativar a default gem antes do `Bundler.setup` do child/preload dispararia "already activated" quando o bundle pinar versão diferente (ex.: base64 0.2.0 do 3.4.4 vs 0.3.0 do 3.4.10) |
-| `crates/calisto-build/src/build.rb` | Bundler: `walk_requires`, BFS collection, `split_end_marker`, bundle generation with loader |
+| `crates/calisto-build/src/build.rb` | Bundler: `walk_requires`, BFS collection, `split_end_marker`, gems do Gemfile.lock (pure + nativos `.so` p/ `$calisto_native` + pré-índice), bundle generation with loader |
 | `crates/calisto-build/src/lib.rs` | `bundle(ruby, entry, out, root) -> Result<BundleStats, String>`; parses `BUNDLED <n>` |
 | `scripts/build-ruby.sh` | Pin `RUBY_VERSION` (default 3.4.10; sha conhecido p/ 3.4.4 também), vendored libyaml, `vendor/ruby-<v>/` + symlink `vendor/current` (não troca ao construir versão extra) |
 | `test/common/mod.rs` | Integration harness shared by all test targets |
@@ -140,13 +145,13 @@ cargo test --test ruby_upstream    # just the ruby/ruby parity harness
 
 - **Ruby**: pinned 3.4.10 (sha256 `ecee2d07...9ec`), built by `scripts/build-ruby.sh` into `vendor/current/bin/ruby`. Stdlib-only; **no gems, no Bundler**. Default gem tooling (`test-unit`, `minitest`, `rake`) ships with the vendor build.
 - **Rust**: edition 2021, zero deps, `[profile.release] lto+strip`.
-- **Env vars** (all `CALISTO_*`): `CALISTO_RUBY` (alternate ruby), `CALISTO_PRELOAD` (stdlib preload list; `0`/`none` disables), `CALISTO_RUNTIME_DIR` (daemon socket/pid location — tests use this for isolation), `CALISTO_BUILD_SCRIPT` (upgrade: path do script de build — testes usam um fake; default `<vendor>/../scripts/build-ruby.sh`), `CALISTO_SOCKET`/`CALISTO_PIDFILE` (set by the client when spawning the daemon).
+- **Env vars** (all `CALISTO_*`): `CALISTO_RUBY` (alternate ruby), `CALISTO_PRELOAD` (stdlib preload list; `0`/`none` disables), `CALISTO_RUNTIME_DIR` (daemon socket/pid location — tests use this for isolation), `CALISTO_BUILD_SCRIPT` (upgrade: path do script de build — testes usam um fake; default `<vendor>/../scripts/build-ruby.sh`), `CALISTO_BUNDLE` (deps: binario do bundle — testes usam um fake; default `ruby -S bundle` do ruby resolvido), `CALISTO_BUNDLE_RUBY` (deps: exportado pelo client pro child — o ruby resolvido, p/ observação), `CALISTO_SOCKET`/`CALISTO_PIDFILE` (set by the client when spawning the daemon).
 - Default daemon preload: `json,yaml,erb,pathname,fileutils,time,date,digest,base64,uri,net/http,ostruct,set,csv,stringio,logger,socket`.
 - No Makefile, no CI, no README — do not create docs unless asked. `git` commits with `-c user.name="felipeb" -c user.email="felipeb@local"` (repo has no local git identity).
 
 ## Testing & QA
 
-Framework: **cargo integration tests** (13 targets in `test/`, declared as `[[test]]` in `Cargo.toml`). No unit tests in `main.rs` (0 tests there is expected).
+Framework: **cargo integration tests** (16 targets in `test/`, declared as `[[test]]` in `Cargo.toml`). No unit tests in `main.rs` (0 tests there is expected).
 
 Harness (`test/common/mod.rs`): each test spawns the real binary via `env!("CARGO_BIN_EXE_calisto")` with a **unique `CALISTO_RUNTIME_DIR`** (isolated daemon per test → parallel-safe). `run_opt` pipes stdio, writes stdin, and enforces a **timeout** (kills + panics if the daemon ever holds a pipe — a known regression class). `spawn_stdout` for live-process tests (read child pid, send signals).
 
@@ -155,7 +160,7 @@ Coverage contract:
 - `stdio.rs` — argv/env/cwd/stdin/exit codes/backtraces; **`cold_and_warm_agree`** (parity between `--cold` and warm daemon is a hard invariant); `__FILE__`/`__dir__`/`DATA`.
 - `daemon.rs` — socket reuse, stale-socket recovery, orphan kill on client death (checks `/proc/<pid>`), signal exit codes (`SIGKILL` → 137), concurrent runs, pipeline non-hang.
 - `preload.rs` — default/`0`/custom preload behavior.
-- `build.rs` — bundle parity with original sources (renames the source tree away to prove self-contained), `DATA` emulation, `__FILE__`/`__dir__` preservation, stdlib delegation, bundle under `calisto run`.
+- `build.rs` — bundle parity with original sources (renames the source tree away to prove self-contained), `DATA` emulation, `__FILE__`/`__dir__` preservation, stdlib delegation, bundle under `calisto run`. **Fase F**: `compile_bundle_embeds_gems_and_runs_without_bundle` (Sinatra + 10 gems, GEM_PATH vazio); `compile_embeds_c_extensions_and_runs` (puma — .so compilado pelo bundle install — roda standalone); `compile_embeds_sqlite3_c_extension` (gem precompilada com require **dinâmico** — pré-índice do nome canônico; gated em bundle install do railsapp).
 - `ruby_upstream.rs` — **parity contract**: each of the 17 upstream ruby/ruby (tag v3_4_10) runtime tests must produce the same test-unit summary (tests/failures/errors) and exit code as plain `ruby -I tool/lib -I test/lib`. Uses `--seed=1` + filter `-n '!/memory_leak/'` (upstream tests have implicit `require` deps and RSS-based tests that are flaky even on pure ruby), and retries against environment flakiness. Always run upstream tests with `--preload 0`.
 - `bundler.rs` — **Fase A (Gemfile activation)**: fixture `gemapp` (5 default/bundled gems, `Gemfile.lock` commitado → hermético, sem rede nem `bundle install`) prova ativação via `$LOAD_PATH`; `cold_and_warm_agree` com bundle; Gemfile com gem faltando falha como `bundle exec` (GemNotFound, script não roda); `BUNDLE_GEMFILE` env é honrado; `.ruby-version` com versão não instalada → erro claro (exit != 0) com o comando de build vs 3.4.10 (instalada) → silêncio (Fase I); golden Sinatra HTTP **gated** em `bundle install` prévio no fixture (`test/fixtures/sinatraapp`) — skipa com aviso se as gems não estiverem instaladas.
 - `app.rs` — **Fase B (preload de app)**: fixture `preloadapp` (boot simulado 2s + contador, hermético) prova que o boot roda UMA vez no daemon e o 2º `run` <500ms; daemon da app isolado do genérico; `calisto.toml` inválido (entrypoint inexistente/sintaxe) → erro claro apontando o problema; golden Rails **gated** (`test/fixtures/railsapp`, Rails 8 + sqlite3): `bin/rails runner` 2º run <500ms e query `SELECT 1` reconecta no child (fork-safe). **Fase C (Rails mínimo)**: `bin/rails server` responde GET `/up` → 200 em <500ms do spawn (servidor roda como child do fork; o cliente killado derruba o Puma via client-death kill) e `bin/rails console` roda IRB no contexto da app via stdin pipe.
@@ -166,10 +171,11 @@ Coverage contract:
 - `scripts.rs` — **Fase H (scripts no calisto.toml)**: fixture hermética `scriptsapp` (só `[scripts]`, sem preload) prova resolução + args do CLI ao final do comando + aspas agrupando + cwd na raiz da app (subdir); paridade cold/warm no script; arquivo existente vence o script de mesmo nome; script inexistente/vazio/aspas quebradas → erro claro; calisto.toml só de scripts NÃO cria daemon da app (`apps/` ausente, daemon genérico serve arquivo); `[scripts]` na `preloadapp` → script roda no daemon da app com boot UMA vez (<500ms no 2º); **golden railsapp** (gated em bundle install): `run dev -p PORT` sobe o server (GET /up → 200), `run db:migrate` idempotente (135ms quente) e `run test <filtro>` roda a suite (74ms) — `run test` completo roda `bin/rails test` no daemon dev e o teste de env falha POR DESIGN (exit 1), documentando a razão do daemon de teste.
 - `versions.rs` — **Fase I (multi-versões)**: gated em `vendor/ruby-3.4.4` (RUBY_VERSION=3.4.4 scripts/build-ruby.sh): `.ruby-version` seleciona (prefixo `ruby-` tolerado) com cold/warm concordando; diretiva `ruby "3.4.4"` do Gemfile seleciona (lock vazio hermético); versão não instalada → erro claro com o build; daemons genéricos isolados por versão (`runtime_dir/ruby-3.4.4/` — stop de um não derruba o outro); daemon da app por versão (hash do socket inclui a versão — o mesmo app em 3.4.4 e default paga o boot UMA vez cada, `apps/` com 2 dirs). O gate `bundle_check` do harness resolve a versão da app (`.ruby-version`/Gemfile → bundler do vendor certo).
 - `tooling.rs` — **Fase J (init/upgrade/completions)**: `calisto init` (cwd explícito no teste — nunca herdar o cwd do processo!) gera calisto.toml + hello.rb executável + .gitignore e o app roda com `calisto run` BARE (= `[scripts] start`, convenção npm/bun — `run` sem script sem `start` continua erro de uso), com `run hello.rb` (arquivo vence) e `--cold` (paridade); nunca sobrescreve sem `--force`; nome-é-arquivo/flag desconhecida → erro. `upgrade` roda o build script (fake via `CALISTO_BUILD_SCRIPT`; sem versão = pin default, com versão passa `RUBY_VERSION`), propaga o exit code do script, versão sem sha conhecido (3.4.10/3.4.4) falha ANTES de spawnar e script ausente/args demais → erro claro. `completions bash|zsh` imprimem scripts instaláveis (`complete -F _calisto calisto`/`#compdef calisto`); shell ausente/desconhecido → erro de uso.
+- `deps.rs` — **Fase K (add/remove/lock)**: wrapper fino do bundle com fake via `CALISTO_BUNDLE` (hermético): args passam direto, cwd na raiz do projeto (dir do Gemfile — walk-up), `BUNDLE_GEMFILE` setado, PATH prefixado com o bin dir do ruby (trap do restart do bundler), `CALISTO_BUNDLE_RUBY` exportado e exit code propaga (FAKE_BUNDLE_RC); sem Gemfile → erro claro sugerindo `bundle init`; `.ruby-version` 3.4.4 → bundle do `vendor/ruby-3.4.4` (gated, como versions.rs).
 
 QA rule of thumb: for any change to `run` semantics, the acceptance test is `cold_and_warm_agree` plus the upstream parity harness — if pure `ruby` and calisto diverge, it's a bug in calisto.
 
 ## Armadilhas conhecidas do ambiente
 
-- **Bundler restart por shebang**: o ruby 3.4.10 embute bundler 2.6.9; app cujo `Gemfile.lock` pina outra versão (ex.: Chatwoot locka 2.5.16) dispara `Bundler::SelfManager#restart_with_locked_bundler_if_needed` no `require 'bundler/setup'` frio — o bundler re-executa o processo via shebang `#!/usr/bin/env ruby` e **precisa de `ruby` no PATH** (senão: `env: 'ruby': No such file`). O daemon warm não é afetado (o restart acontece no boot do daemon, que não tem shebang; o child herda o bundler já ativo). `calisto run --cold bin/rails ...` num app com bundler divergente exige `PATH` com o ruby pinado.
+- **Bundler restart por shebang**: o ruby 3.4.10 embute bundler 2.6.9; app cujo `Gemfile.lock` pina outra versão (ex.: Chatwoot locka 2.5.16) dispara `Bundler::SelfManager#restart_with_locked_bundler_if_needed` no `require 'bundler/setup'` frio — o bundler re-executa o processo via shebang `#!/usr/bin/env ruby` e **precisa de `ruby` no PATH** (senão: `env: 'ruby': No such file`). O daemon warm não é afetado (o restart acontece no boot do daemon, que não tem shebang; o child herda o bundler já ativo). `calisto run --cold bin/rails ...` num app com bundler divergente exige `PATH` com o ruby pinado; o `calisto add/remove/lock` (Fase K) já prefixa o PATH com o bin dir do ruby resolvido.
 - **Shell persistente**: `export RAILS_ENV=test`/`POSTGRES_*` no shell do dev vaza para o `cargo test` (o teste `rails_console_runs_in_app_context` espera `development` e quebra). Rodar a suíte com o ambiente limpo.

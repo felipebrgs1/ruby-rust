@@ -119,6 +119,9 @@ fn main() {
         Some("init") => cmd_init(&argv[1..]),
         Some("upgrade") => cmd_upgrade(&argv[1..]),
         Some("completions") => cmd_completions(&argv[1..]),
+        Some("add") => cmd_bundle_wrapper("add", &argv[1..]),
+        Some("remove") => cmd_bundle_wrapper("remove", &argv[1..]),
+        Some("lock") => cmd_bundle_wrapper("lock", &argv[1..]),
         Some("status") => cmd_status(),
         Some("stop") => cmd_stop(),
         Some("doctor") => cmd_doctor(),
@@ -1875,7 +1878,7 @@ const BASH_COMPLETION: &str = r#"# bash completion for calisto
 _calisto() {
     local cur
     cur="${COMP_WORDS[COMP_CWORD]}"
-    local commands="run test task serve exec repl build init upgrade completions status stop doctor help"
+    local commands="run test task serve exec repl build init upgrade completions add remove lock status stop doctor help"
     if (( COMP_CWORD == 1 )); then
         COMPREPLY=( $(compgen -W "${commands}" -- "${cur}") )
         return 0
@@ -1939,6 +1942,9 @@ _calisto() {
         'init:scaffold de app (calisto.toml + hello.rb)'
         'upgrade:rebuild do pin / build de versao'
         'completions:gera completions (bash/zsh)'
+        'add:adiciona gem ao Gemfile (bundle add)'
+        'remove:remove gem do Gemfile (bundle remove)'
+        'lock:atualiza o Gemfile.lock (bundle lock)'
         'status:estado do daemon'
         'stop:para o daemon'
         'doctor:diagnostico do ambiente'
@@ -1986,6 +1992,65 @@ fn cmd_completions(args: &[String]) -> i32 {
         }
         _ => {
             eprintln!("calisto: uso: calisto completions <bash|zsh>");
+            1
+        }
+    }
+}
+
+// ---- Fase K: deps (calisto add/remove/lock) ---------------------------------
+
+/// `calisto add|remove|lock` — wrapper fino do bundle (decisao da Fase A:
+/// nada de instalador proprio), com o ruby da versao certa (Fase I) e cwd na
+/// raiz do projeto (walk-up do Gemfile, como o resto do calisto). Args passam
+/// direto ao `bundle <sub>`. `CALISTO_BUNDLE` (testes) troca o binario do
+/// bundle; o client exporta `CALISTO_BUNDLE_RUBY` (ruby resolvido) e prefixa
+/// o PATH com o bin dir do ruby (trap do restart do bundler: lock que pina
+/// outro bundler re-executa via shebang e precisa de ruby no PATH).
+fn cmd_bundle_wrapper(sub: &str, args: &[String]) -> i32 {
+    let gemfile = env::var_os("BUNDLE_GEMFILE")
+        .map(PathBuf::from)
+        .or_else(|| find_in_parents("Gemfile"));
+    let Some(gemfile) = gemfile else {
+        eprintln!(
+            "calisto: {sub}: nenhum Gemfile encontrado (subindo do cwd); \
+             crie um Gemfile ou rode `bundle init`"
+        );
+        return 1;
+    };
+    let Some(root) = gemfile.parent().map(Path::to_path_buf) else {
+        eprintln!("calisto: {sub}: BUNDLE_GEMFILE invalido: {}", gemfile.display());
+        return 1;
+    };
+    let Some(ruby) = ruby_or_err() else {
+        return 1;
+    };
+    let bin = ruby.parent().unwrap_or(Path::new("."));
+    let path = format!("{}:{}", bin.display(), env::var("PATH").unwrap_or_default());
+    let mut cmd = match env::var_os("CALISTO_BUNDLE") {
+        Some(b) => {
+            let mut c = Command::new(b);
+            c.arg(sub);
+            c
+        }
+        None => {
+            // `ruby -S bundle`: roda o bundler do MESMO ruby (versao da app)
+            // sem depender de shebang; -S procura no PATH (prefixado acima).
+            let mut c = Command::new(&ruby);
+            c.arg("-S").arg("bundle").arg(sub);
+            c
+        }
+    };
+    cmd.args(args)
+        .current_dir(&root)
+        .env("BUNDLE_GEMFILE", &gemfile)
+        .env("CALISTO_BUNDLE_RUBY", &ruby)
+        .env("PATH", path)
+        .stdin(Stdio::inherit());
+    match cmd.status() {
+        // stdio herdado: o bundle mostra o progresso ao vivo
+        Ok(st) => st.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("calisto: {sub}: cannot run bundle: {e}");
             1
         }
     }
@@ -2181,6 +2246,7 @@ USAGE:
   calisto init [name] [--force]
   calisto upgrade [version]
   calisto completions <bash|zsh>
+  calisto add <gem...> | remove <gem...> | lock
   calisto status | stop | doctor | help
 
   run     executes <script.rb> on the pinned CRuby. Default: warm daemon that
@@ -2250,6 +2316,12 @@ USAGE:
           conhecido: 3.4.10/3.4.4; outras: RUBY_SHA256=<sha> manual).
   completions imprime o script de completions do shell em stdout (bash/zsh) —
           ex.: `calisto completions bash > /etc/bash_completion.d/calisto`.
+  add/remove/lock
+          wrappers finos do `bundle add/remove/lock` (decisao da Fase A: nada
+          de instalador proprio) com o ruby da versao certa (Fase I) e cwd na
+          raiz do projeto (walk-up do Gemfile, como o resto do calisto). Args
+          passam direto ao bundle (ex.: `calisto add sinatra --group web`);
+          sem Gemfile, erro claro sugerindo `bundle init`.
   status  shows whether the warm daemon is running
   stop    stops the warm daemon
   doctor  prints environment, pinned ruby version and daemon state

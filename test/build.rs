@@ -173,31 +173,91 @@ fn compile_bundle_embeds_gems_and_runs_without_bundle() {
 }
 
 #[test]
-fn compile_warns_on_c_extensions() {
-    // C extensions nao embutem: o build --compile avisa e o require cai no
-    // bundle real (puma e nio4r sao C-ext no sinatraapp).
+fn compile_embeds_c_extensions_and_runs() {
+    // Fase F, item C exts: gems com C extension embutem .rb + nativos (.so
+    // extraido p/ tmpdir no runtime) — o bundle roda com GEM_PATH vazio
+    // (puma requer 'puma/puma_http11', um .so, estaticamente).
     let dir = runtime_dir("compile-cext");
     let app = fixture("sinatraapp");
     if !common::bundle_check(&app) {
-        eprintln!("SKIP compile_warns_on_c_extensions: rode `bundle install` em test/fixtures/sinatraapp");
+        eprintln!("SKIP compile_embeds_c_extensions_and_runs: rode `bundle install` em test/fixtures/sinatraapp");
         return;
     }
     let req = dir.join("puma_req.rb");
-    std::fs::write(&req, "require \"puma\"\n").unwrap();
+    std::fs::write(&req, "require \"puma\"\nputs Puma::Const::VERSION\n").unwrap();
+    let out = dir.join("o.rb");
     let build = run_opt(
         &dir,
         RunOpts {
-            args: &["build", "--compile", req.to_str().unwrap(), "-o", dir.join("o.rb").to_str().unwrap(), "--root", "."],
+            args: &["build", "--compile", req.to_str().unwrap(), "-o", out.to_str().unwrap(), "--root", "."],
             env: &[],
             stdin: None,
             cwd: Some(&app),
             timeout: 60,
         },
     );
-    assert!(build.status.success());
-    let err = String::from_utf8_lossy(&build.stderr);
     assert!(
-        err.contains("C extension") && err.contains("puma"),
-        "warning de C ext: {err}"
+        build.status.success(),
+        "build --compile: {}",
+        String::from_utf8_lossy(&build.stderr)
     );
+    let src = std::fs::read_to_string(&out).unwrap();
+    assert!(src.contains("$calisto_native"), "bundle sem secao de nativos");
+    let bundled = Command::new(vendor_ruby())
+        .arg(&out)
+        .env("GEM_HOME", dir.join("nogems"))
+        .env("GEM_PATH", dir.join("nogems"))
+        .output()
+        .expect("rodar bundle sem gems");
+    assert!(
+        bundled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    let s = String::from_utf8_lossy(&bundled.stdout);
+    assert!(s.trim().starts_with("8."), "Puma::Const::VERSION deveria ser 8.x: {s}");
+}
+
+#[test]
+fn compile_embeds_sqlite3_c_extension() {
+    // sqlite3: gem precompilada com .so no lib e require DINAMICO
+    // ("sqlite3/#{RUBY_VERSION}/sqlite3_native") — coberto pelo pre-indice
+    // dos nativos pelo nome canonico de require.
+    let dir = runtime_dir("compile-sqlite");
+    let app = fixture("railsapp");
+    if !common::bundle_check(&app) {
+        eprintln!("SKIP compile_embeds_sqlite3_c_extension: rode `bundle install` em test/fixtures/railsapp");
+        return;
+    }
+    let req = dir.join("sqlite_req.rb");
+    std::fs::write(&req, "require \"sqlite3\"\nputs SQLite3::SQLITE_VERSION\n").unwrap();
+    let out = dir.join("o.rb");
+    let build = run_opt(
+        &dir,
+        RunOpts {
+            args: &["build", "--compile", req.to_str().unwrap(), "-o", out.to_str().unwrap(), "--root", "."],
+            env: &[],
+            stdin: None,
+            cwd: Some(&app),
+            timeout: 60,
+        },
+    );
+    assert!(
+        build.status.success(),
+        "build --compile: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let bundled = Command::new(vendor_ruby())
+        .arg(&out)
+        .env("GEM_HOME", dir.join("nogems"))
+        .env("GEM_PATH", dir.join("nogems"))
+        .output()
+        .expect("rodar bundle sem gems");
+    assert!(
+        bundled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    let s = String::from_utf8_lossy(&bundled.stdout);
+    assert!(s.trim().starts_with("3."), "SQLite3::SQLITE_VERSION: {s}");
 }

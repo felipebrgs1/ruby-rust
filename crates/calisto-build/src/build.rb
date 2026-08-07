@@ -15,8 +15,10 @@
 #     roda normalmente
 #   - DATA/__END__ do entrypoint e emulado com StringIO
 #
-# Limites v1: requires dinamicos nao sao embutidos (warning); assets nao-Ruby
-# ficam externos; C extensions (.so) nao embutidas.
+# Limites v1: requires dinamicos de .rb nao sao embutidos (warning); assets
+# nao-Ruby ficam externos. C extensions (.so) SAO embutidas como bytes
+# (extraidas p/ tmpdir no runtime) — o pre-indice por nome canonico de require
+# cobre requires dinamicos de nativos (ex.: sqlite3).
 
 require "ripper"
 
@@ -107,17 +109,24 @@ end
 def resolve_require(ident, load_path)
   cands = []
   load_path.each do |lp|
+    # mesma ordem do require do ruby: nome exato, .rb, .so, .bundle
     cands << File.expand_path(ident, lp)
     cands << File.expand_path("#{ident}.rb", lp)
+    cands << File.expand_path("#{ident}.so", lp)
+    cands << File.expand_path("#{ident}.bundle", lp)
   end
   cands.find { |c| File.file?(c) }
 end
 
 # --- gems (Fase F: --compile) -------------------------------------------------
-# Embutir gems pure-Ruby do Gemfile.lock no bundle: o loader intercepta o
-# require por nome, entao o executavel roda sem bundle install/rubygems no
-# sistema. Dirigido por requires: so entram arquivos alcancados pelo grafo.
-# C extensions (.so) nao embutem — warning; o require cai no bundle real.
+# Embutir gems do Gemfile.lock no bundle: o loader intercepta o require por
+# nome, entao o executavel roda sem bundle install/rubygems no sistema.
+# Dirigido por requires para os .rb; nativos (.so/.bundle) de gems C-ext sao
+# embutidos como bytes (base64) e extraidos p/ tmpdir no runtime — covers
+# requires dinamicos via pre-indice pelo nome canonico (sqlite3 require
+# "sqlite3/#{RUBY_VERSION}/sqlite3_native"). Compilar do zero continua com o
+# bundle install (decisao da Fase A: sem toolchain propria) — o build so
+# embute o que ja foi compilado no GEM_PATH da app.
 
 def find_gemfile_lock(start)
   d = File.expand_path(start)
@@ -157,13 +166,40 @@ def resolve_gems(gemfile_dir)
   specs
 end
 
-# require_path => [gem_name, c_ext?] — o BFS resolve requires nestes paths e
-# decide embutir (pure-Ruby) ou delegar (C ext / stdlib).
+# Dir de extensoes compiladas do gem pelo bundle install: o .so vive fora do
+# require_path (extensions/<plat>/<ver>/<gem>-<v>/). spec.extension_dir e o
+# caminho canonico; fallback glob no Gem.dir (o "-static" do api version).
+def gem_extension_dirs(spec)
+  dirs = []
+  ed = spec.extension_dir
+  dirs << ed if File.directory?(ed)
+  if dirs.empty?
+    glob = Dir[File.join(Gem.dir, "extensions", "**", "#{spec.name}-#{spec.version}*")]
+           .find { |d| File.directory?(d) }
+    dirs << glob if glob
+  end
+  dirs
+end
+
+# Arquivos nativos do gem (.so/.bundle): nos require_paths (gems precompiladas,
+# ex.: sqlite3-x86_64-linux-gnu) e no dir de extensoes compiladas.
+def gem_native_files(spec)
+  files = []
+  (spec.full_require_paths + gem_extension_dirs(spec)).each do |dir|
+    Dir.glob(File.join(dir, "**", "*.{so,bundle}")).each { |f| files << f if File.file?(f) }
+  end
+  files.uniq
+end
+
+# require_path => [gem_name, c_ext?] — o BFS resolve requires nestes paths
+# (require_paths + dirs de extensao) e decide embutir (.rb) ou extrair no
+# runtime (.so/.bundle). C-ext = extensions declaradas OU nativo presente
+# (gems precompiladas nao declaram extensions).
 def gem_path_map(specs)
   map = {}
   specs.each_value do |spec|
-    c_ext = !spec.extensions.empty?
-    spec.full_require_paths.each { |p| map[p] = [spec.name, c_ext] }
+    c_ext = !spec.extensions.empty? || !gem_native_files(spec).empty?
+    (spec.full_require_paths + gem_extension_dirs(spec)).each { |p| map[p] = [spec.name, c_ext] }
   end
   map
 end
@@ -205,6 +241,8 @@ files = {} # abs => true, ordem de descoberta (entry primeiro)
 index = {} # ident do require => abs (requeridos por nome)
 warnings = []
 embedded_gems = {} # gem_name => version (para o header)
+native = {} # abs => bytes brutos (C extension; base64 na geracao)
+native_gems = {} # gem_name => true (gems C-ext alcancadas: coletar nativos)
 autoload_map = {} # arquivo que registra autoload => [alvos embutidos]
 queue = [entry]
 
@@ -234,20 +272,48 @@ until queue.empty?
       # fora da raiz e das gems (stdlib/default gem): nao embute
       next
     elsif origin.is_a?(Array) # [gem_name, c_ext?]
-      name, c_ext = origin
-      if c_ext
-        warnings << "gem #{name} tem C extension — nao embutida (runtime precisa do bundle)"
-        next
+      name, = origin
+      case File.extname(resolved)
+      when ".so", ".bundle"
+        # C extension: embutida como bytes; extraida e require'd no runtime
+        native[resolved] = File.binread(resolved)
+        native_gems[name] = true
+        index[ident] = resolved unless kind == :require_relative
+      when ".rb"
+        embedded_gems[name] ||= gem_specs[name]&.version.to_s
+        native_gems[name] = true # gems C-ext: coleta os .so nao-vistos apos o BFS
+        index[ident] = resolved unless kind == :require_relative
+        (autoload_map[file] ||= []) << resolved if kind == :autoload
+        queue << resolved unless files[resolved]
+      else
+        # asset nao-Ruby alcancado por nome (ex.: dado do gem): nao embute
+        warnings << "gem #{name}: asset #{File.basename(resolved)} nao embutido"
       end
-      embedded_gems[name] ||= gem_specs[name]&.version.to_s
-      index[ident] = resolved unless kind == :require_relative
-      (autoload_map[file] ||= []) << resolved if kind == :autoload
-      queue << resolved unless files[resolved]
     else # :project
       index[ident] = resolved unless kind == :require_relative
       (autoload_map[file] ||= []) << resolved if kind == :autoload
       queue << resolved unless files[resolved]
     end
+  end
+end
+
+# Nativos de gems C-ext alcancadas pelo grafo: coleta TAMBEM os .so que o
+# Ripper nao ve (requires dinamicos, ex.: sqlite3 require
+# "sqlite3/#{RUBY_VERSION}/sqlite3_native") e pre-indice cada um pelo nome
+# canonico de require (relativo ao require_path/dir de extensao, sem
+# extensao) — o loader entao resolve o require dinamico no runtime.
+# (each_key: no ruby 3.4, Hash#each com bloco de aridade 1 entrega [k, v]).
+native_gems.each_key do |name|
+  spec = gem_specs[name]
+  next unless spec
+  gem_native_files(spec).each { |f| native[f] ||= File.binread(f) }
+end
+native.each_key do |abs|
+  gem_paths.each do |require_path, meta|
+    next unless abs.start_with?("#{require_path}/")
+    rel = abs.delete_prefix("#{require_path}/").sub(/\.(so|bundle)\z/, "")
+    index[rel] = abs unless index.key?(rel)
+    break
   end
 end
 
@@ -268,11 +334,59 @@ LOADER = <<~'CALISTO'
   module CalistoBundle
     CODE = $calisto_code
     INDEX = $calisto_index
+    NATIVE = $calisto_native # abs => base64 (C extension embutida)
     AUTOLOADS = $calisto_autoloads
     ENTRY = $calisto_entry
     DATA = $calisto_data
     LOADING = {} # arquivos com eval em andamento
     LOADED = {}
+
+    # decoder hand-rolled (mesma filosofia do daemon: sem require "base64" —
+    # default gem pinada pode colidir com o bundle da app)
+    B64D = {}
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".each_char.with_index { |c, i| B64D[c] = i }
+
+    def self.b64decode(s)
+      out = +"".b
+      buf = 0
+      bits = 0
+      s.each_char do |c|
+        next if c == "=" || c == "\n" # padding e quebras (pack m0 nao emite \n)
+        v = B64D[c] or raise "calisto bundle: base64 invalido"
+        buf = ((buf << 6) | v) & 0x3fffffff
+        bits += 6
+        next unless bits >= 8
+        bits -= 8
+        out << ((buf >> bits) & 0xff)
+      end
+      out
+    end
+
+    # C extension embutida como bytes: extrai para um cache no tmpdir (chave =
+    # abs sanitizado — versoes/plataformas diferentes nao colidem) e require o
+    # caminho absoluto; o dlopen roda no interpretador do runtime.
+    def self.load_native(abs, b64)
+      tmp = ENV["TMPDIR"]
+      tmp = "/tmp" if tmp.nil? || tmp.empty?
+      base = File.join(tmp, "calisto-native")
+      begin
+        Dir.mkdir(base)
+      rescue Errno::EEXIST
+      end
+      dir = File.join(base, abs.tr("/.", "__"))
+      begin
+        Dir.mkdir(dir)
+      rescue Errno::EEXIST
+      end
+      out = File.join(dir, File.basename(abs))
+      unless File.file?(out)
+        File.binwrite(out, b64decode(b64))
+      end
+      require out
+      LOADED[abs] = true
+      $LOADED_FEATURES << abs unless $LOADED_FEATURES.include?(abs)
+      true
+    end
 
     def self.run
       if DATA
@@ -307,6 +421,15 @@ LOADER = <<~'CALISTO'
 
     def self.load_file(abs)
       return false if LOADED[abs] || LOADING[abs]
+      if NATIVE[abs]
+        LOADING[abs] = true
+        begin
+          load_native(abs, NATIVE[abs])
+        ensure
+          LOADING.delete(abs)
+        end
+        return true
+      end
       code = CODE[abs]
       raise LoadError, "cannot load such file -- #{abs}" unless code
       LOADING[abs] = true
@@ -362,6 +485,10 @@ unless embedded_gems.empty?
   out_src << "# gems embutidas (#{embedded_gems.size}):\n"
   embedded_gems.sort.each { |name, ver| out_src << "#   #{name}-#{ver}\n" }
 end
+unless native.empty?
+  out_src << "# nativos embutidos (#{native.size}):\n"
+  native.keys.sort.each { |f| out_src << "#   #{f}\n" }
+end
 out_src << "\n"
 out_src << "$calisto_code = {\n"
 code_map.each do |f, code|
@@ -371,6 +498,11 @@ out_src << "}\n\n"
 out_src << "$calisto_index = {\n"
 index.each do |ident, f|
   out_src << "  #{ident.dump} => #{f.dump},\n"
+end
+out_src << "}\n\n"
+out_src << "$calisto_native = {\n"
+native.sort.each do |f, data|
+  out_src << "  #{f.dump} => #{[data].pack("m0").dump},\n"
 end
 out_src << "}\n\n"
 out_src << "$calisto_entry = #{entry.dump}\n"
