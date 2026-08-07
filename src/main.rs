@@ -1161,6 +1161,7 @@ fn cmd_build(args: &[String]) -> i32 {
     let mut out = PathBuf::from("bundle.rb");
     let mut root: Option<PathBuf> = None;
     let mut entry: Option<PathBuf> = None;
+    let mut compile = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1184,6 +1185,7 @@ fn cmd_build(args: &[String]) -> i32 {
                     }
                 }
             }
+            "--compile" => compile = true,
             s if s.starts_with('-') => {
                 eprintln!("calisto: flag desconhecida '{s}'");
                 return 1;
@@ -1214,7 +1216,7 @@ fn cmd_build(args: &[String]) -> i32 {
             .unwrap_or_else(|| PathBuf::from("."))
     });
     let ruby = ruby_path();
-    match calisto_build::bundle(&ruby, &entry, &out, &root) {
+    match calisto_build::bundle(&ruby, &entry, &out, &root, compile) {
         Ok(stats) => {
             println!("calisto: bundled {} arquivo(s) -> {}", stats.files, out.display());
             0
@@ -1347,6 +1349,10 @@ USAGE:
           num arquivo unico self-contained. Arquivos fora da raiz (stdlib)
           nao sao embutidos. --root define a raiz do projeto (default: o
           diretorio do entrypoint).
+          --compile embute as gems pure-Ruby do Gemfile.lock (Fase F): o
+          bundle roda sem bundle install — GEM_HOME/GEM_PATH vazios. C
+          extensions nao embutem (warning; o require cai no bundle real).
+          Autoloads das gems sao cobertos (pre-carga em rodadas).
   status  shows whether the warm daemon is running
   stop    stops the warm daemon
   doctor  prints environment, pinned ruby version and daemon state

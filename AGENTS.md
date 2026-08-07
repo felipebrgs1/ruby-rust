@@ -10,8 +10,11 @@ Bundler), Fase B (preload de app), Fase C (Rails mínimo), Fase D completa
 e **Fase E completa** (test/task/serve/.env/watch; daemon multi-conexão — o
 risco conhecido do accept loop single-connection foi resolvido) do ROADMAP.md
 done. Golden rspec real validado no Chatwoot (119 examples: frio 5.0s → quente
-0.70s, 7.2×). O roadmap agora mira **Fase F** — `calisto build --compile` com
-gems (pure-Ruby embutidas; C exts = item "década").
+0.70s, 7.2×). **Fase F em andamento**: `calisto build --compile` embute gems
+pure-Ruby do Gemfile.lock — marco Sinatra alcançado (10 gems, HTTP 200 com
+GEM_PATH vazio); C exts (puma/nio4r) avisam e delegam ao bundle. O roadmap
+mira completar a Fase F (gems C-ext-friendly? handler embutido para servidor
+real) e depois G (exec/-e/repl).
 
 ## Architecture & Data Flow
 
@@ -43,7 +46,7 @@ Fase B (preload de app): `calisto.toml` na raiz da app (walk-up do cwd) com `[ru
 
 **Wire protocol** (RESP-style over unix socket): `"<OP> <n>\r\n"` then n fields `"$<len>\r\n<data>"`. Commands: `PING` → `OK`, `STOP` → `BYE`, `RUN` → `STATUS <code>`. Fields are base64 (hand-rolled encoder, no crates).
 
-**`calisto build` flow**: `build.rb` parses static `require`/`require_relative` with Ripper (the real lexer), BFS-collects project files under the root, emits a bundle where each file is evaluated via `eval(code, TOPLEVEL_BINDING, original_path, 1)` (preserves `__FILE__`/`__dir__`/`require_relative`) and a loader monkey-patches `Kernel#require`/`require_relative` against an index. Files outside the root (stdlib like `json`) are NOT bundled — delegated to real `require`.
+**`calisto build` flow**: `build.rb` parses static `require`/`require_relative`/`autoload` with Ripper (the real lexer), BFS-collects project files under the root, emits a bundle where each file is evaluated via `eval(code, TOPLEVEL_BINDING, original_path, 1)` (preserves `__FILE__`/`__dir__`/`require_relative`) and a loader monkey-patches `Kernel#require`/`require_relative` against an index. Files outside the root (stdlib like `json`) are NOT bundled — delegated to real `require`. `--compile` (Fase F) também embute gems pure-Ruby do Gemfile.lock: specs resolvidas via `Gem::Specification.find_by_name` com o GEM_PATH do app (`vendor/bundle`), C extensions avisam e delegam. O loader pré-carrega os alvos dos `autoload` antes do arquivo registrador (bug do CRuby 3.4: autoload via `eval` dispara na definição do const) em rodadas com retry; `require_relative` de arquivo não embutido delega com caminho absoluto.
 
 ## Key Directories
 

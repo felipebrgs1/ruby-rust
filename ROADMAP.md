@@ -40,11 +40,10 @@ Crates esboçados (ainda vazios): `calisto-{test,task,serve,sqlite,tooling}`.
 - Marco: `calisto test` roda a suíte do `railsapp` (minitest) **<1s total, <500ms/arquivo**; `calisto task db:migrate` idempotente no daemon. **Golden rspec real validado no Chatwoot** (119 examples em `account`+`user`+`label_spec`): `bundle exec rspec` frio **5006ms** → `calisto test` quente **698ms (7.2×)**, 1ª execução (com boot) 2509ms — os 3 arquivos rodam em paralelo via accept loop multi-conexão. Nota: o Chatwoot locka bundler 2.5.16 e o ruby 3.4.10 embute 2.6.9 — o `require 'bundler/setup'` frio dispara `Bundler::SelfManager#restart_with_locked_bundler_if_needed`, que re-executa o processo via shebang (precisa de ruby no PATH); o daemon warm não é afetado (o restart acontece no boot sem shebang, o child herda o bundler ativo)
 
 ### Fase F — build --compile com gems
-- [ ] gems **pure-Ruby** embutidas no bundle (o loader já intercepta `require`)
-- [ ] executável único roda app com gems **sem bundle install** (runtime próprio)
-- [ ] C extensions (nokogiri, pg…): compile + link no build — o item "década"; só para apps sem C exts; provavelmente nunca para Rails completo (bun levou anos com time full-time)
-- Marco: app Sinatra com 5 gems → `calisto build --compile` → executável → HTTP 200 sem rubygems/bundle no sistema
-- Estimativa: 2-4 meses (C exts: estelar)
+- [x] gems **pure-Ruby** embutidas no bundle (o loader intercepta `require` por nome; `autoload` das gems coberto — pré-carga dos alvos em rodadas; `require_relative` delegado com caminho absoluto)
+- [x] executável único roda app com gems **sem bundle install** (roda com `GEM_HOME`/`GEM_PATH` vazios)
+- [ ] C extensions (nokogiri, pg…): compile + link no build — o item "década"; hoje o `--compile` avisa e o require cai no bundle real
+- Marco ✅: Sinatra + 10 gems (sinatra/rack/rack-test/rack-protection/rack-session/rackup/mustermann/tilt/base64/logger) → `calisto build --compile smoke.rb` → roda com `GEM_PATH` vazio → **HTTP 200** (smoke via rack-test em memória; servidor real com handler embutido fica para depois — puma/nio4r são C-ext). Notas: bug do CRuby 3.4 (autoload registrado via `eval` dispara na definição do const) contornado no loader; gems são resolvidas via `Gem::Specification.find_by_name` com o GEM_PATH do app (vendor/bundle) — o bundle install do fixture usa `path vendor/bundle`
 
 ### Fase G — Execução (o bunx do Ruby)
 - [ ] `calisto exec <bin>` — roda o binário de uma gem no contexto da app (ex.: `calisto exec rubocop`, `calisto exec sidekiq`) — o degrau 4/5 precisou de `bin/sidekiq` manual

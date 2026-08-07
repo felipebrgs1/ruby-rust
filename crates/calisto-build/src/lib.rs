@@ -17,19 +17,27 @@ pub struct BundleStats {
     pub files: usize,
 }
 
-/// Roda o bundler: `ruby build.rb <entry> <out> <root>`.
+/// Roda o bundler: `ruby build.rb <entry> <out> <root> [--compile]`.
 /// O bundler imprime `BUNDLED <n>` no stdout; warnings vao ao stderr ao vivo.
-pub fn bundle(ruby: &Path, entry: &Path, out: &Path, root: &Path) -> Result<BundleStats, String> {
+/// `compile` embute gems pure-Ruby do Gemfile.lock (Fase F).
+pub fn bundle(
+    ruby: &Path,
+    entry: &Path,
+    out: &Path,
+    root: &Path,
+    compile: bool,
+) -> Result<BundleStats, String> {
     let dir = std::env::temp_dir().join(format!("calisto-build-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create temp dir: {e}"))?;
     let rb = dir.join("build.rb");
     std::fs::write(&rb, BUILD_RB).map_err(|e| format!("cannot write bundler: {e}"))?;
 
-    let child = Command::new(ruby)
-        .arg(&rb)
-        .arg(entry)
-        .arg(out)
-        .arg(root)
+    let mut cmd = Command::new(ruby);
+    cmd.arg(&rb).arg(entry).arg(out).arg(root);
+    if compile {
+        cmd.arg("--compile");
+    }
+    let child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()

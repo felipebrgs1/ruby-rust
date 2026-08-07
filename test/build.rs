@@ -124,3 +124,80 @@ fn build_reports_bundled_count() {
     let s = String::from_utf8_lossy(&build.stdout);
     assert!(s.contains("bundled 2 arquivo(s)"), "{s}");
 }
+
+#[test]
+fn compile_bundle_embeds_gems_and_runs_without_bundle() {
+    // Fase F, marco: `calisto build --compile` embute as gems pure-Ruby do
+    // Gemfile.lock (Sinatra + rack + rack-test + ...) e o bundle roda com
+    // GEM_HOME/GEM_PATH vazios — sem rubygems/bundle no sistema.
+    let dir = runtime_dir("compile");
+    let app = fixture("sinatraapp");
+    if !common::bundle_check(&app) {
+        eprintln!("SKIP compile_bundle_embeds_gems_and_runs_without_bundle: rode `bundle install` em test/fixtures/sinatraapp");
+        return;
+    }
+    let out = dir.join("compiled.rb");
+    let build = run_opt(
+        &dir,
+        RunOpts {
+            args: &["build", "--compile", "smoke.rb", "-o", out.to_str().unwrap(), "--root", "."],
+            env: &[],
+            stdin: None,
+            cwd: Some(&app),
+            timeout: 60,
+        },
+    );
+    assert!(
+        build.status.success(),
+        "build --compile: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(String::from_utf8_lossy(&build.stdout).contains("bundled"));
+    assert!(out.is_file(), "bundle nao foi gerado");
+
+    let bundled = Command::new(vendor_ruby())
+        .arg(&out)
+        .env("GEM_HOME", dir.join("nogems"))
+        .env("GEM_PATH", dir.join("nogems"))
+        .output()
+        .expect("rodar bundle sem gems");
+    assert!(
+        bundled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&bundled.stdout).trim(),
+        "HTTP 200: hello from sinatra"
+    );
+}
+
+#[test]
+fn compile_warns_on_c_extensions() {
+    // C extensions nao embutem: o build --compile avisa e o require cai no
+    // bundle real (puma e nio4r sao C-ext no sinatraapp).
+    let dir = runtime_dir("compile-cext");
+    let app = fixture("sinatraapp");
+    if !common::bundle_check(&app) {
+        eprintln!("SKIP compile_warns_on_c_extensions: rode `bundle install` em test/fixtures/sinatraapp");
+        return;
+    }
+    let req = dir.join("puma_req.rb");
+    std::fs::write(&req, "require \"puma\"\n").unwrap();
+    let build = run_opt(
+        &dir,
+        RunOpts {
+            args: &["build", "--compile", req.to_str().unwrap(), "-o", dir.join("o.rb").to_str().unwrap(), "--root", "."],
+            env: &[],
+            stdin: None,
+            cwd: Some(&app),
+            timeout: 60,
+        },
+    );
+    assert!(build.status.success());
+    let err = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        err.contains("C extension") && err.contains("puma"),
+        "warning de C ext: {err}"
+    );
+}

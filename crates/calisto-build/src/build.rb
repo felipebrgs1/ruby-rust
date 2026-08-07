@@ -20,12 +20,13 @@
 
 require "ripper"
 
-entry, out, root = ARGV
-abort "uso: build.rb <entry> <out> <root>" unless entry && out && root
+entry, out, root, compile = ARGV
+abort "uso: build.rb <entry> <out> <root> [--compile]" unless entry && out && root
 entry = File.expand_path(entry)
 root = File.expand_path(root)
 abort "entry nao encontrado: #{entry}" unless File.file?(entry)
 abort "root nao e diretorio: #{root}" unless File.directory?(root)
+compile = compile == "1" || compile == "--compile"
 
 # --- analise estatica ---------------------------------------------------------
 
@@ -39,9 +40,14 @@ def static_string(node)
   parts.map { |p| p[1] }.join
 end
 
-# Caminha o sexp achando require/require_relative com argumento literal:
+# Caminha o sexp achando require/require_relative/autoload com argumento
+# literal:
 #   require "x"            -> [:command, [:@ident, "require"], [:args_add_block, ...]]
 #   require("x")           -> [:method_add_arg, [:fcall, [:@ident, "require"]], [:arg_paren, ...]]
+#   autoload :X, "x"       -> [:command, [:@ident, "autoload"], [:args_add_block, ...]]
+#                            (o ident do require e o 2o argumento; o 1o e o const)
+# autoload importa: o rack (entre outros) autoloada classes por nome e o
+# runtime dispara `require "rack/x"` — sem o indice, o bundle quebra.
 def walk_requires(sexp, requires, file)
   return unless sexp.is_a?(Array)
 
@@ -53,10 +59,11 @@ def walk_requires(sexp, requires, file)
     kind_node, args_node = sexp[1][1], sexp[2]&.dig(1)
   end
 
-  if kind_node && %w[require require_relative].include?(kind_node[1])
+  if kind_node && %w[require require_relative autoload].include?(kind_node[1])
     kind = kind_node[1].to_sym
     if args_node.is_a?(Array) && args_node[0] == :args_add_block
-      ident = static_string(args_node[1]&.first)
+      str_arg = kind == :autoload ? args_node[1]&.last : args_node[1]&.first
+      ident = static_string(str_arg)
       if ident
         requires << [kind, ident]
       else
@@ -106,11 +113,99 @@ def resolve_require(ident, load_path)
   cands.find { |c| File.file?(c) }
 end
 
+# --- gems (Fase F: --compile) -------------------------------------------------
+# Embutir gems pure-Ruby do Gemfile.lock no bundle: o loader intercepta o
+# require por nome, entao o executavel roda sem bundle install/rubygems no
+# sistema. Dirigido por requires: so entram arquivos alcancados pelo grafo.
+# C extensions (.so) nao embutem — warning; o require cai no bundle real.
+
+def find_gemfile_lock(start)
+  d = File.expand_path(start)
+  loop do
+    f = File.join(d, "Gemfile.lock")
+    return f if File.file?(f)
+    parent = File.dirname(d)
+    return nil if parent == d
+    d = parent
+  end
+end
+
+# Resolve as specs do Gemfile.lock (caminhos reais + extensions) usando o
+# GEM_PATH do app (vendor/bundle) — o find_by_name e do rubygems puro, sem
+# ativar o bundler (o build.rb roda fora de bundle).
+def resolve_gems(gemfile_dir)
+  require "bundler"
+  lock = File.join(gemfile_dir, "Gemfile.lock")
+  return {} unless File.file?(lock)
+
+  vendored = Dir["#{gemfile_dir}/vendor/bundle/ruby/*/"].first
+  if vendored
+    Gem.paths = { "GEM_PATH" => [vendored, *Gem.default_path].join(File::PATH_SEPARATOR) }
+    Gem::Specification.reset
+  end
+
+  specs = {}
+  Bundler::LockfileParser.new(File.read(lock)).specs.each do |lazy|
+    spec = begin
+      Gem::Specification.find_by_name(lazy.name, lazy.version)
+    rescue Gem::LoadError
+      warn "calisto build: warning: gem #{lazy.name} (#{lazy.version}) nao instalada — nao embutida"
+      next
+    end
+    specs[lazy.name] = spec
+  end
+  specs
+end
+
+# require_path => [gem_name, c_ext?] — o BFS resolve requires nestes paths e
+# decide embutir (pure-Ruby) ou delegar (C ext / stdlib).
+def gem_path_map(specs)
+  map = {}
+  specs.each_value do |spec|
+    c_ext = !spec.extensions.empty?
+    spec.full_require_paths.each { |p| map[p] = [spec.name, c_ext] }
+  end
+  map
+end
+
+def gem_origin(path, root, gem_path_map)
+  # gems primeiro: o vendor/bundle fica DENTRO do root, entao o teste do
+  # projeto so vale se nenhuma require_path de gem casou
+  gem_path_map.each do |require_path, meta|
+    return meta if path.start_with?("#{require_path}/")
+  end
+  if path.start_with?("#{root}/")
+    :project
+  else
+    :stdlib
+  end
+end
+
 load_path = [root, *$LOAD_PATH]
+original_load_path = $LOAD_PATH.dup
+gem_specs = {}
+gem_paths = {}
+
+if compile
+  gemfile_dir = find_gemfile_lock(root)&.then { |f| File.dirname(f) }
+  if gemfile_dir
+    gem_specs = resolve_gems(gemfile_dir)
+    gem_paths = gem_path_map(gem_specs)
+    # Gem.paths= recalcula o $LOAD_PATH e remove as default gems (stringio
+    # etc.) — o resolvedor usa a copia original; o runtime do bundle resolve
+    # essas via rubygems de qualquer forma.
+    load_path = [root, *gem_paths.keys, *original_load_path]
+    warn "calisto build: --compile com #{gem_specs.size} gem(s) do Gemfile.lock" unless gem_specs.empty?
+  else
+    warn "calisto build: warning: --compile sem Gemfile.lock (nada a embutir)"
+  end
+end
 
 files = {} # abs => true, ordem de descoberta (entry primeiro)
 index = {} # ident do require => abs (requeridos por nome)
 warnings = []
+embedded_gems = {} # gem_name => version (para o header)
+autoload_map = {} # arquivo que registra autoload => [alvos embutidos]
 queue = [entry]
 
 until queue.empty?
@@ -126,16 +221,33 @@ until queue.empty?
     resolved =
       case kind
       when :require_relative then resolve_relative(ident, file)
-      when :require then resolve_require(ident, load_path)
+      when :require, :autoload then resolve_require(ident, load_path)
       end
 
     if resolved.nil?
       warnings << "#{kind} #{ident.inspect} nao resolvido em #{file}"
-    elsif resolved.start_with?("#{root}/")
+      next
+    end
+
+    origin = gem_origin(resolved, root, gem_paths)
+    if origin == :stdlib
+      # fora da raiz e das gems (stdlib/default gem): nao embute
+      next
+    elsif origin.is_a?(Array) # [gem_name, c_ext?]
+      name, c_ext = origin
+      if c_ext
+        warnings << "gem #{name} tem C extension — nao embutida (runtime precisa do bundle)"
+        next
+      end
+      embedded_gems[name] ||= gem_specs[name]&.version.to_s
       index[ident] = resolved unless kind == :require_relative
+      (autoload_map[file] ||= []) << resolved if kind == :autoload
+      queue << resolved unless files[resolved]
+    else # :project
+      index[ident] = resolved unless kind == :require_relative
+      (autoload_map[file] ||= []) << resolved if kind == :autoload
       queue << resolved unless files[resolved]
     end
-    # resolvido fora da raiz (stdlib): nao embute
   end
 end
 
@@ -156,8 +268,10 @@ LOADER = <<~'CALISTO'
   module CalistoBundle
     CODE = $calisto_code
     INDEX = $calisto_index
+    AUTOLOADS = $calisto_autoloads
     ENTRY = $calisto_entry
     DATA = $calisto_data
+    LOADING = {} # arquivos com eval em andamento
     LOADED = {}
 
     def self.run
@@ -168,13 +282,42 @@ LOADER = <<~'CALISTO'
       load_file(ENTRY)
     end
 
+    # Bug do CRuby 3.4: autoload registrado via eval dispara na DEFINICAO do
+    # const (NameError). Pre-carregar os alvos dos autoloads ANTES do arquivo
+    # registrador deixa o const definido no momento do registro — autoload
+    # sobre const definido e inofensivo (rack 3 usa ~30 autoloads). Os alvos
+    # podem depender entre si (rack-protection: filhos de Base) — rodadas com
+    # retry: um alvo que falha por const ausente espera o pai carregar.
+    def self.preload(autoloads)
+      pending = autoloads.dup
+      until pending.empty?
+        progressed = false
+        pending = pending.reject do |t|
+          begin
+            load_file(t)
+            progressed = true
+            true
+          rescue NameError
+            false # dependencia ainda nao carregada: tenta na proxima rodada
+          end
+        end
+        break unless progressed # ciclo real: o runtime resolve (ou falha)
+      end
+    end
+
     def self.load_file(abs)
-      return false if LOADED[abs]
+      return false if LOADED[abs] || LOADING[abs]
       code = CODE[abs]
       raise LoadError, "cannot load such file -- #{abs}" unless code
+      LOADING[abs] = true
+      preload(AUTOLOADS[abs] || [])
+      begin
+        eval(code, TOPLEVEL_BINDING, abs, 1) # __FILE__/__dir__ corretos
+      ensure
+        LOADING.delete(abs)
+      end
       LOADED[abs] = true
       $LOADED_FEATURES << abs unless $LOADED_FEATURES.include?(abs)
-      eval(code, TOPLEVEL_BINDING, abs, 1) # __FILE__/__dir__ corretos
       true
     end
   end
@@ -197,7 +340,10 @@ LOADER = <<~'CALISTO'
       elsif CalistoBundle::CODE["#{abs}.rb"]
         return CalistoBundle.load_file("#{abs}.rb")
       end
-      calisto_original_require_relative(path)
+      # chamador nao embutido (stdlib): delega com o caminho ABSOLUTO — o
+      # require_relative nativo resolveria o path relativo contra ESTE
+      # arquivo (o bundle), nao contra o chamador real
+      calisto_original_require_relative(abs)
     end
 
     private :require, :require_relative
@@ -212,6 +358,10 @@ out_src << "# gerado por calisto build\n"
 out_src << "# entry: #{entry}\n"
 out_src << "# arquivos (#{files.size}):\n"
 files.each_key { |f| out_src << "#   #{f}\n" }
+unless embedded_gems.empty?
+  out_src << "# gems embutidas (#{embedded_gems.size}):\n"
+  embedded_gems.sort.each { |name, ver| out_src << "#   #{name}-#{ver}\n" }
+end
 out_src << "\n"
 out_src << "$calisto_code = {\n"
 code_map.each do |f, code|
@@ -224,7 +374,12 @@ index.each do |ident, f|
 end
 out_src << "}\n\n"
 out_src << "$calisto_entry = #{entry.dump}\n"
-out_src << "$calisto_data = #{entry_data.nil? ? "nil" : entry_data.dump}\n\n"
+out_src << "$calisto_data = #{entry_data.nil? ? "nil" : entry_data.dump}\n"
+out_src << "$calisto_autoloads = {\n"
+autoload_map.each do |f, targets|
+  out_src << "  #{f.dump} => [#{targets.map(&:dump).join(", ")}],\n"
+end
+out_src << "}\n\n"
 out_src << LOADER
 out_src << "\n"
 
