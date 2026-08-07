@@ -16,7 +16,7 @@ graph LR
     J --> K[Fase K: deps add/remove]
     K --> L[Fase L: CRuby embutido — libruby]
     L --> M[Fase M: memória / CoW]
-    L --> N[Fase N: YJIT quente no fork]
+    L --> N[Fase N: YJIT quente no fork ✅]
     L --> P[Fase P: APIs nativas calisto.*]
     M --> O[Fase O: snapshot de boot]
     N --> O
@@ -239,29 +239,45 @@ controla o heap **antes** de aceitar conexões.
   `test/app.rs`; doctor com/sem daemon em `test/cli.rs`.
 - Estimativa: ~~1 semana~~ (concluída).
 
-### Fase N — YJIT quente no fork (o que só essa arquitetura permite)
+### Fase N — YJIT quente no fork (o que só essa arquitetura permite) ✅
 YJIT aquece **por processo**: num `ruby` normal os primeiros requests são
 lentos. No calisto o daemon pode compilar o hot path **antes** de aceitar
 conexões e cada child nasce com o código JIT pronto (páginas CoW
 compartilhadas).
 
-- [ ] **N.1 — warmup declarativo**: `[run] warmup = "bin/warmup.rb"` no
+- [x] **N.1 — warmup declarativo**: `[run] warmup = "bin/warmup.rb"` no
       calisto.toml — script executado no daemon pós-boot (ex.: N requests
       contra a Rack app em memória via rack-test) antes do accept loop.
-- [ ] **N.2 — boot com YJIT**: daemon de app sobe com `--yjit`
+- [x] **N.2 — boot com YJIT**: daemon de app sobe com `--yjit`
       (configurável: `[run] yjit = true`); o warmup dispara a compilação
       dos métodos quentes; verificar via `RubyVM::YJIT.runtime_stats` que o
       child herda código compilado.
-- [ ] **N.3 — interação com M**: medir se páginas JIT sobrevivem ao
+- [x] **N.3 — interação com M**: medir se páginas JIT sobrevivem ao
       `GC.compact` (code pages não são heap de objetos — esperado sim, mas
-      o marco é a medição, não a suposição).
-- Marco: endpoint CPU-bound no railsapp/medido com `calisto serve`: p50 do
-  1º request de cada child **igual ao p50 steady-state** (hoje o 1º request
-  paga JIT). Benchmark vira teste gated com tolerância.
-- Risco: YJIT em 3.4 é maduro, mas warmup pode compilar caminho errado se o
-  script não representar tráfego real — warmup é responsabilidade da app,
-  calisto só fornece o gancho.
-- Estimativa: 1–2 semanas.
+      o marco é a medição, não a suposição). Medido: child com
+      `compact_count >= 1` E `compiled_iseq_count > 0` herdado do warmup.
+- Marco ✅: endpoint CPU-bound no railsapp (`/cpu`, SHA256 × 500) medido
+  com `bin/rails server` no child do fork: sem warmup o 1º request paga
+  init+lazy-load+JIT (**119–188ms**, 60–94× o p50); com `[run] yjit` +
+  warmup via **Puma real em memória no daemon** (Integration::Session NÃO
+  serve — o HostAuthorization devolve 403 antes do hot path rodar), o 1º
+  request cai para **6–13ms** (~2–13× o p50; residual do primeiro
+  accept/threads do puma no child). Benchmark vira teste gated
+  (`rails_yjit_warmup_first_request_matches_steady_state`).
+- Riscos resolvidos no caminho: (1) `$0=` no child corrompia a heap —
+  o setter do CRuby (set_arg0 → setproctitle) reescreve argv/env in-place
+  com `argv_env_len` calculado no boot misturando argv da heap (CStrings
+  do Rust) com env da stack → valor gigante → strlcpy+zeroing atravessam a
+  heap (8 bytes NUL no buffer do script path; teste daemon
+  `concurrent_runs_serialize_through_daemon` pegava). Fix: gvars
+  `$0`/`$PROGRAM_NAME` redefinidos com slot próprio sem setter
+  (`install_arg0_slot` no calisto-ruby). (2) a timer thread da VM precisa
+  ser parada antes do fork (`rb_thread_stop_timer_thread`/`start` — símbolos
+  LOCAIS resolvidos via .symtab da libruby) — sem isso o fork pode cair com
+  a timer thread segurando `vm->ractor.sched.lock` e o child deadlocka.
+  (3) fork-safety do stdio do glibc via pthread_atfork (flockfile nos 3
+  FILEs padrão).
+- Estimativa: ~~1–2 semanas~~ (concluída).
 
 ### Fase O — Snapshot de boot (daemon frio instantâneo)
 Mesmo com tudo acima, o **primeiro** comando numa app paga o boot do daemon

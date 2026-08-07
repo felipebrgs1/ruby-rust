@@ -1,0 +1,9 @@
+# calisto.toml — Fase N: YJIT quente no fork.
+# O daemon da app boota com --yjit ([run] yjit = true), roda o warmup
+# pos-boot ([run] warmup — compila o hot path no daemon) e compacta o heap
+# (default on com preload, Fase M). Cada fork herda o codigo JIT compilado.
+
+[run]
+preload = "boot.rb"
+warmup = "warmup.rb"
+yjit = true

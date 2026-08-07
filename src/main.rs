@@ -481,14 +481,27 @@ fn connect_or_spawn_app_daemon_in(
     envs: &[(&str, &str)],
 ) -> Result<UnixStream, String> {
     let compact = app_compact(app)?;
+    let yjit = app_yjit(app)?;
+    let warmup = app_warmup(app)?;
     let preload = app.preload.as_ref().map(|p| p.display().to_string());
+    // Fase N: --yjit e flag real do interpretador (ruby_options no modo
+    // embutido; `ruby --yjit ...` no legado) — o JIT liga antes do preload/
+    // warmup, entao o codigo quente compilado no boot e herdado pelos forks.
+    let mut flags: Vec<&str> = vec!["-rbundler/setup"];
+    if yjit {
+        flags.push("--yjit");
+    }
     // Daemon da app: boota com o Gemfile ativo (-rbundler/setup ANTES do
     // script — flag real) e cwd na raiz da app, e o entrypoint e carregado
-    // no boot (CALISTO_APP_PRELOAD).
-    connect_or_spawn_daemon_in(ruby, dir, "", &["-rbundler/setup"], |cmd| {
+    // no boot (CALISTO_APP_PRELOAD), seguido do warmup (CALISTO_APP_WARMUP)
+    // e da compactacao (CALISTO_COMPACT).
+    connect_or_spawn_daemon_in(ruby, dir, "", &flags, |cmd| {
         cmd.current_dir(&app.root);
         if let Some(p) = &preload {
             cmd.env("CALISTO_APP_PRELOAD", p);
+        }
+        if let Some(w) = &warmup {
+            cmd.env("CALISTO_APP_WARMUP", w);
         }
         for (k, v) in envs {
             cmd.env(k, v);
@@ -504,6 +517,89 @@ fn connect_or_spawn_app_daemon_in(
 /// preload de `CALISTO_PRELOAD`, entrypoint de `CALISTO_APP_PRELOAD`; depois
 /// o loop atende PING/RUN/EVAL/STOP com fork por request. Nao retorna ate o
 /// shutdown.
+// ---- fork-safety do stdio do glibc (Fase N) ----------------------------------
+// O child do fork pode herdar um FILE lock do glibc (stdin/stdout/stderr)
+// preso: o fork cai com o mutex locked (por outra thread — a timer thread da
+// VM passa por caminhos de libc que tocam o stdio) e, como o child é a MESMA
+// thread do forker, o lock fica "owned" para sempre -> o child deadlocka no
+// primeiro uso de stdio (futex_wait no _lock do FILE; sintoma: cliente
+// esperando STATUS para sempre, teste >30s). Solucao: pthread_atfork que
+// trava os 3 FILEs padrao no PREPARE (fork acontece com eles held pela
+// thread do fork) e destrava no CHILD/PARENT (funlockfile nao checa owner).
+static mut STDIO_FILES: [*mut c_void; 3] = [std::ptr::null_mut(); 3];
+
+/// Leitura/escrita sem referencias ao static mut (static_mut_refs): o array
+/// so e escrito uma vez no registro (antes do accept loop) e lido pelos
+/// handlers de atfork — sempre via ponteiro cru.
+fn stdio_file(i: usize) -> *mut c_void {
+    unsafe { (*std::ptr::addr_of!(STDIO_FILES))[i] }
+}
+
+unsafe extern "C" fn stdio_fork_prepare() {
+    for i in 0..3 {
+        let f = stdio_file(i);
+        if !f.is_null() {
+            flockfile(f);
+        }
+    }
+}
+
+unsafe extern "C" fn stdio_fork_release() {
+    for i in 0..3 {
+        let f = stdio_file(i);
+        if !f.is_null() {
+            funlockfile(f);
+        }
+    }
+}
+
+unsafe extern "C" {
+    fn flockfile(f: *mut c_void);
+    fn funlockfile(f: *mut c_void);
+}
+
+/// Registra (uma vez) os handlers de atfork do stdio — chamado no boot do
+/// daemon, antes do accept loop. Best-effort: sem os FILE* exportados pela
+/// libc, avisa e segue (o fork volta ao comportamento racy anterior).
+fn stdio_atfork_register() {
+    unsafe {
+        extern "C" {
+            fn pthread_atfork(
+                prepare: Option<unsafe extern "C" fn()>,
+                parent: Option<unsafe extern "C" fn()>,
+                child: Option<unsafe extern "C" fn()>,
+            ) -> c_int;
+            fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+        }
+        for (i, name) in [
+            b"_IO_2_1_stdin_\0".as_ptr(),
+            b"_IO_2_1_stdout_\0".as_ptr(),
+            b"_IO_2_1_stderr_\0".as_ptr(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            (*std::ptr::addr_of_mut!(STDIO_FILES))[i] =
+                dlsym(std::ptr::null_mut(), *name as *const c_char);
+        }
+        if (0..3).any(|i| stdio_file(i).is_null()) {
+            eprintln!(
+                "calisto daemon: aviso: FILE* padrao nao resolvidos na libc — \
+                 fork sem trava do stdio (child pode herdar FILE lock preso)"
+            );
+            return;
+        }
+        if pthread_atfork(
+            Some(stdio_fork_prepare),
+            Some(stdio_fork_release),
+            Some(stdio_fork_release),
+        ) != 0
+        {
+            eprintln!("calisto daemon: aviso: pthread_atfork falhou (stdio)");
+        }
+    }
+}
+
 fn cmd_daemon(args: &[String]) -> i32 {
     if args.first().map(String::as_str) != Some("--internal") {
         eprintln!("calisto daemon: uso interno: calisto daemon --internal [-r<gem>...]");
@@ -514,9 +610,12 @@ fn cmd_daemon(args: &[String]) -> i32 {
         return 1;
     };
     let mut requires: Vec<String> = Vec::new();
+    let mut yjit = false;
     for a in &args[1..] {
         if let Some(name) = a.strip_prefix("-r") {
             requires.push(name.to_string());
+        } else if a == "--yjit" {
+            yjit = true;
         } else {
             eprintln!("calisto daemon: flag interna desconhecida: {a}");
             return 1;
@@ -529,10 +628,11 @@ fn cmd_daemon(args: &[String]) -> i32 {
         }
         Ok(vm) => vm,
     };
-    if let Err(e) = vm.boot() {
+    if let Err(e) = vm.boot(yjit) {
         eprintln!("calisto daemon: {e}");
         return 1;
     }
+    stdio_atfork_register();
     match daemon_main(&vm, &requires) {
         Ok(code) => code,
         Err(e) => {
@@ -876,11 +976,37 @@ $LOADED_FEATURES << File.expand_path($calisto_app_preload)
             Ok(_) => {}
         }
     }
+    // Fase N.1: warmup declarativo (pos-boot, antes da compactacao). Script
+    // da app que aquece o codigo quente no daemon — ex.: N requests contra a
+    // Rack app em memoria (ActionDispatch::Integration::Session). Com yjit
+    // ligado, o hot path compila AQUI e cada child nasce com o JIT pronto.
+    // Responsabilidade da app: falha avisa e segue (daemon continua servindo,
+    // so perde o pre-aquecimento).
+    if let Some(w) = env::var_os("CALISTO_APP_WARMUP") {
+        let w = w.to_string_lossy().into_owned();
+        vm.set_gv("$calisto_app_warmup", vm.str(&w));
+        let snippet = r#"
+begin
+  load $calisto_app_warmup
+rescue SystemExit
+  raise
+rescue Exception => e
+  warn "calisto: warmup falhou (#{$calisto_app_warmup}): #{e.class}: #{e.message}"
+  warn(e.backtrace.first(8).join("\n")) if e.backtrace
+end
+"#;
+        match vm.eval(snippet) {
+            Err(e) if vm.is_system_exit(e) => return Ok(vm.cleanup(vm.system_exit_status(e))),
+            Err(e) => eprintln!("calisto: warmup: {}", vm.error_summary(e)),
+            Ok(_) => {}
+        }
+    }
     // Fase M.1: compactacao pre-fork (pos-boot, antes do bind). GC.start +
     // GC.compact densificam o heap -> os children (fork) nascem com quase
     // todas as paginas compartilhadas via CoW (o que o child escreve depois
     // custa paginas privadas). Best-effort como o preload: falha avisa e
-    // segue — performance, nao semantica.
+    // segue — performance, nao semantica. As paginas de codigo do YJIT nao
+    // sao heap de objetos — sobrevivem a compactacao (Fase N.3).
     if env::var("CALISTO_COMPACT").as_deref() == Ok("1") {
         if let Err(e) = vm.eval("GC.start\nGC.compact\n") {
             eprintln!("calisto: compact falhou: {}", vm.error_summary(e));
@@ -1009,8 +1135,22 @@ $LOADED_FEATURES << File.expand_path($calisto_app_preload)
                         }
                         "RUN" | "EVAL" => {
                             let decoded: Vec<String> = fields.iter().map(|f| b64_decode(f)).collect();
+                            // Protocolo de fork do CRuby (process.c
+                            // before_fork_ruby/after_fork_ruby): para a timer
+                            // thread da VM ANTES do fork e reinicia no parent.
+                            // Sem isso, o fork pode cair com a timer thread
+                            // segurando vm->ractor.sched.lock (tick de 10ms do
+                            // timer_thread_set_timeout) — mutex que o
+                            // rb_thread_atfork do child NAO re-inicializa —
+                            // e o child deadlocka no primeiro acesso ao
+                            // scheduler (cliente espera STATUS para sempre).
+                            // Process.fork nunca sofre isso porque para/
+                            // reinicia a timer thread; o child a recria no
+                            // proprio rb_thread_atfork.
+                            vm.stop_timer_thread();
                             let pid = unsafe { fork() };
                             if pid < 0 {
+                                vm.start_timer_thread();
                                 let e = io::Error::last_os_error();
                                 respond(fd, &format!("ERR RuntimeError: fork: {e}\r\n"));
                                 let _ = unsafe { close(fd) };
@@ -1032,6 +1172,7 @@ $LOADED_FEATURES << File.expand_path($calisto_app_preload)
                                     listener_fd,
                                 );
                             }
+                            vm.start_timer_thread();
                             // parent: fecha as copias dos fds do cliente
                             for f in clients[i].fds.drain(..) {
                                 let _ = unsafe { close(f) };
@@ -1168,7 +1309,12 @@ end"#;
     if let Err(e) = vm.eval(loadpath_snippet) {
         child_error(vm, e);
     }
-    // $0/ARGV (sem frames extras: C API)
+    // $0/ARGV: $0 NAO pode ser setado com o setter original do CRuby — o
+    // setter (set_arg0 -> setproctitle) reescreve argv/env in-place com um
+    // argv_env_len calculado no boot que mistura argv da heap com env da
+    // stack (valor gigante) e corrompe a heap do fork. install_arg0_slot
+    // redefine o gvar com slot proprio (escrita direta, sem setter).
+    vm.install_arg0_slot();
     vm.set_gv("$0", vm.str(if is_eval { "-e" } else { subject }));
     let arg_items: Vec<&str> = args.iter().map(String::as_str).collect();
     vm.funcall(vm.const_get("ARGV"), "replace", &[vm.ary(&arg_items)]);
@@ -1448,6 +1594,14 @@ struct AppConfig {
     /// preload, ou seja, daemon de app). Flag de performance — nao entra no
     /// hash do socket (mudar nao reinicia o daemon, como scripts).
     compact: Option<bool>,
+    /// `[run] yjit` (Fase N): daemon da app boota com `--yjit` — o warmup
+    /// compila o hot path no daemon e cada child nasce com o codigo JIT
+    /// pronto (paginas CoW). None = off.
+    yjit: Option<bool>,
+    /// `[run] warmup` (Fase N): script rodado no daemon pos-boot (depois do
+    /// preload da app, antes da compactacao) — ex.: N requests contra a
+    /// Rack app em memoria. Responsabilidade da app; falha avisa e segue.
+    warmup: Option<PathBuf>,
     /// `[scripts]` nome -> comando (ordem do arquivo; Fase H)
     scripts: Vec<(String, String)>,
 }
@@ -1465,6 +1619,34 @@ fn app_compact(app: &AppConfig) -> Result<bool, String> {
         };
     }
     Ok(app.compact.unwrap_or(app.preload.is_some()))
+}
+
+/// `[run] yjit` efetivo (Fase N): CALISTO_YJIT (override) > calisto.toml >
+/// off. Com yjit, o daemon da app boota com `--yjit` e o warmup compila o
+/// hot path antes do accept loop — os children herdam o codigo compilado.
+fn app_yjit(app: &AppConfig) -> Result<bool, String> {
+    if let Ok(v) = env::var("CALISTO_YJIT") {
+        return match v.as_str() {
+            "1" | "true" => Ok(true),
+            "0" | "false" => Ok(false),
+            _ => Err(format!("CALISTO_YJIT deve ser 0/1/true/false (achei '{v}')")),
+        };
+    }
+    Ok(app.yjit.unwrap_or(false))
+}
+
+/// `[run] warmup` efetivo (Fase N): CALISTO_WARMUP (override; `0`/`none`
+/// desliga) > calisto.toml > nenhum. Caminho relativo ao calisto.toml, como
+/// o preload.
+fn app_warmup(app: &AppConfig) -> Result<Option<PathBuf>, String> {
+    if let Ok(v) = env::var("CALISTO_WARMUP") {
+        return Ok(match v.as_str() {
+            "0" | "none" => None,
+            p if !p.is_empty() => Some(PathBuf::from(p)),
+            _ => None,
+        });
+    }
+    Ok(app.warmup.clone())
 }
 
 impl AppConfig {
@@ -1517,6 +1699,8 @@ fn split_command(s: &str) -> Result<Vec<String>, String> {
 fn parse_calisto_toml(content: &str, base: &Path) -> Result<AppConfig, String> {
     let mut preload: Option<PathBuf> = None;
     let mut compact: Option<bool> = None;
+    let mut yjit: Option<bool> = None;
+    let mut warmup: Option<PathBuf> = None;
     let mut scripts: Vec<(String, String)> = Vec::new();
     let mut section = "run"; // chave sem secao = [run] (backwards compat)
     for (i, raw) in content.lines().enumerate() {
@@ -1536,9 +1720,9 @@ fn parse_calisto_toml(content: &str, base: &Path) -> Result<AppConfig, String> {
             return Err(format!("calisto.toml:{}: linha invalida: {raw}", i + 1));
         };
         let k = k.trim();
-        // chaves do [run] aceitam booleano TOML puro (true/false sem aspas),
+        // chaves booleanas do [run] aceitam TOML puro (true/false sem aspas),
         // como no TOML de verdade; o resto do subset exige "valor" entre aspas
-        let bare = k == "compact";
+        let bare = k == "compact" || k == "yjit";
         let value = match v.trim().strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
             Some(s) => s.to_string(),
             None if bare => v.trim().to_string(),
@@ -1564,6 +1748,22 @@ fn parse_calisto_toml(content: &str, base: &Path) -> Result<AppConfig, String> {
                         ));
                     }
                 },
+                "yjit" => match value.as_str() {
+                    "true" => yjit = Some(true),
+                    "false" => yjit = Some(false),
+                    _ => {
+                        return Err(format!(
+                            "calisto.toml:{}: yjit precisa ser true/false (achei '{value}')",
+                            i + 1
+                        ));
+                    }
+                },
+                "warmup" => {
+                    if value.is_empty() {
+                        return Err(format!("calisto.toml:{}: warmup vazio", i + 1));
+                    }
+                    warmup = Some(base.join(&value));
+                }
                 _ => {
                     return Err(format!(
                         "calisto.toml:{}: chave desconhecida '{k}' (scripts vao na secao [scripts])",
@@ -1585,7 +1785,15 @@ fn parse_calisto_toml(content: &str, base: &Path) -> Result<AppConfig, String> {
             ));
         }
     }
-    Ok(AppConfig { root: base.to_path_buf(), preload, compact, scripts })
+    if let Some(w) = &warmup {
+        if !w.is_file() {
+            return Err(format!(
+                "calisto.toml: warmup '{}' nao existe",
+                w.display()
+            ));
+        }
+    }
+    Ok(AppConfig { root: base.to_path_buf(), preload, compact, yjit, warmup, scripts })
 }
 
 /// Detecta app do cwd (walk up, como Gemfile). Erro de parse e estrito no
@@ -1781,6 +1989,8 @@ fn send_run_request(
                     | "CALISTO_PIDFILE"
                     | "CALISTO_PRELOAD"
                     | "CALISTO_COMPACT"
+                    | "CALISTO_YJIT"
+                    | "CALISTO_WARMUP"
                     | "CALISTO_RUBY"
             )
         })
@@ -3202,6 +3412,10 @@ USAGE:
           Com um calisto.toml no diretorio atual (walk up) o daemon vira o
           daemon da app (socket dedicado) e pre-carrega o entrypoint de
           [run].preload no boot — boot congelado, cada comando roda como fork.
+          [run] compact (Fase M) compacta o heap pos-boot (CoW; default on);
+          [run] yjit = true (Fase N) boota com --yjit e [run] warmup = \"path\"
+          roda um script de aquecimento no daemon (ex.: requests em memoria)
+          — o hot path compilado e herdado por cada fork.
           Um nome que nao e arquivo resolve para [scripts.NAME] do calisto.toml
           (Fase H): `calisto run dev` roda o comando de `dev = \"bin/rails
           server\"` no daemon (como `calisto exec`, com o Gemfile ativo), com
@@ -3274,6 +3488,12 @@ CONFIG:
                       pos-boot (GC.start + GC.compact — Fase M) para os forks
                       compartilharem paginas via CoW; default on no daemon de
                       app (calisto.toml com [run].preload)
+  CALISTO_YJIT        [run].yjit override (0/1): daemon da app boota com
+                      --yjit (Fase N) — o warmup compila o hot path no daemon
+                      e os children herdam o codigo JIT pronto
+  CALISTO_WARMUP      [run].warmup override (path; 0/none desliga): script
+                      rodado no daemon pos-boot (ex.: requests contra a Rack
+                      app em memoria) antes da compactacao/bind
 
 NOTE: calisto run is equivalent to `bundle exec ruby <script>` with -e/-E VM
 flags (alem de -e) ainda nao suportados; fora de Gemfile, identico a

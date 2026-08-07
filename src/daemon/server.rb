@@ -102,6 +102,23 @@ if APP_PRELOAD
   $LOADED_FEATURES << File.expand_path(APP_PRELOAD)
 end
 
+# ---- boot: warmup declarativo (Fase N) ----------------------------------------
+# Script da app que aquece o codigo quente no daemon pos-boot (ex.: requests
+# contra a Rack app em memoria via ActionDispatch::Integration::Session).
+# Com `--yjit` no boot, o hot path compila AQUI e cada child nasce com o JIT
+# pronto. Espelho do daemon embutido (main.rs): falha avisa e segue.
+WARMUP = ENV["CALISTO_APP_WARMUP"]
+if WARMUP
+  begin
+    load WARMUP
+  rescue SystemExit
+    raise
+  rescue Exception => e # rubocop:disable Lint/RescueException -- warmup da app
+    warn "calisto: warmup falhou (#{WARMUP}): #{e.class}: #{e.message}"
+    warn(e.backtrace.first(8).join("\n")) if e.backtrace
+  end
+end
+
 # ---- boot: compactacao pre-fork (Fase M) --------------------------------------
 # GC.start + GC.compact apos o boot: heap denso -> os children (fork do
 # daemon) nascem com quase todas as paginas compartilhadas via CoW. Espelho

@@ -5,7 +5,7 @@
 Calisto is a Bun-like runtime for **Ruby**: a single Rust binary that embeds and manages a pinned CRuby 3.4.10, gives it near-instant startup via a warm fork-based daemon, and can bundle stdlib-only apps into a single self-contained file. No third-party gems — stdlib only, by design. Linux-only (relies on `fork`).
 
 Status: Fases 1-2 (runtime + fast startup), Fase A (gems via
-Bundler), Fase B (preload de app), Fase C (Rails mínimo), Fase D completa
+C completa
 (escada real: Sinatra → Rails → Maybe Finance/Sidekiq → Chatwoot/API+ActionCable),
 **Fase E completa** (test/task/serve/.env/watch; daemon multi-conexão — o
 risco conhecido do accept loop single-connection foi resolvido), **Fase F
@@ -23,8 +23,8 @@ run` bare roda o `[scripts] start` do calisto.toml, convenção npm/bun) e
 da versão certa; `calisto add sinatra` → `calisto run` ativa sem passos
 manuais)
 do ROADMAP.md done. Golden rspec real
-validado no Chatwoot (119 examples: frio 5.0s → quente 0.70s, 7.2×); marco G:
-`calisto exec sidekiq -r <app>` no Maybe processa o `CalistoProbeJob` (golden
+validado no Chatwoot (119 examples: frio 5.0s → quente 0.70s, 7.2×); marco
+G: `calisto exec sidekiq -r <app>` no Maybe processa o `CalistoProbeJob` (golden
 realapps) e `calisto run -e 'puts 1+1'` quente **36ms** (marco <50ms). Ciclo
 runtime (Fases L-Q): **Fase L completa** (CRuby embutido via libruby dlopen —
 daemon in-process com accept loop em Rust, `server.rb` vira legado-only para
@@ -32,10 +32,21 @@ rubies sem .so, ex.: 3.4.4) e **Fase M completa** (memória/CoW: `[run]
 compact` — GC.start+GC.compact pós-boot, default on no daemon de app,
 `CALISTO_COMPACT` sobrepõe; `calisto doctor` mede RSS/Pss/Shared_Clean/
 Private_Dirty do daemon e de um child de probe via smaps_rollup; marcos:
-Private_Dirty do child do Chatwoot **−46%**; `MALLOC_ARENA_MAX=2` no spawn).
-O roadmap mira a **Fase N (YJIT quente no fork)** — `[run] warmup` +
-`--yjit` no daemon de app — e depois O (snapshot criu), P (APIs nativas
-`calisto.*`) e Q (distribuição).
+Private_Dirty do child do Chatwoot **−46%**; `MALLOC_ARENA_MAX=2` no spawn) e
+**Fase N completa** (YJIT quente no fork — `[run] yjit` boota o daemon com
+`--yjit` e `[run] warmup` roda um script de aquecimento pós-boot ANTES da
+compactação/bind; o child herda o código compilado — páginas CoW; marco:
+1º request `/cpu` do railsapp 119–188ms sem warmup → 6–13ms com warmup via
+Puma real em memória no daemon — Integration::Session não serve, o
+HostAuthorization devolve 403 antes do hot path. Fixes do caminho: `$0`/
+`$PROGRAM_NAME` no child usam slot próprio sem o setter do CRuby
+(set_arg0→setproctitle corrompia a heap: `argv_env_len` do boot mistura
+argv da heap com env da stack → strlcpy+zeroing gigantes; o teste
+`concurrent_runs_serialize_through_daemon` pegava 8 NULs no script path),
+timer thread da VM parada antes do fork (`rb_thread_stop/start_timer_thread`
+via .symtab da libruby — deadlock do sched.lock) e fork-safety do stdio do
+glibc via pthread_atfork). O roadmap mira a **Fase O (snapshot criu)** e
+depois P (APIs nativas `calisto.*`) e Q (distribuição).
 
 ## Architecture & Data Flow
 

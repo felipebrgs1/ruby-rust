@@ -5,6 +5,15 @@ Rails.application.routes.draw do
   # Can be used by load balancers and uptime monitors to verify that the app is live.
   get "up" => "rails/health#show", as: :rails_health_check
 
+  # Fase N (marco): endpoint CPU-bound para o benchmark de YJIT quente no
+  # fork — o 1o request de cada child paga compilacao JIT sem warmup, e
+  # ~= steady-state com [run] yjit + warmup.
+  get "cpu" => lambda { |_env|
+    n = 0
+    500.times { n = Digest::SHA256.hexdigest(n.to_s) }
+    [200, { "content-type" => "text/plain" }, [n]]
+  }
+
   # Render dynamic PWA files from app/views/pwa/* (remember to link manifest in application.html.erb)
   # get "manifest" => "rails/pwa#manifest", as: :pwa_manifest
   # get "service-worker" => "rails/pwa#service_worker", as: :pwa_service_worker

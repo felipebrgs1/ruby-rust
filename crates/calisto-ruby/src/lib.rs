@@ -72,6 +72,7 @@ struct RubyFns {
     rb_funcallv: RbFuncallvFn,
     rb_gv_get: unsafe extern "C" fn(*const c_char) -> VALUE,
     rb_gv_set: unsafe extern "C" fn(*const c_char, VALUE) -> VALUE,
+    rb_define_hooked_variable: unsafe extern "C" fn(*const c_char, *mut VALUE, Option<unsafe extern "C" fn(ID, *mut VALUE) -> VALUE>, Option<unsafe extern "C" fn(VALUE, ID, *mut VALUE)>),
     rb_ary_new: unsafe extern "C" fn() -> VALUE,
     rb_ary_push: unsafe extern "C" fn(VALUE, VALUE) -> VALUE,
     rb_utf8_str_new_cstr: unsafe extern "C" fn(*const c_char) -> VALUE,
@@ -95,6 +96,80 @@ fn last_dlerror() -> String {
     } else {
         unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
     }
+}
+
+/// Resolve um simbolo LOCAL (visibilidade oculta — sem dlsym) pelo nome no
+/// .symtab do proprio arquivo da libruby. Retorna o st_value (vaddr
+/// relativo). A runtime address e `addr(anchor) + (st_value(sym) -
+/// st_value(anchor))` — o load bias cancela. Necessario para o protocolo de
+/// fork do CRuby (rb_thread_stop/start_timer_thread sao locais no 3.4.x —
+/// `Process.fork` os usa, mas nao os exporta). Hand-rolled, zero deps.
+fn symtab_lookup(path: &Path, name: &[u8]) -> Option<u64> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < 64 || data[4] != 2 {
+        return None; // ELF64 apenas
+    }
+    let shoff = u64::from_le_bytes(data[40..48].try_into().ok()?);
+    let shentsize = u16::from_le_bytes(data[58..60].try_into().ok()?) as usize;
+    let shnum = u16::from_le_bytes(data[60..62].try_into().ok()?) as usize;
+    let shstrndx = u16::from_le_bytes(data[62..64].try_into().ok()?) as usize;
+    let shstr_hdr = &data.get(shoff as usize + shstrndx * shentsize..shoff as usize + (shstrndx + 1) * shentsize)?;
+    let shstr_off = u64::from_le_bytes(shstr_hdr[24..32].try_into().ok()?) as usize;
+    let shstr_size = u64::from_le_bytes(shstr_hdr[32..40].try_into().ok()?) as usize;
+    let shstr = data.get(shstr_off..shstr_off + shstr_size)?;
+    let cstr_at = |off: usize| -> Option<&[u8]> {
+        let tail = shstr.get(off..)?;
+        let end = tail.iter().position(|&b| b == 0)?;
+        Some(&tail[..end])
+    };
+    for i in 0..shnum {
+        let hdr = &data.get(shoff as usize + i * shentsize..shoff as usize + (i + 1) * shentsize)?;
+        // ELF64 section header: name(4) type(4) flags(8) addr(8) offset(8)
+        // size(8) link(4) info(4) addralign(8) entsize(8)
+        let sh_type = u32::from_le_bytes(hdr[4..8].try_into().ok()?);
+        if sh_type != 2 {
+            continue; // SHT_SYMTAB
+        }
+        if cstr_at(u32::from_le_bytes(hdr[0..4].try_into().ok()?) as usize) != Some(b".symtab") {
+            continue;
+        }
+        let strtab_idx = u32::from_le_bytes(hdr[40..44].try_into().ok()?) as usize;
+        let entsize = u64::from_le_bytes(hdr[56..64].try_into().ok()?) as usize;
+        let offset = u64::from_le_bytes(hdr[24..32].try_into().ok()?) as usize;
+        let size = u64::from_le_bytes(hdr[32..40].try_into().ok()?) as usize;
+        let strtab_hdr = &data.get(shoff as usize + strtab_idx * shentsize..shoff as usize + (strtab_idx + 1) * shentsize)?;
+        let strtab_off = u64::from_le_bytes(strtab_hdr[24..32].try_into().ok()?) as usize;
+        let strtab_size = u64::from_le_bytes(strtab_hdr[32..40].try_into().ok()?) as usize;
+        let strtab = data.get(strtab_off..strtab_off + strtab_size)?;
+        let mut off = 0;
+        while off + 24 <= size {
+            let sym = &data.get(offset + off..offset + off + 24)?;
+            let st_name = u32::from_le_bytes(sym[0..4].try_into().ok()?) as usize;
+            let st_value = u64::from_le_bytes(sym[8..16].try_into().ok()?);
+            let tail = strtab.get(st_name..)?;
+            let end = tail.iter().position(|&b| b == 0)?;
+            if &tail[..end] == name {
+                return Some(st_value);
+            }
+            off += entsize.max(24);
+        }
+        return None;
+    }
+    None
+}
+
+/// Resolve um simbolo LOCAL da libruby para um fn pointer, ancorado num
+/// simbolo exportado ja resolvido (load bias cancela na subtracao).
+fn resolve_local(
+    so_path: &Path,
+    anchor_addr: usize,
+    anchor_name: &[u8],
+    target_name: &[u8],
+) -> Option<unsafe extern "C" fn()> {
+    let anchor_st = symtab_lookup(so_path, anchor_name)?;
+    let target_st = symtab_lookup(so_path, target_name)?;
+    let addr = (anchor_addr as i64 + (target_st as i64 - anchor_st as i64)) as usize;
+    Some(unsafe { std::mem::transmute::<usize, unsafe extern "C" fn()>(addr) })
 }
 
 /// Resolve um simbolo da libruby pelo nome (com NUL). Erro claro se faltar:
@@ -173,11 +248,33 @@ unsafe extern "C" fn tramp_call(_: VALUE) -> VALUE {
     f(ctx.args[0], ctx.args[1], ctx.args[2], ctx.args[3], ctx.args[4], ctx.args[5], ctx.args[6], ctx.args[7])
 }
 
+/// Slot dos gvars `$0`/`$PROGRAM_NAME` no child (fix do fork): o setter
+/// original do CRuby (set_arg0 -> ruby_setproctitle -> setproctitle)
+/// REESCREVE a regiao argv+environ do processo in-place. O argv_env_len e
+/// calculado no boot misturando argv da HEAP (CStrings do Rust) com o
+/// environ da STACK do exec — valor gigante — e o strlcpy + zeroing do
+/// setproctitle atravessam a heap corrompendo memoria arbitraria (medido:
+/// 8 bytes NUL no buffer do script path de um child concorrente).
+/// Redefinimos os gvars como hooked simples apontando para este slot (sem
+/// setter): rb_gvar_set escreve direto no slot (registrado como raiz GC
+/// pelo proprio rb_gvar_set) e o getter default le o slot.
+static mut ARGV0_SLOT: VALUE = 0; // Qnil
+
 /// VM CRuby embutida (handle dlopen da libruby + tabela de simbolos).
 pub struct Ruby {
     _handle: *mut c_void,   // mantida viva; nunca descarregada (daemon)
     _argv0: CString,        // ruby_sysinit guarda o ponteiro (origarg)
     fns: RubyFns,
+    /// Protocolo de fork do CRuby (process.c): a timer thread precisa ser
+    /// parada antes do fork e reiniciada no parent — sem isso, o fork pode
+    /// cair com a timer thread segurando `vm->ractor.sched.lock` (tick de
+    /// 10ms do timer_thread_set_timeout), mutex que o rb_thread_atfork do
+    /// child NAO re-inicializa -> child deadlocka no primeiro acesso ao
+    /// scheduler (cliente espera STATUS para sempre). `Process.fork` nunca
+    /// sofre isso porque para/reinicia a timer thread. Simbolos locais
+    /// (sem dlsym) — resolvidos via .symtab do arquivo da libruby.
+    stop_timer_thread: Option<unsafe extern "C" fn()>,
+    start_timer_thread: Option<unsafe extern "C" fn()>,
     c_object: VALUE,        // rb_cObject (global da VM)
     system_exit_class: VALUE,
 }
@@ -209,6 +306,7 @@ impl Ruby {
                 rb_funcallv: load_sym(handle, b"rb_funcallv\0")?,
                 rb_gv_get: load_sym(handle, b"rb_gv_get\0")?,
                 rb_gv_set: load_sym(handle, b"rb_gv_set\0")?,
+                rb_define_hooked_variable: load_sym(handle, b"rb_define_hooked_variable\0")?,
                 rb_ary_new: load_sym(handle, b"rb_ary_new\0")?,
                 rb_ary_push: load_sym(handle, b"rb_ary_push\0")?,
                 rb_utf8_str_new_cstr: load_sym(handle, b"rb_utf8_str_new_cstr\0")?,
@@ -225,15 +323,49 @@ impl Ruby {
                 rb_iseq_eval_main: load_sym(handle, b"rb_iseq_eval_main\0")?,
             }
         };
+        // Protocolo de fork: rb_thread_stop/start_timer_thread sao simbolos
+        // LOCAIS (sem dlsym) — resolvidos pelo .symtab do arquivo, ancorados
+        // no ruby_options ja dlsym'ado (load bias cancela). Sem eles, o
+        // daemon perde a guarda e o fork volta a ser racy (avisa uma vez).
+        let anchor_addr = fns.ruby_options as usize;
+        let stop_timer_thread =
+            resolve_local(&so, anchor_addr, b"ruby_options", b"rb_thread_stop_timer_thread");
+        let start_timer_thread =
+            resolve_local(&so, anchor_addr, b"ruby_options", b"rb_thread_start_timer_thread");
+        if stop_timer_thread.is_none() || start_timer_thread.is_none() {
+            eprintln!(
+                "calisto daemon: aviso: .symtab sem rb_thread_*_timer_thread em {} — \
+                 fork sem guarda da timer thread (libruby stripped?)",
+                so.display()
+            );
+        }
         Ok(Ruby {
             _handle: handle,
             _argv0: CString::new("ruby").expect("literal"),
             fns,
+            stop_timer_thread,
+            start_timer_thread,
             c_object: Qnil,
             // system_exit_class/c_object so existem apos o boot (BSS da
             // libruby inicializado pelo ruby_init; rb_path2class antes = crash)
             system_exit_class: Qnil,
         })
+    }
+
+    /// Para a timer thread da VM (protocolo de fork do CRuby — parent,
+    /// antes do fork). Sem GVL e seguro: native_stop_timer_thread so
+    /// decrementa um contador, acorda e faz join (sem locks).
+    pub fn stop_timer_thread(&self) {
+        if let Some(f) = self.stop_timer_thread {
+            unsafe { f() };
+        }
+    }
+
+    /// Reinicia a timer thread da VM (parent, depois do fork).
+    pub fn start_timer_thread(&self) {
+        if let Some(f) = self.start_timer_thread {
+            unsafe { f() };
+        }
     }
 
     /// Boot da VM (main.c do CRuby): sysinit -> init_stack -> init ->
@@ -245,7 +377,12 @@ impl Ruby {
     /// inits, classes core (ex.: metodos de Time) ficam quebradas — os
     /// simbolos desses inits nao sao exportados, entao o caminho manual
     /// nao replica o boot.
-    pub fn boot(&mut self) -> Result<(), String> {
+    ///
+    /// `yjit` (Fase N): insere `--yjit` na linha do process_options — o JIT
+    /// liga ANTES do preload/warmup, entao o codigo quente compilado no boot
+    /// e herdado pelos children do fork (paginas de codigo CoW). Mesmo
+    /// caminho do CLI real (`ruby --yjit ...`).
+    pub fn boot(&mut self, yjit: bool) -> Result<(), String> {
         unsafe {
             let mut argc: c_int = 1;
             let mut argv_ptr = [self._argv0.as_ptr() as *mut c_char].as_mut_ptr();
@@ -256,12 +393,16 @@ impl Ruby {
         }
         let c_e = CString::new("-e").expect("literal");
         let c_empty = CString::new("").expect("literal");
-        let argv = [
-            self._argv0.as_ptr() as *mut c_char,
-            c_e.as_ptr() as *mut c_char,
-            c_empty.as_ptr() as *mut c_char,
-        ];
-        let node = unsafe { (self.fns.ruby_options)(3, argv.as_ptr() as *mut *mut c_char) };
+        let c_yjit = CString::new("--yjit").expect("literal");
+        let mut argv: Vec<*mut c_char> = vec![self._argv0.as_ptr() as *mut c_char];
+        if yjit {
+            argv.push(c_yjit.as_ptr() as *mut c_char);
+        }
+        argv.push(c_e.as_ptr() as *mut c_char);
+        argv.push(c_empty.as_ptr() as *mut c_char);
+        let node = unsafe {
+            (self.fns.ruby_options)(argv.len() as c_int, argv.as_ptr() as *mut *mut c_char)
+        };
         if node.is_null() {
             return Err("boot: ruby_options retornou nulo".into());
         }
@@ -413,6 +554,20 @@ impl Ruby {
     pub fn set_gv(&self, name: &str, v: VALUE) {
         let c = CString::new(name).unwrap_or_else(|_| CString::new("").unwrap());
         unsafe { (self.fns.rb_gv_set)(c.as_ptr(), v) };
+    }
+
+    /// `$0`/`$PROGRAM_NAME` via slot proprio (sem o setter do CRuby, que
+    /// corrompe a heap pos-fork — ver ARGV0_SLOT). Redefine os gvars com
+    /// getter/setter default (leitura/escrita direta do slot). Idempotente;
+    /// chamar no child ANTES do set_gv("$0").
+    pub fn install_arg0_slot(&self) {
+        unsafe {
+            let slot = std::ptr::addr_of_mut!(ARGV0_SLOT);
+            let c0 = CString::new("$0").expect("literal");
+            let cpn = CString::new("$PROGRAM_NAME").expect("literal");
+            (self.fns.rb_define_hooked_variable)(c0.as_ptr(), slot, None, None);
+            (self.fns.rb_define_hooked_variable)(cpn.as_ptr(), slot, None, None);
+        }
     }
 
     pub fn get_gv(&self, name: &str) -> VALUE {
