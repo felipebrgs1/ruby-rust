@@ -3,6 +3,8 @@
 //! Degrau 4: Maybe Finance (Rails 7.2 + Sidekiq + Postgres + Redis) — valida
 //! o modelo fork-safe com jobs + threads: o worker Sidekiq roda como child do
 //! fork do daemon da app pre-carregada, conecta no Redis e processa o job.
+//! O worker sobe via `calisto exec sidekiq` (Fase G: binario da gem resolvido
+//! no bundle ativo, carregado in-process no daemon quente — marco da Fase G).
 //!
 //! Gated em 3 pré-requisitos (senão skipa com aviso):
 //!   1. checkout do Maybe em test/fixtures/maybe (git clone --depth 1
@@ -143,11 +145,14 @@ fn maybe_sidekiq_job_in_forked_worker() {
     );
     assert!(push.status.success(), "{}", String::from_utf8_lossy(&push.stderr));
 
-    // spawna o worker Sidekiq como child do fork e espera o job rodar
+    // spawna o worker Sidekiq como child do fork via `calisto exec sidekiq`
+    // (Fase G: resolve o binario da gem no bundle ativo e carrega in-process
+    // no daemon quente — o `-r` e o require path que o Sidekiq 8 exige, como
+    // o bin/sidekiq do fixture) e espera o job rodar
     let probe = dir.join("probe_out");
     let _ = std::fs::remove_file(&probe);
     let mut child = calisto(&dir)
-        .args(["run", "bin/sidekiq"])
+        .args(["exec", "sidekiq", "-r", app.to_str().unwrap()])
         .current_dir(&app)
         .envs(env.clone())
         .stdout(Stdio::null())

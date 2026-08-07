@@ -15,6 +15,7 @@
 #   PING                          -> OK
 #   STOP                          -> BYE (daemon exits; children rodando sao mortos)
 #   RUN <cwd> <env> <script> <args...>   (each field base64) -> STATUS <code>
+#   EVAL <cwd> <env> <code> <args...>    (like RUN, but evals code as `ruby -e`)
 #
 # Loop multi-conexao (Fase E): select sobre o listener + conexoes ativas e
 # waitpid WNOHANG a cada tick. Um child de longa duracao (server, sidekiq,
@@ -88,6 +89,7 @@ server =
     File.unlink(SOCKET) # stale socket from a dead daemon
     UNIXServer.new(SOCKET)
   end
+$server = server
 
 File.write(PIDFILE, Process.pid) if PIDFILE
 
@@ -235,6 +237,44 @@ def dup_into_stdio(fds)
   end
 end
 
+# ---- child bootstrap ----------------------------------------------------------
+# Corpo comum do child (RUN e EVAL): traps default, stdio do cliente, hygiene
+# de fds (nao segura o socket de controle nem o listener), cwd, env do RUN e
+# ativacao do Gemfile do cwd (walk up, como `bundle exec`): fora de bundle e
+# no-op, entao rodar sem Gemfile continua identico a `ruby <script>`.
+# Nao da para usar RUBYOPT=-rbundler/setup aqui: RUBYOPT so e lido no boot do
+# interpretador, e um child de fork nao re-boota.
+def child_enter(io, reader, cwd, env_blob)
+  trap("INT", "DEFAULT")
+  trap("TERM", "DEFAULT")
+  trap("HUP", "DEFAULT")
+  dup_into_stdio(reader.fds)
+  io.close rescue nil
+  $server.close rescue nil
+  Dir.chdir(cwd)
+  env_pairs = env_blob.split("\u001e").reject(&:empty?).filter_map do |kv|
+    i = kv.index("=") and [kv[0...i], kv[(i + 1)..]]
+  end
+  ENV.replace(env_pairs.to_h)
+  require "bundler/setup"
+  # -I do child: usado por `calisto test` para `require "test_helper"` /
+  # `require "rails_helper"` funcionar sem o runner do framework. Depois
+  # do Bundler.setup: ele limpa o $LOAD_PATH, entao o unshift e pos-setup.
+  if (lp = ENV["CALISTO_LOAD_PATH"])
+    lp.split(":").reject(&:empty?).each do |p|
+      $LOAD_PATH.unshift(p) unless $LOAD_PATH.include?(p)
+    end
+  end
+end
+
+def report_child_error(e)
+  daemon_path = File.expand_path(__FILE__)
+  bt = e.backtrace || []
+  cut = bt.index { |l| l.include?(daemon_path) } || bt.size
+  e.set_backtrace(bt[0...cut]) if cut < bt.size
+  warn e.full_message(highlight: false, order: :top)
+end
+
 # ---- commands ----------------------------------------------------------------
 class Client
   attr_reader :io, :reader
@@ -251,72 +291,74 @@ class Client
   end
 end
 
+def close_client_fds(reader)
+  reader.fds.each { |fd| IO.new(fd, autoclose: true).close rescue nil }
+end
+
 def start_child(io, reader, fields)
   cwd, env_blob, script, *args = fields.map { |f| Base64.strict_decode64(f) }
-  env_pairs = env_blob.split("\u001e").reject(&:empty?).filter_map do |kv|
-    i = kv.index("=") and [kv[0...i], kv[(i + 1)..]]
-  end
 
   pid = Process.fork do
     # child: behave like `ruby <script> <args...>`
-    trap("INT", "DEFAULT")
-    trap("TERM", "DEFAULT")
-    trap("HUP", "DEFAULT")
-    dup_into_stdio(reader.fds)
-    # hygiene: o child nao pode segurar o socket de controle nem o listener
-    io.close rescue nil
-    server.close rescue nil
-    Dir.chdir(cwd)
-    ENV.replace(env_pairs.to_h)
+    child_enter(io, reader, cwd, env_blob)
     $0 = script
     ARGV.replace(args)
     setup_data(script) if File.file?(script)
     begin
-      # Ativa o Gemfile do cwd (walk up, como `bundle exec`): fora de bundle e
-      # no-op, entao rodar sem Gemfile continua identico a `ruby <script>`.
-      # Nao da para usar RUBYOPT=-rbundler/setup aqui: RUBYOPT so e lido no
-      # boot do interpretador, e um child de fork nao re-boota.
-      require "bundler/setup"
-      # -I do child: usado por `calisto test` para `require "test_helper"` /
-      # `require "rails_helper"` funcionar sem o runner do framework. Depois
-      # do Bundler.setup: ele limpa o $LOAD_PATH, entao o unshift e pos-setup.
-      if (lp = ENV["CALISTO_LOAD_PATH"])
-        lp.split(":").reject(&:empty?).each do |p|
-          $LOAD_PATH.unshift(p) unless $LOAD_PATH.include?(p)
-        end
-      end
       load script
     rescue SystemExit
       raise # propaga: o runtime usa o status e roda at_exit hooks UMA vez
     rescue Exception => e # rubocop:disable Lint/RescueException -- mimic `ruby script`
-      daemon_path = File.expand_path(__FILE__)
-      bt = e.backtrace || []
-      cut = bt.index { |l| l.include?(daemon_path) } || bt.size
-      e.set_backtrace(bt[0...cut]) if cut < bt.size
-      warn e.full_message(highlight: false, order: :top)
+      report_child_error(e)
       exit 1
     end
   end
 
-  reader.fds.each { |fd| IO.new(fd, autoclose: true).close rescue nil }
+  close_client_fds(reader)
+  pid
+end
+
+# EVAL: como RUN, mas o "script" e codigo inline — paridade com `ruby -e`:
+# $0 = "-e", ARGV = args, eval no TOPLEVEL_BINDING com nome de arquivo "-e"
+# (backtraces idem `ruby -e`), sem DATA. Multiplos -e chegam concatenados
+# com "\n" (o cliente junta), entao __LINE__ segue a concatenacao.
+def start_child_eval(io, reader, fields)
+  cwd, env_blob, code, *args = fields.map { |f| Base64.strict_decode64(f) }
+
+  pid = Process.fork do
+    # child: behave like `ruby -e '<code>' <args...>`
+    child_enter(io, reader, cwd, env_blob)
+    $0 = "-e"
+    ARGV.replace(args)
+    begin
+      eval(code, TOPLEVEL_BINDING, "-e", 1)
+    rescue SystemExit
+      raise # propaga: o runtime usa o status e roda at_exit hooks UMA vez
+    rescue Exception => e # rubocop:disable Lint/RescueException -- mimic `ruby -e`
+      report_child_error(e)
+      exit 1
+    end
+  end
+
+  close_client_fds(reader)
   pid
 end
 
 # ---- main loop ---------------------------------------------------------------
 loop do
-  ready = IO.select([server] + $clients.values.map(&:io), nil, nil, 0.01) || [[], [], []]
+  ready = IO.select([$server] + $clients.values.map(&:io), nil, nil, 0.01) || [[], [], []]
   readables = ready[0] || []
 
-  if readables.include?(server)
+  if readables.include?($server)
     begin
-      io = server.accept_nonblock
+      io = $server.accept_nonblock
       $clients[io.object_id] = Client.new(io)
     rescue IO::WaitReadable, Errno::EINTR
     end
   end
 
   readables.each do |io|
-    next if io == server
+    next if io == $server
     client = $clients[io.object_id]
     next unless client
 
@@ -350,6 +392,10 @@ loop do
         shutdown # derruba children antes de sair (sem orfaos)
       when "RUN"
         pid = start_child(io, client.reader, fields)
+        client.pid = pid
+        $children[pid] = client
+      when "EVAL"
+        pid = start_child_eval(io, client.reader, fields)
         client.pid = pid
         $children[pid] = client
       else
