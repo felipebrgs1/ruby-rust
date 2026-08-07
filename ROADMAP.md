@@ -14,6 +14,13 @@ graph LR
     H --> I[Fase I: multi-versões de ruby]
     I --> J[Fase J: init / upgrade / completions]
     J --> K[Fase K: deps add/remove]
+    K --> L[Fase L: CRuby embutido — libruby]
+    L --> M[Fase M: memória / CoW]
+    L --> N[Fase N: YJIT quente no fork]
+    L --> P[Fase P: APIs nativas calisto.*]
+    M --> O[Fase O: snapshot de boot]
+    N --> O
+    P --> Q[Fase Q: distribuição — binário único]
 ```
 
 ## Pronto (Fases 1-2 + A-K) — resumo
@@ -90,7 +97,192 @@ Crates esboçados (ainda vazios): `calisto-{test,task,serve,sqlite,tooling}`.
 - Marco ✅: `calisto add sinatra` num projeto → `calisto run -e 'require "sinatra"'` ativa **sem passos manuais** (Sinatra 4.2.1 no daemon quente). Detalhes: wrapper roda `ruby -S bundle <sub>` com o ruby resolvido (Fase I — `.ruby-version`/Gemfile) e cwd na **raiz do projeto** (walk-up do Gemfile, como o resto do calisto), `BUNDLE_GEMFILE` setado, PATH prefixado com o bin dir do ruby (trap do restart do bundler: lock que pina outro bundler re-executa via shebang) e `CALISTO_BUNDLE_RUBY` exportado; `CALISTO_BUNDLE` (testes) troca o binário — `test/deps.rs`, 5 testes (passthrough de args, cwd/Gemfile/ruby certos, exit code, versão 3.4.4 gated, sem Gemfile → erro sugerindo `bundle init`).
 - Estimativa: ~~1 semana~~ (concluída)
 
+## Próximo ciclo — entrando na runtime (Fases L–Q)
+
+> Até a Fase K o calisto **orquestra** um ruby externo (`vendor/*/bin/ruby`).
+> O próximo ciclo faz o calisto **ser** o runtime: embutir o CRuby via
+> `libruby`, controlar o boot da VM diretamente e usar o fork quente para o
+> que só essa arquitetura permite (memória compartilhada, JIT pré-aquecido,
+> snapshot). Anti-objetivo mantido: **nunca reimplementar o CRuby** — embutir
+> ≠ reimplementar. Cada fase continua com marco verificável que vira teste.
+
+### Fase L — CRuby embutido (libruby): o calisto vira o runtime
+Hoje o daemon é `spawn vendor/ruby server.rb`. Esta fase move o daemon para
+**dentro do binário calisto**, com a VM CRuby inicializada in-process.
+
+- [ ] **L.1 — build compartilhado**: `scripts/build-ruby.sh` ganha
+      `--enable-shared` → `vendor/ruby-<v>/lib/libruby.so.3.4`. Rubies
+      antigos (sem .so) continuam válidos: fallback para o spawn externo
+      atual (modo legado), detectado em runtime.
+- [ ] **L.2 — crate `crates/calisto-ruby`**: bindings FFI hand-rolled
+      (zero deps, convenção do repo) via **dlopen** — carrega a
+      `libruby.so.<v>` do ruby resolvido pela Fase I (multi-versão continua
+      funcionando: cada versão tem sua .so). Superfície mínima:
+      `ruby_init`/`ruby_setup`/`ruby_init_loadpath`, `rb_protect`,
+      `rb_eval_string_protect`, `rb_load_protect`, `rb_funcall`,
+      `rb_intern`, `rb_errinfo`/`rb_set_errinfo`, `ruby_cleanup`.
+      Estado de erro sempre via `rb_protect` + `state` (nunca longjmp sem
+      proteção — pânico/abort em Rust seria corrupção).
+- [ ] **L.3 — daemon in-process**: subcomando interno
+      `calisto daemon --internal <dir>` (spawnado pelo cliente como hoje,
+      mesmo socket/protocolo RESP — client não muda). A VM boota in-process;
+      o preload stdlib e o entrypoint da app rodam via `rb_load_protect`.
+      Elimina o boot do interpretador no spawn do daemon e a dependência do
+      executável `vendor/current/bin/ruby` (a lib tree continua necessária:
+      stdlib .rb/.so).
+- [ ] **L.4 — accept loop em Rust**: `select`/`poll` + `fork` no Rust
+      (substitui o `select` + `waitpid WNOHANG` do server.rb); `child_enter`
+      vira Rust (dup2 dos fds SCM_RIGHTS, chdir, setenv do env_blob) + um
+      snippet Ruby mínimo avaliado no child via `rb_protect`
+      (`Bundler.setup`, `CALISTO_LOAD_PATH`, `load` do script / `eval` do
+      `-e`). O `server.rb` encolhe para o bootstrap do child; a máquina de
+      estados do protocolo vive onde já estava o client: no Rust.
+- [ ] **Fork-safety da VM**: invariante — no daemon, nenhuma thread Ruby além
+      da principal quando o fork acontece (o accept loop Rust garante;
+      timer thread do CRuby é tolerada, como já ocorre hoje no fork a
+      partir do daemon Ruby). Signal handling: o CRuby instala traps no
+      `ruby_init` — o daemon Rust restaura o que precisa (SIGPIPE já é
+      tratado; revisar SIGCHLD/SIGINT).
+- Marco: suíte inteira verde com o daemon in-process (paridade cold/warm
+  intacta), `calisto run -e 'puts 1+1'` quente ≤ **25ms** (hoje 36ms),
+  spawn do daemon frio ~40–80ms mais rápido (sem exec do interpretador), e
+  modo legado (ruby sem .so) provado por um teste que força
+  `CALISTO_NO_EMBED=1`. Golden Maybe/Chatwoot verde sem mudança de fixture.
+- Risco: dlopen de libruby exige símbolos estáveis — travar na ABI
+  `libruby.so.3.4` por série (3.4.x), como o nome do arquivo já indica.
+- Estimativa: 3–4 semanas (é a fundação; L.1–L.3 entregam valor sem L.4,
+  que pode ser L-bis).
+
+### Fase M — Memória e copy-on-write (o preço do preload)
+O daemon com Chatwoot preloaded passa de 500MB RSS; cada fork compartilha
+páginas até a primeira escrita. Com a VM embutida (Fase L) o calisto
+controla o heap **antes** de aceitar conexões.
+
+- [ ] **M.1 — compactação pré-fork**: após o boot (preload + entrypoint),
+      `GC.start` + `GC.compact` no daemon → heap denso e read-only na
+      prática → children compartilham quase tudo via CoW. Flag
+      `[run] compact = true` (default on quando há daemon de app).
+- [ ] **M.2 — medição real**: `calisto doctor` reporta RSS/Pss do daemon e
+      de um child de probe (`/proc/<pid>/smaps_rollup`), separando
+      `Shared_Clean`/`Private_Dirty` — o número que prova o CoW.
+- [ ] **M.3 — arenas e GVL**: `MALLOC_ARENA_MAX=2` no spawn do daemon
+      (glibc fragmenta o heap do preload em arenas por thread que o child
+      nunca usa); avaliar `--yjit-mem-size` (guarda para a Fase N).
+- Marco: Pss de um child do Chatwoot cai **≥30%** vs. baseline medido no
+  M.2 (teste gated realapps lendo smaps_rollup); nenhum teste de paridade
+  quebra (compactação não pode mudar semântica — invariante coberto pela
+  suíte existente).
+- Estimativa: 1 semana.
+
+### Fase N — YJIT quente no fork (o que só essa arquitetura permite)
+YJIT aquece **por processo**: num `ruby` normal os primeiros requests são
+lentos. No calisto o daemon pode compilar o hot path **antes** de aceitar
+conexões e cada child nasce com o código JIT pronto (páginas CoW
+compartilhadas).
+
+- [ ] **N.1 — warmup declarativo**: `[run] warmup = "bin/warmup.rb"` no
+      calisto.toml — script executado no daemon pós-boot (ex.: N requests
+      contra a Rack app em memória via rack-test) antes do accept loop.
+- [ ] **N.2 — boot com YJIT**: daemon de app sobe com `--yjit`
+      (configurável: `[run] yjit = true`); o warmup dispara a compilação
+      dos métodos quentes; verificar via `RubyVM::YJIT.runtime_stats` que o
+      child herda código compilado.
+- [ ] **N.3 — interação com M**: medir se páginas JIT sobrevivem ao
+      `GC.compact` (code pages não são heap de objetos — esperado sim, mas
+      o marco é a medição, não a suposição).
+- Marco: endpoint CPU-bound no railsapp/medido com `calisto serve`: p50 do
+  1º request de cada child **igual ao p50 steady-state** (hoje o 1º request
+  paga JIT). Benchmark vira teste gated com tolerância.
+- Risco: YJIT em 3.4 é maduro, mas warmup pode compilar caminho errado se o
+  script não representar tráfego real — warmup é responsabilidade da app,
+  calisto só fornece o gancho.
+- Estimativa: 1–2 semanas.
+
+### Fase O — Snapshot de boot (daemon frio instantâneo)
+Mesmo com tudo acima, o **primeiro** comando numa app paga o boot do daemon
+(Chatwoot: ~5s). Esta fase elimina o boot frio com checkpoint/restore.
+
+- [ ] **O.1 — spike criu**: checkpoint do daemon pós-boot
+      (`criu dump --shell-job`) → restore em vez de bootar. Verificar
+      permissões (`CAP_CHECKPOINT_RESTORE`/`sysctl kernel.yama`), socket
+      rebind no restore, e invalidação (mtime do Gemfile.lock/entrypoint no
+      hash do snapshot, como o hash do socket da app).
+- [ ] **O.2 — alternativa sem root**: se criu for inviável sem privilégio,
+      avaliar dump de heap via `ObjectSpace` + marshal seletivo (frágil,
+      provavelmente não) — ou aceitar O.1 gated em feature detect.
+- [ ] **O.3 — integração**: `calisto run` restaura o snapshot se presente e
+      válido; `calisto stop` + mudança de app invalidam. Snapshot por
+      (app, versão ruby, salt) no runtime dir.
+- Marco: 1º `bin/rails runner` no railsapp **<500ms** numa máquina sem
+  daemon vivo (hoje paga o boot completo). Se o spike O.1 provar que criu
+  exige privilégio demais para o alvo "dev laptop", a fase fecha com a
+  decisão documentada e o gancho de invalidação reutilizado.
+- Estimativa: 2–3 semanas (spike primeiro; fase de risco, escopada para
+  falhar barato).
+
+### Fase P — APIs nativas `calisto.*` (o Bun.* do Ruby)
+Com a VM embutida, o calisto pode registrar métodos Ruby implementados em
+Rust (`rb_define_method` via FFI) — APIs rápidas que existem **porque**
+você roda no calisto. É o equivalente ao `Bun.serve`/`Bun.sql`. O stub
+`crates/calisto-sqlite` já existe para isso.
+
+- [ ] **P.1 — `calisto/sqlite`**: binding fino sobre `libsqlite3` do sistema
+      (FFI hand-rolled, zero crates — convenção do repo): `Calisto::SQLite.open`,
+      `#execute` com bind params, prepared statements reutilizados.
+      Mesma forma do `bun:sqlite`; não substitui ActiveRecord — é para
+      scripts e tooling (o próprio calisto pode usar para caches futuros).
+- [ ] **P.2 — `calisto/hash`**: `Calisto::Hash.sha256/blake3(string)` em
+      Rust (blake3 hand-rolled é ~500 linhas; sha256 ~80) — 10–50× o
+      `Digest` puro para payloads grandes. Escopo deliberadamente mínimo:
+      prova do mecanismo de extensão nativa, não uma stdlib nova.
+- [ ] **Não fazer (ainda)**: HTTP server em Rust chamando Ruby por request
+      — exige GVL por request + marshalling, complexidade de framework
+      inteiro; `calisto serve` + puma já cobre. Revisitar depois de medir.
+- Marco: script stdlib-only `require "calisto/sqlite"` roda no daemon
+  genérico sem gem nenhuma (hermético); benchmark sha256 de 100MB:
+  calisto ≥10× `Digest::SHA256`. Testes novos em `test/native.rs`.
+- Estimativa: 2 semanas (P.1 é o grosso).
+
+### Fase Q — Distribuição: o instalador do Bun
+Fecha o ciclo "Bun de verdade": hoje o calisto exige o checkout +
+`scripts/build-ruby.sh` (~15min de compilação).
+
+- [ ] **Q.1 — release tarball**: CI (GitHub Actions) publica
+      `calisto-linux-x86_64.tar.gz` com o binário + `vendor/ruby-<v>/` dos
+      rubies suportados (3.4.10, 3.4.4) — dlopen da Fase L torna o binário
+      relocável (rpath `$ORIGIN/../lib`).
+- [ ] **Q.2 — `curl | sh`**: script instalador que baixa, verifica sha256 e
+      instala em `~/.calisto` (+ shim no PATH); `calisto upgrade` passa a
+      **baixar** rubies pré-compilados em vez de compilar (compilação vira
+      fallback `--source`).
+- [ ] **Q.3 — vendor_root portátil**: `vendor_root()` hoje sobe do
+      executável — generalizar para `CALISTO_HOME` (default `~/.calisto`),
+      mantendo o comportamento de checkout para desenvolvimento.
+- Marco: máquina limpa (container `ubuntu:24.04` sem ruby/rust):
+  `curl … | sh && calisto init app && cd app && calisto run` → Hello em
+  <1min total. Teste de fumaça em CI, não na suíte local.
+- Estimativa: 1–2 semanas.
+
+### Ordem e dependências
+
+```
+L (embutir) ──┬─→ M (memória) ─┐
+              ├─→ N (YJIT) ────┴─→ O (snapshot)
+              └─→ P (APIs nativas) ─→ Q (distribuição)
+```
+
+- **L primeiro, sempre** — é a fundação; L.1–L.3 já entregam o daemon
+  in-process sem reescrever o accept loop (L.4 pode ser L-bis se o risco
+  subir).
+- **M e N em paralelo** depois de L — independentes, ambos curtos.
+- **O é o único com risco de não sair** (criu) — spike de 2–3 dias decide;
+  se falhar, o marco documentado é a decisão.
+- **P antes de Q** para o binário distribuído já sair com as APIs nativas.
+- Sequência sugerida: **L → M → N → P → Q**, com O spikado em background
+  assim que L.3 estabilizar.
+
 ## Riscos técnicos conhecidos
+
 
 - **Memória**: daemon com Chatwoot pré-carregado ≈ 500MB+ RSS (preço do preload)
 - **Watch/fork**: o listen (inotify) quebra o 2º fork (descoberto no Chatwoot) — o watch da Fase E roda no cliente Rust (polling de mtime), fork-safe por construção
