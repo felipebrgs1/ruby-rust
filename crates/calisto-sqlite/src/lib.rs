@@ -175,15 +175,28 @@ unsafe impl<T> Sync for SyncPtr<T> {}
 
 unsafe extern "C" fn db_free(p: *mut c_void) {
     if !p.is_null() {
-        let s = sqlite();
-        unsafe { (s.close_v2)(p as *mut sqlite3) };
+        // p = o BOX (struct Db) — o handle real vive em (*h).db; passar o
+        // box como sqlite3* faz o sqlite ler o Vdbe/magic no layout do box
+        // (lixo — crash no shutdown com handle aberto)
+        let h = p as *mut Db;
+        let db = unsafe { (*h).db };
+        if !db.is_null() {
+            let s = sqlite();
+            unsafe { (s.close_v2)(db) };
+        }
+        unsafe { drop(Box::from_raw(h)) };
     }
 }
 
 unsafe extern "C" fn stmt_free(p: *mut c_void) {
     if !p.is_null() {
-        let s = sqlite();
-        unsafe { (s.finalize)(p as *mut sqlite3_stmt) };
+        let h = p as *mut Stmt;
+        let stmt = unsafe { (*h).stmt };
+        if !stmt.is_null() {
+            let s = sqlite();
+            unsafe { (s.finalize)(stmt) };
+        }
+        unsafe { drop(Box::from_raw(h)) };
     }
 }
 
@@ -255,7 +268,7 @@ struct Stmt {
 fn db_of(vm: &Ruby, obj: VALUE) -> *mut Db {
     let p = unsafe { (vm.native().rb_check_typeddata)(obj, db_type()) };
     if p.is_null() {
-        vm.raise(error_class(), "objeto invalido (Calisto::SQLite::Database)");
+        vm.raise(error_class(), "Database sem handle (use Calisto::SQLite.open, nao .new)");
     }
     p as *mut Db
 }
@@ -263,7 +276,7 @@ fn db_of(vm: &Ruby, obj: VALUE) -> *mut Db {
 fn stmt_of(vm: &Ruby, obj: VALUE) -> *mut Stmt {
     let p = unsafe { (vm.native().rb_check_typeddata)(obj, stmt_type()) };
     if p.is_null() {
-        vm.raise(error_class(), "objeto invalido (Calisto::SQLite::Statement)");
+        vm.raise(error_class(), "Statement sem handle (use Database#prepare, nao .new)");
     }
     p as *mut Stmt
 }
@@ -308,7 +321,12 @@ unsafe extern "C" fn sqlite_open(argc: c_int, argv: *mut VALUE, _self: VALUE) ->
     let mut db: *mut sqlite3 = std::ptr::null_mut();
     let rc = (s.open_v2)(path_c.as_ptr(), &mut db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, std::ptr::null());
     if rc != SQLITE_OK {
-        err_raise(vm, db, rc, "cannot open database");
+        // open_v2 pode devolver um handle NAO-NULO mesmo na falha — fecha
+        // antes de raise (senao o close_v2 posterior ficaria adiado)
+        if !db.is_null() {
+            (s.close_v2)(db);
+        }
+        err_raise(vm, std::ptr::null_mut(), rc, "cannot open database");
     }
     let boxed = Box::into_raw(Box::new(Db { db }));
     (vm.native().rb_data_typed_object_wrap)(CLASS_DATABASE.lock().unwrap().unwrap(), boxed as *mut c_void, db_type())
@@ -342,9 +360,17 @@ fn check_open_stmt(vm: &Ruby, h: *mut Stmt) -> *mut sqlite3_stmt {
     stmt
 }
 
-/// Converte um VALUE para bind param (nil/bool/Integer/Float/String);
-/// TypeError para outros tipos. `idx` e 1-based (API do sqlite).
-fn bind_param(vm: &Ruby, stmt: *mut sqlite3_stmt, db: *mut sqlite3, idx: c_int, v: VALUE) {
+/// Falha de bind: tipo invalido (TypeError) ou erro do sqlite (SQLite::Error).
+enum BindFail {
+    Type(String),
+    Sqlite(String),
+}
+
+/// Converte um VALUE para bind param (nil/bool/Integer/Float/String).
+/// NUNCA levanta (longjmp) — um raise aqui pularia o finalize do stmt no
+/// caller (vazamento: o sqlite3_close_v2 fica adiado para sempre). `idx` e
+/// 1-based (API do sqlite).
+fn bind_param(vm: &Ruby, stmt: *mut sqlite3_stmt, db: *mut sqlite3, idx: c_int, v: VALUE) -> Result<(), BindFail> {
     let s = sqlite();
     let n = vm.native();
     let rc = unsafe {
@@ -358,24 +384,54 @@ fn bind_param(vm: &Ruby, stmt: *mut sqlite3_stmt, db: *mut sqlite3, idx: c_int, 
         } else if vm.is_kind_of(v, vm.c_string()) {
             let mut sv = v;
             let (ptr, len) = vm.string_bytes(&mut sv);
+            if len > c_int::MAX as usize {
+                return Err(BindFail::Type(format!(
+                    "string too long for SQLite ({} bytes)",
+                    len
+                )));
+            }
             (s.bind_text)(stmt, idx, ptr as *const c_char, len as c_int, SQLITE_TRANSIENT)
         } else if vm.is_kind_of(v, vm.c_integer()) {
-            let i = (n.rb_num2ll)(v); // RangeError p/ bignum enorme
+            // bignum: bit_length ANTES do num2ll — o RangeError do num2ll
+            // (longjmp) pularia o finalize do caller
+            let bits = vm.funcall(v, "bit_length", &[]);
+            let bits = (n.rb_num2ll)(bits); // Fixnum — nunca levanta
+            if bits > 63 {
+                return Err(BindFail::Type(format!("integer too big for SQLite ({bits} bits)")));
+            }
+            let i = (n.rb_num2ll)(v);
             (s.bind_int64)(stmt, idx, i)
         } else if vm.is_kind_of(v, vm.c_float()) {
             (s.bind_double)(stmt, idx, (n.rb_num2dbl)(v))
         } else {
-            vm.raise(vm.e_type_error(), &format!("cannot bind {} as SQLite param", vm.classname(v)));
+            return Err(BindFail::Type(format!(
+                "cannot bind {} as SQLite param",
+                vm.classname(v)
+            )));
         }
     };
     if rc != SQLITE_OK {
-        err_raise(vm, db, rc, "bind");
+        return Err(BindFail::Sqlite(sqlite_msg(db, rc, "bind")));
     }
+    Ok(())
+}
+
+/// Mensagem de erro do sqlite (errmsg do db, ou errstr quando sem db).
+fn sqlite_msg(db: *mut sqlite3, rc: c_int, what: &str) -> String {
+    let s = sqlite();
+    let msg = if db.is_null() {
+        unsafe { CStr::from_ptr((s.errstr)(rc)) }.to_string_lossy().into_owned()
+    } else {
+        let p = unsafe { (s.errmsg)(db) };
+        if p.is_null() { format!("(erro {rc})") } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned() }
+    };
+    format!("{what}: {msg}")
 }
 
 /// Executa a statement ate DONE, coletando linhas; [] para nao-SELECT.
-/// `stmt` e finalizada no fim (execute de Database). Err via raise.
-fn run_statement(vm: &Ruby, db: *mut sqlite3, stmt: *mut sqlite3_stmt) -> VALUE {
+/// Err = mensagem do step — o CALLER decide finalizar (db_execute) ou
+/// manter a statement reutilizavel (stmt_execute, o reset limpa o erro).
+fn run_statement(vm: &Ruby, db: *mut sqlite3, stmt: *mut sqlite3_stmt) -> Result<VALUE, String> {
     let s = sqlite();
     let ncol = unsafe { (s.column_count)(stmt) };
     let rows = unsafe { (vm.native().rb_ary_new)() };
@@ -418,10 +474,10 @@ fn run_statement(vm: &Ruby, db: *mut sqlite3, stmt: *mut sqlite3_stmt) -> VALUE 
         } else if rc == SQLITE_DONE {
             break;
         } else {
-            err_raise(vm, db, rc, "step");
+            return Err(sqlite_msg(db, rc, "step"));
         }
     }
-    rows
+    Ok(rows)
 }
 
 /// `Database#execute(sql, *binds)` -> Array
@@ -458,9 +514,23 @@ unsafe extern "C" fn db_execute(argc: c_int, argv: *mut VALUE, self_: VALUE) -> 
     }
     for i in 0..(argc - 1) {
         let v = *argv.add(1 + i as usize);
-        bind_param(vm, stmt, db, i + 1, v);
+        if let Err(fail) = bind_param(vm, stmt, db, i + 1, v) {
+            // finaliza ANTES do raise — o longjmp pularia o finalize e o
+            // close_v2 do db ficaria adiado para sempre (vazamento)
+            unsafe { (s.finalize)(stmt) };
+            match fail {
+                BindFail::Type(msg) => vm.raise(vm.e_type_error(), &msg),
+                BindFail::Sqlite(msg) => vm.raise(error_class(), &msg),
+            }
+        }
     }
-    let rows = run_statement(vm, db, stmt);
+    let rows = match run_statement(vm, db, stmt) {
+        Ok(r) => r,
+        Err(msg) => {
+            unsafe { (s.finalize)(stmt) };
+            vm.raise(error_class(), &msg);
+        }
+    };
     unsafe { (s.finalize)(stmt) };
     rows
 }
@@ -507,19 +577,29 @@ unsafe extern "C" fn stmt_execute(argc: c_int, argv: *mut VALUE, self_: VALUE) -
     let stmt = check_open_stmt(vm, h);
     let db = unsafe { (*h).db };
     let s = sqlite();
-    let rc = (s.reset)(stmt);
-    if rc != SQLITE_OK {
-        err_raise(vm, db, rc, "reset");
-    }
-    let rc = (s.clear_bindings)(stmt);
-    if rc != SQLITE_OK {
-        err_raise(vm, db, rc, "clear_bindings");
-    }
+    // reset: o rc devolvido e o do ULTIMO step (erro anterior) — o reset
+    // LIMPA o estado de erro para o proximo step, mas reporta o passado
+    // (doc do sqlite3_reset); tratar como erro aqui quebraria o reuso de
+    // statements que erraram. O stmt foi validado pelo check_open_stmt —
+    // reset so falha com SQLITE_MISUSE (stmt invalido), impossivel aqui.
+    let _ = (s.reset)(stmt);
+    let _ = (s.clear_bindings)(stmt);
     for i in 0..argc {
         let v = *argv.add(i as usize);
-        bind_param(vm, stmt, db, i + 1, v);
+        if let Err(fail) = bind_param(vm, stmt, db, i + 1, v) {
+            // statement REUTILIZAVEL: nao finaliza — o proximo execute faz
+            // reset (que limpa o estado de erro); o reset do inicio da
+            // proxima chamada ja cobre o caso do step falhar
+            match fail {
+                BindFail::Type(msg) => vm.raise(vm.e_type_error(), &msg),
+                BindFail::Sqlite(msg) => vm.raise(error_class(), &msg),
+            }
+        }
     }
-    run_statement(vm, db, stmt)
+    match run_statement(vm, db, stmt) {
+        Ok(rows) => rows,
+        Err(msg) => vm.raise(error_class(), &msg),
+    }
 }
 
 /// `Statement#columns` -> Array<String>

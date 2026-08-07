@@ -112,6 +112,22 @@ begin
 rescue Calisto::SQLite::Error => e
   raise "msg #{e.message}" unless e.message.include?("no such table")
 end
+# apos o erro o db continua util — o stmt do erro nao pode ficar
+# pendurado (senao o close_v2 do db ficaria adiado para sempre)
+raise db.execute("SELECT 1").inspect unless db.execute("SELECT 1") == [[1]]
+# statement reutilizavel que ERRA no step: o reset da proxima chamada
+# limpa o estado de erro (nao pode ser finalizada no caminho de erro)
+db.execute("CREATE TABLE u (x INTEGER UNIQUE)")
+db.execute("INSERT INTO u VALUES (1)")
+stmt2 = db.prepare("INSERT INTO u VALUES (?)")
+begin
+  stmt2.execute(1)
+  raise "no unique error"
+rescue Calisto::SQLite::Error => e
+  raise "msg3 #{e.message}" unless e.message.include?("UNIQUE")
+end
+raise stmt2.execute(2).inspect unless stmt2.execute(2) == []
+stmt2.close
 # multi-statement: erro claro (escopo da API: uma statement por chamada)
 begin
   db.execute("SELECT 1; SELECT 2")
@@ -121,7 +137,18 @@ rescue Calisto::SQLite::Error => e
 end
 db.close
 raise "db not closed" unless db.closed?
-puts Calisto::SQLite.libversion"##;
+puts Calisto::SQLite.libversion
+# regressao do dfree: handles ABERTOS no exit — o GC shutdown finaliza
+# via TypedData e precisa fechar o HANDLE certo (bug real: o dfree passava
+# o ponteiro do box {stmt,db} como sqlite3_stmt*/sqlite3* — lixo no sqlite
+# -> SIGSEGV/abort no exit; so nao crashava porque os smokes fechavam tudo
+# explicitamente antes)
+db3 = Calisto::SQLite.open(":memory:")
+db3.execute("CREATE TABLE t3 (x)")
+s3 = db3.prepare("INSERT INTO t3 VALUES (1)")
+s3.execute
+# sem close — dfree no shutdown
+print "OPEN-AT-EXIT-OK""##;
     let out = warm_eval(&dir, code);
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let v = String::from_utf8_lossy(&out.stdout);
@@ -139,6 +166,40 @@ fn native_sqlite_cold_raises_clear_load_error() {
     assert!(
         stderr.contains("calisto/sqlite"),
         "stderr deve explicar o problema: {stderr}"
+    );
+}
+
+#[test]
+fn native_hash_available_in_app_daemon_preload() {
+    // O boot do daemon da app roda -rbundler/setup (limpa o $LOAD_PATH) —
+    // o unshift do dir nativo precisa acontecer DEPOIS disso, ou o
+    // entrypoint nao consegue `require "calisto/hash"` no boot (bug real:
+    // o bloco nativo rodava antes do loop de -r).
+    let dir = runtime_dir("native-app-preload");
+    let app = dir.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("calisto.toml"), "[run]\npreload = \"boot.rb\"\n").unwrap();
+    std::fs::write(
+        app.join("boot.rb"),
+        "require \"calisto/hash\"\nraise \"Calisto::Hash ausente no boot\" unless defined?(Calisto::Hash)\n",
+    )
+    .unwrap();
+    // 1º comando sobe o daemon da app (o boot roda o entrypoint)
+    let out = run_opt(
+        &dir,
+        RunOpts {
+            args: &["run", "-e", "puts Calisto::Hash.sha256(\"boot\")"],
+            env: &[],
+            stdin: None,
+            cwd: Some(&app),
+            timeout: 30,
+        },
+    );
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // sha256("boot") — o mesmo digest em qualquer execucao
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "4509beb0ab401d71fa4a5cd94a55c9a74f13332776ae4019c5bfc4c2005157ff"
     );
 }
 

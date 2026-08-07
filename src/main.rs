@@ -940,11 +940,19 @@ fn daemon_main(vm: &calisto_ruby::Ruby, requires: &[String]) -> Result<i32, Stri
     let sock = PathBuf::from(
         env::var("CALISTO_SOCKET").map_err(|_| "CALISTO_SOCKET nao definido".to_string())?,
     );
+    // boot: flags -r (ex.: -rbundler/setup do daemon da app) antes do preload
+    for name in requires {
+        if let Err(e) = vm.require(name) {
+            return Err(format!("require -r{name} falhou: {}", vm.error_summary(e)));
+        }
+    }
     // Fase P: APIs nativas calisto.* — registradas no boot (Rust ->
     // rb_define_method na VM embutida), antes do preload/compact para o
-    // heap dos modulos entrar na compactacao. Os shims vivem no dir do
-    // socket (que o child injeta no $LOAD_PATH apos o Bundler.setup) e o
-    // daemon da app preload/warmup tambem enxerga o dir (unshift no boot).
+    // heap dos modulos entrar na compactacao. DEPOIS do loop de -r: o
+    // Bundler.setup limpa o $LOAD_PATH e o unshift do dir nativo abaixo
+    // precisa sobreviver ate o app preload/warmup (que rodam a seguir).
+    // Os shims vivem no dir do socket (o child injeta o dir no $LOAD_PATH
+    // apos o proprio Bundler.setup — child_main).
     let native_dir = sock
         .parent()
         .map(|p| p.to_path_buf())
@@ -966,12 +974,6 @@ end"#;
         // sem libsqlite3 do sistema: degrada — o shim do require levanta
         // LoadError claro (o calisto segue util sem o sqlite nativo)
         eprintln!("calisto: warning: calisto/sqlite indisponivel: {e}");
-    }
-    // boot: flags -r (ex.: -rbundler/setup do daemon da app) antes do preload
-    for name in requires {
-        if let Err(e) = vm.require(name) {
-            return Err(format!("require -r{name} falhou: {}", vm.error_summary(e)));
-        }
     }
     let preload = env::var("CALISTO_PRELOAD").unwrap_or_default();
     for name in preload.split(',').map(str::trim).filter(|s| !s.is_empty()) {

@@ -338,10 +338,11 @@ no calisto. É o equivalente ao `Bun.sql`/`Bun.CryptoHasher`. O stub
       — exige GVL por request + marshalling, complexidade de framework
       inteiro; `calisto serve` + puma já cobre. Revisitar depois de medir.
 - Marco ✅: `require "calisto/sqlite"` + `require "calisto/hash"` rodam no
-  daemon genérico **sem gem nenhuma** (hermético) — `test/native.rs`, 5
+  daemon genérico **sem gem nenhuma** (hermético) — `test/native.rs`, 6
   testes (blake3 contra os **vetores oficiais** — 13 comprimentos cobrindo
   chunk único/cheio/árvore; sha256 com paridade cold/warm + Digest;
-  sqlite em memória com binds/prepared/reuso/erros; cold sqlite → erro
+  sqlite em memória com binds/prepared/reuso/erros/**handles abertos no
+  exit**; calisto/\* no preload do daemon de app; cold sqlite → erro
   claro; benchmark). **Benchmark real (sha256 de 100MB, release): 1802 MB/s
   vs 261 MB/s do `Digest::SHA256` = 6.9×** — o "10×" do plano era contra um
   Digest "puro" que não existe: o da stdlib é C otimizado (~300 MB/s
@@ -353,7 +354,17 @@ no calisto. É o equivalente ao `Bun.sql`/`Bun.CryptoHasher`. O stub
   caracteres); ponteiro de stack num static = segfault (SqliteFns num Box);
   o shim do task se chamava `rake.rb` e o dir no `$LOAD_PATH` fazia o
   `require "rake"` do próprio rake carregar o shim recursivamente →
-  renomeado para `task.rb`.
+  renomeado para `task.rb`; **dfree do TypedData passava o ponteiro do
+  BOX {stmt,db} como sqlite3_stmt\*/sqlite3\*** (o sqlite lia o Vdbe no
+  layout do box → SIGSEGV/abort tpp no shutdown da VM com handle aberto —
+  os smokes só não pegavam porque fechavam tudo; fix: deref do box +
+  Box::from_raw); **`sqlite3_reset` devolve o rc do ÚLTIMO step** — tratar
+  como erro quebrava o reuso de statements que erraram (o reset limpa o
+  estado, só reporta o passado); o registro nativo rodava ANTES do
+  `-rbundler/setup` do daemon (que limpa o $LOAD_PATH) → app preload não
+  enxergava `calisto/*` (movido para depois do loop de -r); raises no meio
+  do bind/step vazavam a prepared statement (close_v2 adiado para sempre)
+  — caminhos de erro viraram Result com finalize no caller.
 - Estimativa: ~~2 semanas~~ (concluída).
 
 ### Fase Q — Distribuição: o instalador do Bun
