@@ -52,8 +52,11 @@ SHA-NI — e `Calisto::SQLite` sobre a libsqlite3 do sistema com TypedData;
 shims `calisto/sqlite.rb`+`calisto/hash.rb` no dir de runtime injetado no
 `$LOAD_PATH` do child pós-Bundler.setup; cold: hash cai no fallback Digest,
 sqlite levanta LoadError claro; benchmark sha256 100MB: **6.9×** o
-Digest::SHA256). O roadmap mira a **Fase Q (distribuição)**; O (snapshot
-criu) segue como spike de risco.
+Digest::SHA256). Próximo ciclo começa pela runtime: **Fase Q
+(distribuição)** + spike da **Fase O (snapshot criu)**, depois **Fase R
+(paridade de CLI do interpretador)** — gaps reais do `ruby` no calisto:
+`-I`/`-r`/`-w`/`-c`/`--version` (semântica do interpretador já é ~100%
+por construção — CRuby embutido).
 
 ## Architecture & Data Flow
 

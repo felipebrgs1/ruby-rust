@@ -21,6 +21,7 @@ graph LR
     M --> O[Fase O: snapshot de boot]
     N --> O
     P --> Q[Fase Q: distribuição — binário único]
+    Q --> R[Fase R: paridade de CLI do interpretador]
 ```
 
 ## Pronto (Fases 1-2 + A-K) — resumo
@@ -97,14 +98,44 @@ Crates esboçados (ainda vazios): `calisto-{test,task,serve,sqlite,tooling}`.
 - Marco ✅: `calisto add sinatra` num projeto → `calisto run -e 'require "sinatra"'` ativa **sem passos manuais** (Sinatra 4.2.1 no daemon quente). Detalhes: wrapper roda `ruby -S bundle <sub>` com o ruby resolvido (Fase I — `.ruby-version`/Gemfile) e cwd na **raiz do projeto** (walk-up do Gemfile, como o resto do calisto), `BUNDLE_GEMFILE` setado, PATH prefixado com o bin dir do ruby (trap do restart do bundler: lock que pina outro bundler re-executa via shebang) e `CALISTO_BUNDLE_RUBY` exportado; `CALISTO_BUNDLE` (testes) troca o binário — `test/deps.rs`, 5 testes (passthrough de args, cwd/Gemfile/ruby certos, exit code, versão 3.4.4 gated, sem Gemfile → erro sugerindo `bundle init`).
 - Estimativa: ~~1 semana~~ (concluída)
 
-## Próximo ciclo — entrando na runtime (Fases L–Q)
+## Cobertura atual vs `ruby` (levantamento)
 
-> Até a Fase K o calisto **orquestra** um ruby externo (`vendor/*/bin/ruby`).
-> O próximo ciclo faz o calisto **ser** o runtime: embutir o CRuby via
-> `libruby`, controlar o boot da VM diretamente e usar o fork quente para o
-> que só essa arquitetura permite (memória compartilhada, JIT pré-aquecido,
-> snapshot). Anti-objetivo mantido: **nunca reimplementar o CRuby** — embutir
-> ≠ reimplementar. Cada fase continua com marco verificável que vira teste.
+> O calisto EMBEDDA o CRuby: a semântica do interpretador (core, stdlib,
+> gems) é ~100% coberta **por construção** — o boot do daemon roda o
+> `process_options` completo do CLI e o child replica `ruby <script>`/
+> `ruby -e` byte a byte (paridade cold/warm + 17 arquivos do ruby/ruby
+> upstream em `test/ruby_upstream.rs`). A cobertura que falta é a do
+> **CLI** (flags) e de alguns comandos do ecossistema.
+
+| Uso `ruby` | No calisto | Prova |
+|---|---|---|
+| `ruby <script>` | ✅ `calisto run` | parity contract (cold/warm + upstream) |
+| `ruby -e 'code'` | ✅ `calisto run -e` (múltiplos -e, $0/ARGV/backtrace/exit) | `exec.rs` |
+| `ruby -I DIR` / `-r LIB` | ❌ (só internos: CALISTO_LOAD_PATH no test; -r do daemon) | probe: `cannot open -I` |
+| `ruby -w` / `-W` / `-d` | ❌ | probe |
+| `ruby -c` (syntax check) | ❌ | probe |
+| `ruby -v` / `--version` | ❌ (`calisto --version` = unknown command; `doctor` mostra a versão) | probe |
+| `-E enc`, `-n/-p/-a/-F/-l/-0/-i/-s/-S/-x/-C` | ❌ (raros) | — |
+| `--yjit` | ✅ parcial: `[run] yjit` no daemon de app (não como flag do run) | Fase N |
+| `irb` | ✅ `calisto repl` | `exec.rs` |
+| `rake` | ✅ `calisto task` | `testcmd.rs` |
+| rspec / minitest | ✅ `calisto test` | `testcmd.rs` |
+| rackup / puma | ✅ `calisto serve` (+ `exec`) | Fase E/C |
+| binários de gems (sidekiq, rubocop…) | ✅ `calisto exec` (resolução bundle-exec) | Fase G |
+| `bundle` | ✅ add/remove/lock + Gemfile ativo no run | Fase K |
+| `gem` | ⚠️ delegado (instalação = `bundle install`, decisão Fase A) | — |
+| rdbg | ⚠️ roda via `calisto exec rdbg` se a gem está no bundle | — |
+
+**Gaps reais de uso cotidiano**: `-I`, `-r`, `-w`, `-c`, `-v/--version` — os
+primeiros flags do `ruby --help` que um dev usa (gems com `-I lib`, CI com
+`-c`, warnings com `-w`). O resto é uso marginal e vira "não fazer"
+documentado.
+
+## Próximo ciclo — fechando a runtime (O → Q) e a cobertura (R)
+
+> Pedido: começar pelo runtime. **O (snapshot) e Q (distribuição) fecham o
+> ciclo L–Q**; R fecha a superfície do CLI ruby nos gaps reais (a
+> semântica do interpretador já é 100% por construção).
 
 ### Fase L — CRuby embutido (libruby): o calisto vira o runtime
 Hoje o daemon é `spawn vendor/ruby server.rb`. Esta fase move o daemon para
@@ -387,12 +418,39 @@ Fecha o ciclo "Bun de verdade": hoje o calisto exige o checkout +
   <1min total. Teste de fumaça em CI, não na suíte local.
 - Estimativa: 1–2 semanas.
 
+### Fase R — Paridade de CLI do interpretador (os gaps reais)
+Fecha o "NOTE: -e/-E VM flags ainda não suportados" do help. Escopo = os
+gaps de uso cotidiano do levantamento acima; os raros ficam como não-fazer
+documentado.
+
+- [ ] **R.1 — flags do `run`**: `calisto run` aceita `-I DIR` (repetível),
+      `-r LIB` (repetível), `-w`/`-W[0-2]`, `-c` (syntax check — compila e
+      sai 0/1 como o ruby, sem executar) e `-E enc[:in]` (best-effort via
+      `Encoding.default_*=`). **Design**: opções do CHILD, não do boot do
+      daemon — o daemon é compartilhado entre comandos diferentes e o
+      `$LOAD_PATH` do `-I` precisa ser reaplicado DEPOIS do Bundler.setup
+      (mesmo mecanismo do CALISTO_LOAD_PATH); `-r` vira require no child
+      antes do script; `-w` vira `$VERBOSE`; `-c` vira uma opção do RUN
+      (compila a iseq, não avalia). Flags vão no env_blob/campos do RUN.
+- [ ] **R.2 — `calisto --version` / `-v`**: imprime a versão do calisto +
+      a VM embutida no formato do `ruby -v` (`ruby 3.4.10 (...) +PRISM
+      [x86_64-linux]` — mesma string do `RUBY_DESCRIPTION`), do ruby
+      resolvido (Fase I). Trivial: `doctor` já mostra.
+- [ ] **R.3 — não fazer documentado**: `-n/-p/-a/-F/-l/-0/-i/-s/-S/-x/-C`
+      (awk-mode e companhia — uso marginal; o `ruby` do vendor segue
+      disponível via PATH/--cold para esses).
+- Marco: app de gems com `calisto run -I lib -r helper -w script.rb` roda
+  quente com paridade cold/warm (`cold_and_warm_agree` com cada flag);
+  `calisto run -c` == `ruby -c` em exit codes e mensagens; `calisto
+  --version` imprime a VM embutida.
+- Estimativa: 1 semana (R.1 é o grosso; R.2 é trivial).
+
 ### Ordem e dependências
 
 ```
 L (embutir) ──┬─→ M (memória) ─┐
               ├─→ N (YJIT) ────┴─→ O (snapshot)
-              └─→ P (APIs nativas) ✅ ─→ Q (distribuição)
+              └─→ P (APIs nativas) ✅ ─→ Q (distribuição) ─→ R (CLI parity)
 ```
 
 - **L primeiro, sempre** — é a fundação; L.1–L.3 já entregam o daemon
@@ -403,8 +461,9 @@ L (embutir) ──┬─→ M (memória) ─┐
   se falhar, o marco documentado é a decisão.
 - **P antes de Q** para o binário distribuído já sair com as APIs nativas.
 - Sequência sugerida: **L → M → N → P → Q**, com O spikado em background
-  assim que L.3 estabilizar. P concluída; **Q é a próxima** (O segue como
-  spike de risco — criu).
+  assim que L.3 estabilizar. P concluída; **o próximo ciclo abre com a
+  runtime: Q em paralelo com o spike do O; R (CLI parity) depois** — o
+  usuário pediu para começar pelo runtime.
 
 ## Riscos técnicos conhecidos
 
