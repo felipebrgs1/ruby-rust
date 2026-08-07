@@ -164,9 +164,12 @@ USAGE:
           num arquivo unico self-contained. Arquivos fora da raiz (stdlib)
           nao sao embutidos. --root define a raiz do projeto (default: o
           diretorio do entrypoint).
-          --compile embute as gems pure-Ruby do Gemfile.lock (Fase F): o
-          bundle roda sem bundle install — GEM_HOME/GEM_PATH vazios. C
-          extensions nao embutem (warning; o require cai no bundle real).
+          --compile embute as gems do Gemfile.lock (Fase F): pure-Ruby
+          avaliados e C extensions (.so/.bundle ja compilados) embutidos
+          como bytes e extraidos p/ tmpdir no runtime — o bundle roda sem
+          bundle install (GEM_HOME/GEM_PATH vazios); requires dinamicos de
+          nativos cobertos por pre-indice. Compilar do zero continua
+          delegado ao bundle install.
           Autoloads das gems sao cobertos (pre-carga em rodadas).
   init    scaffold de app (como `bun init`): calisto.toml com
           [scripts] start = \"./hello.rb\", hello.rb e .gitignore. Sem nome usa
