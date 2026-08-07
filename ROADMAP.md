@@ -147,19 +147,27 @@ Hoje o daemon é `spawn vendor/ruby server.rb`. Esta fase move o daemon para
       executável `vendor/current/bin/ruby`. Socket/protocolo/env
       (CALISTO_SOCKET/PIDFILE/PRELOAD/APP_PRELOAD) inalterados — server.rb
       não mudou. `CALISTO_NO_EMBED=1` força o modo legado (fallback).
-- [ ] **L.4 — accept loop em Rust**: `select`/`poll` + `fork` no Rust
-      (substitui o `select` + `waitpid WNOHANG` do server.rb); `child_enter`
-      vira Rust (dup2 dos fds SCM_RIGHTS, chdir, setenv do env_blob) + um
-      snippet Ruby mínimo avaliado no child via `rb_protect`
-      (`Bundler.setup`, `CALISTO_LOAD_PATH`, `load` do script / `eval` do
-      `-e`). O `server.rb` encolhe para o bootstrap do child; a máquina de
-      estados do protocolo vive onde já estava o client: no Rust.
-- [ ] **Fork-safety da VM**: invariante — no daemon, nenhuma thread Ruby além
-      da principal quando o fork acontece (o accept loop Rust garante;
-      timer thread do CRuby é tolerada, como já ocorre hoje no fork a
-      partir do daemon Ruby). Signal handling: o CRuby instala traps no
-      `ruby_init` — o daemon Rust restaura o que precisa (SIGPIPE já é
-      tratado; revisar SIGCHLD/SIGINT).
+- [x] **L.4 — accept loop em Rust**: o daemon embutido vive inteiro em Rust —
+      poll(10ms) sobre o listener + conexões, `recvmsg` SCM_RIGHTS (1º
+      recvmsg da conexão), fork por RUN/EVAL com o child 100% Rust
+      (rb_thread_atfork, dup2, chdir, ENV.replace via clearenv+setenv) +
+      bootstrap Ruby mínimo sob rb_protect. O EVAL compila o código como o
+      CLI (`rb_parser_new` → `rb_parser_set_context(parent=NULL,
+      top_level=TRUE)` → `rb_parser_compile_string_path("-e")` →
+      `rb_iseq_new_main(parent=0, opt=1)` → `rb_iseq_eval_main`) — backtrace
+      idêntico ao `ruby -e` (sem frames de eval). O RUN carrega via
+      `Kernel#load` (rb_f_load: $LOAD_PATH → fallback CWD com o caminho
+      original — rb_load C-level resolve só $LOAD_PATH e falhava paths
+      relativos). Exit paths corretos: `ruby_cleanup` recebe TAG type (0 =
+      normal, 6 = TAG_RAISE) e o status sai do errinfo (SystemExit) —
+      `cleanup(42)` abortava (violação TAG_FATAL). `server.rb` virou
+      legado-only (rubies sem .so — ex.: 3.4.4), com 2 fixes de robustez:
+      rescue de `Errno::EBADF` no select (fd reaproveitado por outro io —
+      derruba clientes e segue; o cliente stop re-tenta) e o `stop` do
+      cliente agora espera o socket sumir + re-tenta + limpa stale.
+- [x] **Fork-safety da VM**: `rb_thread_atfork()` no child (o que o
+      Process.fork do ruby faz) — sem isso o `ruby_cleanup` do child
+      pendurava tentando dar join na timer thread que não sobrevive ao fork.
 - Marco (L.1–L.3) ✅: suíte inteira verde (15 targets, 0 falhas — paridade
   cold/warm, app daemon com `-rbundler/setup`, daemon de teste
   RAILS_ENV=test, versions com 3.4.4 no modo legado natural); `calisto
@@ -173,6 +181,17 @@ Hoje o daemon é `spawn vendor/ruby server.rb`. Esta fase move o daemon para
   gitignored + bundle instalado sob a build antiga) — a suíte hermética
   cobre a semântica; re-rodar `bundle install` nos fixtures e os goldens
   fica para o ciclo realapps da Fase L.4.
+- Marco (L.4) ✅: suíte inteira verde (15 targets; versions 16× seguido no
+  debug do flaky do stop legado — EBADF + retry do stop); `run -e` quente
+  55ms, `run examples/hello.rb` 80ms; backtrace `raise`/`raise.rb`
+  byte-igual ao `ruby` (incl. error_highlight e `<top (required)>` do
+  load); `exit 42` → 42; DATA/`__END__` ok; daemon morre limpo no STOP
+  (socket+pidfile removidos). Os bugs encontrados no caminho viraram
+  fix: `rb_parser_set_context`/`rb_iseq_new_main` com parent **NULL** (Qnil
+  como ponteiro = crash), `cleanup(42)` abortava (param é TAG type),
+  `rb_load` C-level não resolve CWD, errinfo pendente era re-impresso pelo
+  `ruby_cleanup`, e o `-e` via `rb_funcallv(eval)` adicionava frame
+  `Kernel#eval` (a cadeia iseq não).
 - Risco: dlopen de libruby exige símbolos estáveis — travar na ABI
   `libruby.so.3.4` por série (3.4.x), como o nome do arquivo já indica.
 - Estimativa: 3–4 semanas (é a fundação; L.1–L.3 entregam valor sem L.4,

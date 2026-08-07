@@ -1,13 +1,14 @@
 use std::env;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::UnixStream;
+use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const DAEMON_RB: &str = include_str!("daemon/server.rb");
@@ -396,26 +397,24 @@ fn connect_or_spawn_daemon_in(
         return Ok(s);
     }
     fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let rb = dir.join("calisto.rb");
-    fs::write(&rb, DAEMON_RB).map_err(|e| format!("cannot write daemon script: {e}"))?;
     // Fase L: com libruby.so disponivel o daemon roda EMBUTIDO — o proprio
     // binario calisto vira o processo do daemon (VM in-process via dlopen),
-    // sem spawnar o interpretador externo. CALISTO_NO_EMBED=1 força o modo
-    // legado (spawn `ruby <daemon.rb>`) — ex.: rubies antigos sem .so, ou
-    // debug. flags sao repassadas ao ruby_options em ambos os modos
+    // sem spawnar o interpretador externo nem rodar o server.rb (o accept
+    // loop vive em Rust — Fase L.4). CALISTO_NO_EMBED=1 forca o modo legado
+    // (spawn `ruby <daemon.rb>`) — ex.: rubies antigos sem .so, ou debug.
+    // flags sao repassadas como `-r<gem>` do boot em ambos os modos
     // (`-rbundler/setup` antes do script continua sendo flag de verdade).
     let embedded = env::var_os("CALISTO_NO_EMBED").is_none() && calisto_ruby::libruby_path(ruby).is_some();
     let mut cmd = if embedded {
         let exe = std::env::current_exe()
             .map_err(|e| format!("cannot resolve own executable: {e}"))?;
         let mut c = Command::new(exe);
-        c.arg("daemon")
-            .arg("--internal")
-            .args(flags)
-            .arg(&rb)
-            .env("CALISTO_EMBED_RUBY", ruby);
+        c.arg("daemon").arg("--internal").args(flags);
+        c.env("CALISTO_EMBED_RUBY", ruby);
         c
     } else {
+        let rb = dir.join("calisto.rb");
+        fs::write(&rb, DAEMON_RB).map_err(|e| format!("cannot write daemon script: {e}"))?;
         let mut c = Command::new(ruby);
         // flags ANTES do script: `ruby -r... <daemon.rb>` — depois do script seria
         // ARGV do daemon, nao flag do interpretador
@@ -429,7 +428,7 @@ fn connect_or_spawn_daemon_in(
     setup(&mut cmd);
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("cannot start daemon with {}: {e}", rb.display()))?;
+        .map_err(|e| format!("cannot start daemon: {e}"))?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(s) = UnixStream::connect(&sock) {
@@ -485,29 +484,721 @@ fn connect_or_spawn_app_daemon_in(
     })
 }
 
-/// Uso interno (Fase L): `calisto daemon --internal [flags...] <script>` —
-/// roda o script com o CRuby EMBUTIDO (libruby dlopen'd pelo
-/// calisto_ruby::Ruby::open), sem spawnar o interpretador externo.
-/// Spawnado pelo proprio cliente quando o ruby resolvido tem libruby.so;
-/// `CALISTO_EMBED_RUBY` aponta esse ruby (para achar a .so). O restante do
-/// argv e repassado como argv do `ruby` (flags como `-rbundler/setup`
-/// primeiro, script por ultimo) — ruby_options + ruby_run_node dao $0,
-/// ARGV, at_exit e exit code iguais aos do modo legado.
+/// Uso interno (Fase L): `calisto daemon --internal [-r<gem>...]` — o daemon
+/// EMBUTIDO: VM CRuby in-process (dlopen libruby) com o accept loop em Rust
+/// (L.4 — sem server.rb). Spawnado pelo proprio cliente quando o ruby
+/// resolvido tem libruby.so; `CALISTO_EMBED_RUBY` aponta esse ruby (para
+/// achar a .so). Boot: require das flags `-r` (ex.: `-rbundler/setup`),
+/// preload de `CALISTO_PRELOAD`, entrypoint de `CALISTO_APP_PRELOAD`; depois
+/// o loop atende PING/RUN/EVAL/STOP com fork por request. Nao retorna ate o
+/// shutdown.
 fn cmd_daemon(args: &[String]) -> i32 {
     if args.first().map(String::as_str) != Some("--internal") {
-        eprintln!("calisto daemon: uso interno: calisto daemon --internal [flags...] <script>");
+        eprintln!("calisto daemon: uso interno: calisto daemon --internal [-r<gem>...]");
         return 1;
     }
     let Some(ruby) = env::var_os("CALISTO_EMBED_RUBY") else {
         eprintln!("calisto daemon: CALISTO_EMBED_RUBY nao definido (uso interno)");
         return 1;
     };
-    match calisto_ruby::Ruby::open(Path::new(&ruby)) {
+    let mut requires: Vec<String> = Vec::new();
+    for a in &args[1..] {
+        if let Some(name) = a.strip_prefix("-r") {
+            requires.push(name.to_string());
+        } else {
+            eprintln!("calisto daemon: flag interna desconhecida: {a}");
+            return 1;
+        }
+    }
+    let mut vm = match calisto_ruby::Ruby::open(Path::new(&ruby)) {
+        Err(e) => {
+            eprintln!("calisto daemon: {e}");
+            return 1;
+        }
+        Ok(vm) => vm,
+    };
+    if let Err(e) = vm.boot() {
+        eprintln!("calisto daemon: {e}");
+        return 1;
+    }
+    match daemon_main(&vm, &requires) {
+        Ok(code) => code,
         Err(e) => {
             eprintln!("calisto daemon: {e}");
             1
         }
-        Ok(vm) => vm.run_script(&args[1..]),
+    }
+}
+
+// ---- Fase L.4: daemon embutido — accept loop em Rust --------------------------
+// Espelho 1:1 do server.rb (preload, bind com stale-socket recovery, detach,
+// traps, RequestReader SCM_RIGHTS, select multi-conexao, waitpid WNOHANG,
+// client-death kill TERM->KILL, STOP derruba children, STATUS por child).
+
+const SIGINT: i32 = 2;
+const SIGHUP: i32 = 1;
+const SIGTERM: i32 = 15;
+const SIGKILL: i32 = 9;
+const SIG_IGN: usize = 1;
+const WNOHANG: i32 = 1;
+const MSG_PEEK: i32 = 2;
+const MSG_DONTWAIT: i32 = 0x40;
+const POLLIN: i16 = 1;
+const POLLHUP: i16 = 0x10;
+const POLLERR: i16 = 0x8;
+const O_RDWR: i32 = 2;
+const EAGAIN: i32 = 11;
+const EINTR: i32 = 4;
+
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
+
+unsafe extern "C" {
+    fn fork() -> i32;
+    fn waitpid(pid: i32, status: *mut c_int, options: i32) -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
+    fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
+    fn close(fd: c_int) -> c_int;
+    fn chdir(path: *const c_char) -> c_int;
+    fn clearenv() -> c_int;
+    fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
+    fn open(path: *const c_char, flags: c_int) -> c_int;
+    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+    fn recv(fd: c_int, buf: *mut c_void, len: usize, flags: c_int) -> isize;
+    fn recvmsg(fd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
+    fn poll(fds: *mut PollFd, nfds: usize, timeout: c_int) -> c_int;
+    fn getpid() -> i32;
+    fn _exit(code: c_int) -> !;
+}
+
+/// Primeiro recvmsg de uma conexao: dados + fds SCM_RIGHTS (stdio do
+/// cliente) — espelho do RequestReader#fill (scm_rights: true) do server.rb.
+fn recv_with_fds(fd: RawFd) -> io::Result<(Vec<u8>, Vec<RawFd>)> {
+    let mut data = vec![0u8; 65_536];
+    let mut iov = Iovec {
+        iov_base: data.as_mut_ptr() as *mut c_void,
+        iov_len: data.len(),
+    };
+    let mut control = vec![0u8; 128];
+    let mut msg = MsgHdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: control.as_mut_ptr() as *mut c_void,
+        msg_controllen: control.len(),
+        msg_flags: 0,
+    };
+    let n = unsafe { recvmsg(fd, &mut msg, MSG_DONTWAIT) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    data.truncate(n as usize);
+    let mut fds = Vec::new();
+    let mut off = 0usize;
+    while off + size_of::<Cmsghdr>() <= msg.msg_controllen {
+        let cmsg = unsafe { &*(control.as_ptr().add(off) as *const Cmsghdr) };
+        if cmsg.cmsg_level == SOL_SOCKET && cmsg.cmsg_type == SCM_RIGHTS {
+            let data_off = align8(size_of::<Cmsghdr>());
+            let nfds = (cmsg.cmsg_len - data_off) / size_of::<i32>();
+            for i in 0..nfds {
+                let p = unsafe {
+                    std::ptr::read(control.as_ptr().add(off + data_off + i * 4) as *const i32)
+                };
+                fds.push(p);
+            }
+        }
+        off += align8(cmsg.cmsg_len);
+    }
+    Ok((data, fds))
+}
+
+struct DaemonClient {
+    fd: RawFd,
+    buf: Vec<u8>,
+    fds: Vec<RawFd>, // stdio do cliente via SCM_RIGHTS (1o recvmsg)
+    first: bool,
+    pid: Option<i32>,
+}
+
+fn respond(fd: RawFd, msg: &str) {
+    let bytes = msg.as_bytes();
+    let mut off = 0;
+    while off < bytes.len() {
+        let n = unsafe { write(fd, bytes[off..].as_ptr() as *const c_void, bytes.len() - off) };
+        if n <= 0 {
+            return; // EPIPE/ECONNRESET: cliente morto (rescue do respond)
+        }
+        off += n as usize;
+    }
+}
+
+enum CommandErr {
+    Partial, // comando incompleto: aguarda mais dados no proximo tick
+    Eof,
+    Bad(String),
+}
+
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\r\n")
+}
+
+/// Espelho do RequestReader#fill: 1o recvmsg com SCM_RIGHTS, depois reads
+/// planos; EAGAIN -> Partial.
+fn client_fill(c: &mut DaemonClient) -> Result<(), CommandErr> {
+    if c.first {
+        c.first = false;
+        match recv_with_fds(c.fd) {
+            Ok((data, fds)) => {
+                c.fds = fds;
+                c.buf.extend_from_slice(&data);
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(CommandErr::Partial),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(CommandErr::Partial),
+            Err(_) => Err(CommandErr::Eof), // 0 bytes ou erro: "eof" do server.rb
+        }
+    } else {
+        let mut data = [0u8; 65_536];
+        let n = unsafe { recv(c.fd, data.as_mut_ptr() as *mut c_void, data.len(), MSG_DONTWAIT) };
+        if n > 0 {
+            c.buf.extend_from_slice(&data[..n as usize]);
+            Ok(())
+        } else if n == 0 {
+            Err(CommandErr::Eof)
+        } else {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(EAGAIN) || e.kind() == io::ErrorKind::Interrupted {
+                Err(CommandErr::Partial)
+            } else {
+                Err(CommandErr::Eof)
+            }
+        }
+    }
+}
+
+/// Espelho do read_command: `OP N\r\n` + N campos `$len\r\n<data>`.
+fn client_read_command(c: &mut DaemonClient) -> Result<(String, Vec<Vec<u8>>), CommandErr> {
+    loop {
+        if let Some(pos) = find_crlf(&c.buf) {
+            let head = String::from_utf8_lossy(&c.buf[..pos]).into_owned();
+            c.buf.drain(..pos + 2);
+            let (op, count) = match head.split_once(' ') {
+                Some(x) => x,
+                None => return Err(CommandErr::Bad(format!("bad command: {:?}", head))),
+            };
+            let count: usize = match count.parse() {
+                Ok(n) => n,
+                Err(_) => return Err(CommandErr::Bad(format!("bad command: {:?}", head))),
+            };
+            let mut fields: Vec<Vec<u8>> = Vec::with_capacity(count);
+            for _ in 0..count {
+                loop {
+                    if let Some(pos) = find_crlf(&c.buf) {
+                        let line = String::from_utf8_lossy(&c.buf[..pos]).into_owned();
+                        c.buf.drain(..pos + 2);
+                        let len: usize = match line.strip_prefix('$').and_then(|l| l.parse().ok()) {
+                            Some(n) => n,
+                            None => return Err(CommandErr::Bad(format!("bad command: {:?}", head))),
+                        };
+                        if c.buf.len() < len {
+                            match client_fill(c) {
+                                Ok(()) => continue,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        let data: Vec<u8> = c.buf.drain(..len).collect();
+                        fields.push(data);
+                        break;
+                    } else {
+                        match client_fill(c) {
+                            Ok(()) => continue,
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+            }
+            return Ok((op.to_string(), fields));
+        } else {
+            match client_fill(c) {
+                Ok(()) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// TERM -> (200ms) -> KILL -> wait bloqueante (kill_child do server.rb).
+fn kill_child(pid: i32) -> Option<i32> {
+    unsafe { kill(pid, SIGTERM) };
+    std::thread::sleep(Duration::from_millis(200));
+    unsafe { kill(pid, SIGKILL) };
+    let mut status = 0;
+    let r = unsafe { waitpid(pid, &mut status, 0) };
+    if r == pid { Some(status) } else { None }
+}
+
+/// exitstatus || (128 + termsig) — como o Ruby decode do wait status.
+fn wait_status_code(status: i32) -> i32 {
+    if status & 0x7f == 0 {
+        (status >> 8) & 0xff
+    } else {
+        128 + (status & 0x7f)
+    }
+}
+
+fn b64_decode(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let table: [i16; 256] = {
+        let mut t = [-1i16; 256];
+        for (i, b) in B64.iter().enumerate() {
+            t[*b as usize] = i as i16;
+        }
+        t
+    };
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let c0 = table[bytes[i] as usize];
+        let c1 = table[bytes[i + 1] as usize];
+        if c0 < 0 || c1 < 0 {
+            break;
+        }
+        out.push(((c0 << 2) | (c1 >> 4)) as u8);
+        let c2 = if bytes[i + 2] == b'=' { -1 } else { table[bytes[i + 2] as usize] };
+        if c2 >= 0 {
+            out.push((((c1 & 0x0f) << 4) | (c2 >> 2)) as u8);
+            let c3 = if bytes[i + 3] == b'=' { -1 } else { table[bytes[i + 3] as usize] };
+            if c3 >= 0 {
+                out.push((((c2 & 0x03) << 6) | c3) as u8);
+            }
+        }
+        i += 4;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Shutdown (STOP/TERM/HUP): derruba children devolvendo STATUS aos clientes,
+/// remove socket/pidfile e encerra a VM (at_exit hooks, como o `exit 0`).
+fn daemon_shutdown(
+    vm: &calisto_ruby::Ruby,
+    sock: &Path,
+    pidfile: Option<&Path>,
+    clients: &mut Vec<DaemonClient>,
+) -> i32 {
+    for c in clients.iter_mut() {
+        if let Some(pid) = c.pid.take() {
+            if let Some(status) = kill_child(pid) {
+                respond(c.fd, &format!("STATUS {}\r\n", wait_status_code(status)));
+            }
+        }
+    }
+    let _ = fs::remove_file(sock);
+    if let Some(pf) = pidfile {
+        let _ = fs::remove_file(pf);
+    }
+    vm.cleanup(0)
+}
+
+static DAEMON_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn on_daemon_term(_: c_int) {
+    DAEMON_SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+/// Flag de shutdown como handler de sinal (sigaction-safe: so um store).
+fn install_daemon_signal_handlers() {
+    let term: usize = on_daemon_term as *const c_void as usize;
+    unsafe {
+        signal(SIGINT, SIG_IGN);
+        signal(SIGTERM, term);
+        signal(SIGHUP, term);
+    }
+}
+
+/// Boot + accept loop do daemon embutido. Espelho do server.rb:
+/// preload -> app preload -> bind (stale socket) -> pidfile -> detach ->
+/// traps -> loop (select 10ms, accept, comandos, waitpid WNOHANG).
+fn daemon_main(vm: &calisto_ruby::Ruby, requires: &[String]) -> Result<i32, String> {
+    // boot: flags -r (ex.: -rbundler/setup do daemon da app) antes do preload
+    for name in requires {
+        if let Err(e) = vm.require(name) {
+            return Err(format!("require -r{name} falhou: {}", vm.error_summary(e)));
+        }
+    }
+    let preload = env::var("CALISTO_PRELOAD").unwrap_or_default();
+    for name in preload.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Err(e) = vm.require(name) {
+            // espelho do daemon legado: avisa e segue (stderr ainda visivel)
+            eprintln!("calisto: preload '{}' failed: {}", name, vm.error_summary(e));
+        }
+    }
+    // app preload (Fase B): entrypoint no boot congelado + AR disconnect +
+    // registro em $LOADED_FEATURES (initialize! duplo do Rails)
+    if let Some(app) = env::var_os("CALISTO_APP_PRELOAD") {
+        let app = app.to_string_lossy().into_owned();
+        vm.set_gv("$calisto_app_preload", vm.str(&app));
+        let snippet = r#"
+begin
+  load $calisto_app_preload
+rescue SystemExit
+  raise
+rescue Exception => e
+  warn "calisto: app preload falhou (#{$calisto_app_preload}): #{e.class}: #{e.message}"
+  warn(e.backtrace.first(8).join("\n")) if e.backtrace
+  exit 1
+end
+if defined?(ActiveRecord::Base) && ActiveRecord::Base.respond_to?(:connection_handler)
+  ActiveRecord::Base.connection_handler.clear_all_connections!
+end
+$LOADED_FEATURES << File.expand_path($calisto_app_preload)
+"#;
+        match vm.eval(snippet) {
+            Err(e) if vm.is_system_exit(e) => return Ok(vm.cleanup(vm.system_exit_status(e))),
+            Err(e) => return Err(format!("app preload: {}", vm.error_summary(e))),
+            Ok(_) => {}
+        }
+    }
+    // bind com stale-socket recovery (EADDRINUSE -> live? -> exit 0 | unlink)
+    let sock = PathBuf::from(
+        env::var("CALISTO_SOCKET").map_err(|_| "CALISTO_SOCKET nao definido".to_string())?,
+    );
+    let pidfile = env::var_os("CALISTO_PIDFILE").map(PathBuf::from);
+    let listener = match UnixListener::bind(&sock) {
+        Ok(l) => l,
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            if UnixStream::connect(&sock).is_ok() {
+                return Ok(0); // outro daemon ja dono do socket
+            }
+            let _ = fs::remove_file(&sock);
+            UnixListener::bind(&sock).map_err(|e| format!("bind {}: {e}", sock.display()))?
+        }
+        Err(e) => return Err(format!("bind {}: {e}", sock.display())),
+    };
+    listener.set_nonblocking(true).ok();
+    let listener_fd = listener.as_raw_fd();
+    if let Some(pf) = &pidfile {
+        fs::write(pf, format!("{}\n", unsafe { getpid() }))
+            .map_err(|e| format!("pidfile {}: {e}", pf.display()))?;
+    }
+    // detach do proprio stdio (sem isso o daemon segura o stdout pipe do
+    // spawner — `calisto run ... | head` pendura). CALISTO_DAEMON_NO_DETACH
+    // mantem o stderr do spawner (debug de boot/crash do daemon).
+    if env::var_os("CALISTO_DAEMON_NO_DETACH").is_none() {
+        unsafe {
+            let devnull = open(b"/dev/null\0".as_ptr() as *const c_char, O_RDWR);
+            if devnull >= 0 {
+                dup2(devnull, 0);
+                dup2(devnull, 1);
+                dup2(devnull, 2);
+                close(devnull);
+            }
+        }
+    }
+    // traps (pos-boot, como o server.rb): INT sobrevive Ctrl-C; TERM/HUP ->
+    // shutdown. Sobrescreve os handlers que a VM instalou no init.
+    install_daemon_signal_handlers();
+    // ---- accept loop multi-conexao (select 10ms + waitpid WNOHANG) ----
+    let mut clients: Vec<DaemonClient> = Vec::new();
+    loop {
+        if DAEMON_SHUTDOWN.load(Ordering::Relaxed) {
+            return Ok(daemon_shutdown(vm, &sock, pidfile.as_deref(), &mut clients));
+        }
+        let mut pfds = Vec::with_capacity(clients.len() + 1);
+        pfds.push(PollFd { fd: listener_fd, events: POLLIN, revents: 0 });
+        for c in &clients {
+            pfds.push(PollFd { fd: c.fd, events: POLLIN, revents: 0 });
+        }
+        let n = unsafe { poll(pfds.as_mut_ptr(), pfds.len(), 10) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(EINTR) {
+                continue;
+            }
+            return Err(format!("poll: {e}"));
+        }
+        // conexoes ativas: so os clientes que estavam no poll (`polled`
+        // calculado ANTES do accept — novos clientes ficam fora do pfds e
+        // esperam o proximo tick)
+        let polled = clients.len();
+        if pfds[0].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(true).ok();
+                        clients.push(DaemonClient {
+                            fd: stream.into_raw_fd(),
+                            buf: Vec::new(),
+                            fds: Vec::new(),
+                            first: true,
+                            pid: None,
+                        });
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+        let mut i = 0;
+        // `polled` limita o pfds (stale apos removals); `clients.len()`
+        // protege o acesso apos um remove(i) (o vetor encolheu)
+        while i < polled && i < clients.len() {
+            let rev = pfds[i + 1].revents;
+            if rev & (POLLIN | POLLHUP | POLLERR) == 0 {
+                i += 1;
+                continue;
+            }
+            if clients[i].pid.is_some() {
+                // child rodando: readable so pode ser EOF (cliente morto) ou
+                // dados espurios — o cliente espera STATUS e nao envia mais.
+                let mut b = [0u8; 1];
+                let r = unsafe { recv(clients[i].fd, b.as_mut_ptr() as *mut c_void, 1, MSG_PEEK | MSG_DONTWAIT) };
+                let dead = if r == 0 {
+                    true
+                } else if r < 0 {
+                    io::Error::last_os_error().raw_os_error() != Some(EAGAIN)
+                } else {
+                    false
+                };
+                if dead {
+                    let pid = clients[i].pid.take().unwrap();
+                    kill_child(pid);
+                    let _ = unsafe { close(clients[i].fd) };
+                    clients.remove(i);
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            match client_read_command(&mut clients[i]) {
+                Ok((op, fields)) => {
+                    let fd = clients[i].fd;
+                    match op.as_str() {
+                        "PING" => respond(fd, "OK\r\n"),
+                        "STOP" => {
+                            respond(fd, "BYE\r\n");
+                            return Ok(daemon_shutdown(vm, &sock, pidfile.as_deref(), &mut clients));
+                        }
+                        "RUN" | "EVAL" => {
+                            let decoded: Vec<String> = fields.iter().map(|f| b64_decode(f)).collect();
+                            let pid = unsafe { fork() };
+                            if pid < 0 {
+                                let e = io::Error::last_os_error();
+                                respond(fd, &format!("ERR RuntimeError: fork: {e}\r\n"));
+                                let _ = unsafe { close(fd) };
+                                clients.remove(i);
+                                continue;
+                            }
+                            if pid == 0 {
+                                // child: espelho do child_enter + start_child
+                                let child_fds = clients[i].fds.clone();
+                                child_main(
+                                    vm,
+                                    op == "EVAL",
+                                    &decoded[0],
+                                    &decoded[1],
+                                    &decoded[2],
+                                    &decoded[3..],
+                                    &child_fds,
+                                    clients[i].fd,
+                                    listener_fd,
+                                );
+                            }
+                            // parent: fecha as copias dos fds do cliente
+                            for f in clients[i].fds.drain(..) {
+                                let _ = unsafe { close(f) };
+                            }
+                            clients[i].pid = Some(pid);
+                        }
+                        other => {
+                            respond(fd, &format!("ERR unknown command: {:?}\r\n", other));
+                            let _ = unsafe { close(fd) };
+                            clients.remove(i);
+                            continue;
+                        }
+                    }
+                    i += 1;
+                }
+                Err(CommandErr::Partial) => i += 1,
+                Err(CommandErr::Eof) => {
+                    respond(clients[i].fd, "ERR RuntimeError: eof\r\n");
+                    let _ = unsafe { close(clients[i].fd) };
+                    clients.remove(i);
+                }
+                Err(CommandErr::Bad(msg)) => {
+                    respond(clients[i].fd, &format!("ERR RuntimeError: {msg}\r\n"));
+                    let _ = unsafe { close(clients[i].fd) };
+                    clients.remove(i);
+                }
+            }
+        }
+        // children terminados -> STATUS para o cliente (se ainda vivo)
+        let mut i = 0;
+        while i < clients.len() {
+            if let Some(pid) = clients[i].pid {
+                let mut status = 0;
+                let r = unsafe { waitpid(pid, &mut status, WNOHANG) };
+                if r == pid {
+                    respond(clients[i].fd, &format!("STATUS {}\r\n", wait_status_code(status)));
+                    let _ = unsafe { close(clients[i].fd) };
+                    clients.remove(i);
+                    continue;
+                } else if r < 0 {
+                    // ECHILD etc.: defesa — o child nao existe mais
+                    respond(clients[i].fd, "STATUS 0\r\n");
+                    let _ = unsafe { close(clients[i].fd) };
+                    clients.remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Erro no child: espelho do report_child_error — full_message sem highlight
+/// com os frames do proprio daemon embutido cortados (marcador "eval:" — os
+/// snippets gerados pelo calisto rodam com filename "eval"). Se o report
+/// falhar, deixa a VM imprimir (ruby_cleanup TAG_RAISE com o errinfo).
+/// Nunca retorna.
+fn child_error(vm: &calisto_ruby::Ruby, e: calisto_ruby::VALUE) -> ! {
+    vm.set_errinfo(e);
+    let snippet = r#"e = $!
+bt = e.backtrace || []
+cut = bt.index { |l| l.start_with?("eval:") || l =~ /\A[^:]+:in 'Kernel#load'\z/ } || bt.size
+e.set_backtrace(bt[0...cut]) if cut < bt.size
+warn e.full_message(highlight: false, order: :top)"#;
+    if vm.eval(snippet).is_ok() {
+        // errinfo pendente faria o ruby_cleanup re-imprimir o erro
+        vm.set_errinfo(calisto_ruby::Qnil);
+        let _ = vm.cleanup(0);
+        std::process::exit(1);
+    }
+    // report falhou: VM imprime no formato padrao (TAG_RAISE = 6) e sai 1
+    vm.set_errinfo(e);
+    let st = vm.cleanup(6);
+    std::process::exit(st);
+}
+
+/// Corpo do child (RUN/EVAL) — espelho do child_enter + start_child do
+/// server.rb: traps default, stdio do cliente, hygiene de fds, cwd, env do
+/// RUN (ENV.replace), bundler/setup, CALISTO_LOAD_PATH, $0/ARGV, setup_data,
+/// load/eval com semantica de `ruby <script>`/`ruby -e`. Nunca retorna.
+fn child_main(
+    vm: &calisto_ruby::Ruby,
+    is_eval: bool,
+    cwd: &str,
+    env_blob: &str,
+    subject: &str,
+    args: &[String],
+    stdio_fds: &[RawFd],
+    control_fd: RawFd,
+    listener_fd: RawFd,
+) -> ! {
+    // obrigatorio: o VM state da timer thread nao sobrevive ao fork
+    // (mesmo fix que o Process.fork do ruby aplica no child)
+    vm.thread_atfork();
+    unsafe {
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        // dup2 dos fds do cliente; nao fecha os originais (autoclose: false
+        // do dup_into_stdio — o child morre logo, sem vazamento duradouro)
+        for (idx, dst) in [(0usize, 0i32), (1, 1), (2, 2)] {
+            if let Some(fd) = stdio_fds.get(idx) {
+                dup2(*fd, dst);
+            }
+        }
+        close(control_fd);
+        close(listener_fd);
+    }
+    let ccwd = CString::new(cwd).unwrap_or_default();
+    if unsafe { chdir(ccwd.as_ptr()) } != 0 {
+        let e = io::Error::last_os_error();
+        let _ = writeln!(io::stderr(), "calisto: chdir {}: {e}", cwd);
+        unsafe { _exit(1) };
+    }
+    // ENV.replace(env_blob): pares "k=v" separados por \x1e
+    unsafe { clearenv() };
+    for pair in env_blob.split('\u{1e}') {
+        if let Some((k, v)) = pair.split_once('=') {
+            let ck = CString::new(k).unwrap_or_default();
+            let cv = CString::new(v).unwrap_or_default();
+            unsafe { setenv(ck.as_ptr(), cv.as_ptr(), 1) };
+        }
+    }
+    // child_enter: ativacao do Gemfile do cwd (no-op fora de bundle)
+    if let Err(e) = vm.require("bundler/setup") {
+        child_error(vm, e);
+    }
+    // -I do child (calisto test): depois do Bundler.setup (limpa $LOAD_PATH)
+    let loadpath_snippet = r#"if (lp = ENV["CALISTO_LOAD_PATH"])
+  lp.split(":").reject(&:empty?).each do |p|
+    $LOAD_PATH.unshift(p) unless $LOAD_PATH.include?(p)
+  end
+end"#;
+    if let Err(e) = vm.eval(loadpath_snippet) {
+        child_error(vm, e);
+    }
+    // $0/ARGV (sem frames extras: C API)
+    vm.set_gv("$0", vm.str(if is_eval { "-e" } else { subject }));
+    let arg_items: Vec<&str> = args.iter().map(String::as_str).collect();
+    vm.funcall(vm.const_get("ARGV"), "replace", &[vm.ary(&arg_items)]);
+    // sync como o dup_into_stdio (stdout/stderr do cliente)
+    if let Err(e) = vm.eval("$stdout.sync = true if STDOUT.tty?\n$stderr.sync = true if STDERR.tty?") {
+        child_error(vm, e);
+    }
+    // setup_data: DATA/__END__ para RUN com arquivo existente
+    if !is_eval && Path::new(subject).is_file() {
+        vm.set_gv("$calisto_script", vm.str(subject));
+        let snippet = r#"if File.file?($calisto_script)
+  src = File.binread($calisto_script)
+  if src.include?("__END__")
+    require "ripper"
+    line = nil
+    Ripper.lex(src).each { |(l, _c), event, _tok, _st| line = l if event == :on___end__ }
+    if line
+      pos = 0
+      line.times do
+        nl = src.index("\n", pos)
+        pos = nl ? nl + 1 : src.bytesize
+      end
+      io = File.open($calisto_script, "rb")
+      io.seek(pos)
+      Object.const_set(:DATA, io)
+    end
+  end
+end"#;
+        if let Err(e) = vm.eval(snippet) {
+            child_error(vm, e);
+        }
+    }
+    // load / eval: mesma semantica do `ruby <script>` / `ruby -e`
+    let res = if is_eval {
+        vm.eval_main_iseq(subject)
+    } else {
+        vm.load(subject)
+    };
+    match res {
+        Ok(_) => {
+            // exit normal: cleanup(0) com errinfo limpo
+            let st = vm.cleanup(0);
+            std::process::exit(st);
+        }
+        Err(e) if vm.is_system_exit(e) => {
+            // exit n do script: at_exit hooks UMA vez. O STATUS sai do
+            // ERRINFO (SystemExit) — o param do ruby_cleanup e TAG type,
+            // nao status (cleanup(42) viola TAG_FATAL e aborta 134).
+            let st = vm.cleanup(0);
+            std::process::exit(st);
+        }
+        Err(e) => child_error(vm, e),
     }
 }
 
@@ -2241,11 +2932,31 @@ fn cmd_status() -> i32 {
 }
 
 fn stop_daemon_at(dir: &Path) {
-    if let Some(mut s) = daemon_connect_at(dir) {
-        if send_cmd(&mut s, "STOP", &[]).is_ok() {
-            let _ = read_line(&mut s);
+    // O BYE e respondido ANTES do shutdown (unlink do socket) — um stop que
+    // retorna com o socket ainda no ar e uma corrida para quem observa o
+    // resultado (os testes assertam a remocao). Alem disso, o daemon legado
+    // pode descartar a conexao do STOP (recovery de fd invalido no select)
+    // sem processar o comando. Retry + espera: stop significa "daemon
+    // realmente parado e socket removido".
+    for _ in 0..5 {
+        if let Some(mut s) = daemon_connect_at(dir) {
+            if send_cmd(&mut s, "STOP", &[]).is_ok() {
+                let _ = read_line(&mut s);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(400);
+        while dir.join("calisto.sock").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !dir.join("calisto.sock").exists() {
+            return;
         }
     }
+    // Daemon morto/morto demais: remove o socket stale (o proximo run faz o
+    // stale-socket recovery e rebinda sem conflito). Seguro: acabamos de
+    // falhar em conectar 5x.
+    let _ = fs::remove_file(dir.join("calisto.sock"));
+    let _ = fs::remove_file(dir.join("calisto.pid"));
 }
 
 fn cmd_stop() -> i32 {

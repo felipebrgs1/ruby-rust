@@ -33,17 +33,19 @@ melhorias: compilar C exts do zero no build (mkmf) e `calisto doctor`/UX.
 
 ```
 src/main.rs (Rust CLI, zero deps)
-  ├─ include_str! embeds src/daemon/server.rb (Ruby)
+  ├─ include_str! embeds src/daemon/server.rb (Ruby — LEGADO only, rubies sem .so)
   ├─ spawns the daemon: EMBEDDED (Fase L) — o próprio binário calisto com a
   │    VM CRuby in-process (dlopen da libruby.so.<v> via crates/calisto-ruby,
-  │    RTLD_GLOBAL, símbolos por dlsym; `calisto daemon --internal <flags...>
-  │    <daemon.rb>` — sequência do main.c do CRuby: ruby_sysinit →
-  │    ruby_init_stack → ruby_init → ruby_options → ruby_run_node; loadpath
-  │    do stdlib derivado da localização da libruby via dladdr, relocável).
-  │    Fallback legado: spawn de vendor/<v>/bin/ruby quando não há libruby.so
-  │    (rubies pré --enable-shared) ou CALISTO_NO_EMBED=1.
+  │    RTLD_GLOBAL, símbolos por dlsym; `calisto daemon --internal [-r<gem>]`
+  │    — boot via ruby_options(["-e",""]) = process_options completo do CLI;
+  │    accept loop 100% RUST: poll 10ms, recvmsg SCM_RIGHTS, fork por RUN/EVAL,
+  │    waitpid WNOHANG, client-death kill, STOP). Fallback legado: spawn de
+  │    vendor/<v>/bin/ruby rodando server.rb (sem libruby.so ou
+  │    CALISTO_NO_EMBED=1).
   │    daemon: preload stdlib → bind unix socket → accept loop → fork 1 child per RUN
 ```
+
+**`calisto run` flow**: client connects to daemon socket (spawning the daemon on first use) → sends `RUN` with base64 fields (cwd, env, script, args) + its own stdio fds via `SCM_RIGHTS` → daemon `fork()`s a child → child (RUST): `rb_thread_atfork` (obrigatório — a timer thread da VM não sobrevive ao fork e o cleanup pendura), dup2 dos fds, chdir, ENV.replace (clearenv+setenv) → bootstrap Ruby sob rb_protect (`Bundler.setup`, CALISTO_LOAD_PATH, $0/ARGV via C API, setup_data) → RUN: `Kernel#load` (rb_f_load — CWD p/ paths relativos; rb_load C-level resolve só $LOAD_PATH) / EVAL: cadeia iseq do CLI (`rb_parser_new` → `rb_parser_set_context(NULL, TRUE)` → `rb_parser_compile_string_path("-e")` → `rb_iseq_new_main(parent=0)` → `rb_iseq_eval_main`) — backtrace idêntico ao `ruby -e`. Exit: `ruby_cleanup(TAG)` (0 normal / 6 raise; o status do SystemExit sai do errinfo — cleanup(42) viola TAG_FATAL e aborta) → `std::process::exit`.
 
 `**calisto run` flow**: client connects to daemon socket (spawning the daemon on first use) → sends `RUN` with base64 fields (cwd, env, script, args) + its own stdio fds via `SCM_RIGHTS` → daemon `fork()`s a child → child dup2's the fds, chdirs, sets `$0`/`ARGV`, requires `bundler/setup` (no-op fora de Gemfile; ativa o Gemfile do cwd como `bundle exec`), `load`s the script → daemon `waitpid`s and replies `STATUS <code>` → client exits with that code. Child output streams live (real fds, not pipes through the daemon).
 
@@ -140,8 +142,8 @@ cargo test --test ruby_upstream    # just the ruby/ruby parity harness
 | File | Role |
 |---|---|
 |`src/main.rs`|CLI: `run` (`--cold`/`--time`/`--preload LIST`/`-e`), `test` (`--watch`), `task`, `serve` (`-p`/`-o`), `exec`, `repl`, `build` (`-o`/`--root`/`--compile`), `init` (`--force`), `upgrade` (`[version]`), `completions` (bash/zsh), `add`/`remove`/`lock`, `status`, `stop`, `doctor`, `help`; interno: `daemon --internal` (Fase L — daemon embutido, spawnado pelo próprio cliente quando o ruby resolvido tem libruby.so)|
-|`src/daemon/server.rb`|Daemon: preload → bind (handles stale socket `EADDRINUSE`) → detach stdio to `/dev/null` → `RequestReader` (recvmsg não-bloqueante + SCM_RIGHTS) → **accept loop multi-conexão** (select + waitpid WNOHANG; client-death kill por conexão; STOP derruba children) → `child_enter` (bootstrap comum) + `start_child`/`start_child_eval` (fork, `dup_into_stdio`, `setup_data`, `CALISTO_LOAD_PATH`, eval `-e`). **Sem `require "base64"` no boot** (Fase I): decoder hand-rolled (`b64_decode`) — ativar a default gem antes do `Bundler.setup` do child/preload dispararia "already activated" quando o bundle pinar versão diferente (ex.: base64 0.2.0 do 3.4.4 vs 0.3.0 do 3.4.10). Roda embutido (Fase L) ou legado — semântica idêntica |
-| `crates/calisto-ruby/src/lib.rs` | (Fase L) CRuby embedding: dlopen `libruby.so.<v>` (RTLD_NOW\|GLOBAL, símbolos por dlsym — nunca extern link-time), `libruby_path(ruby)` decide embutido vs legado, `Ruby::open` + `run_script` (sequência do main.c: sysinit → init_stack → init → options → run_node; loadpath via dladdr da própria .so) |
+|`src/daemon/server.rb`|Daemon LEGADO (rubies sem libruby.so — ex.: 3.4.4 — ou CALISTO_NO_EMBED=1): preload → bind (stale socket `EADDRINUSE`) → detach → `RequestReader` (recvmsg SCM_RIGHTS) → **accept loop multi-conexão** (select + waitpid WNOHANG; client-death kill TERM→KILL por conexão; STOP derruba children) → `child_enter` + `start_child`/`start_child_eval`. **Sem `require "base64"` no boot** (decoder hand-rolled). Fix Fase L: rescue `Errno::EBADF` no select (fd reaproveitado por outro io — derruba clientes+children e segue; o `calisto stop` do cliente re-tenta) |
+| `crates/calisto-ruby/src/lib.rs` | (Fase L) CRuby embedding: dlopen `libruby.so.<v>` (RTLD_NOW\|GLOBAL, símbolos por dlsym), `libruby_path(ruby)` decide embutido vs legado, `Ruby::open` + `boot` (ruby_sysinit → init_stack → init → `ruby_options(["-e",""])` = boot completo do CLI — prelude/rubygems incluído; `rb_path2class`/`rb_cObject` só depois do init — BSS), `require`/`load` via Kernel (hook do rubygems / rb_f_load — CWD p/ relativo), `eval_main_iseq` (parser → compile "-e" → iseq MAIN → eval_main — sem frames de eval), chamadas protegidas via `rb_protect` + trampolines (Mutex), `thread_atfork`, `cleanup(TAG)` |
 | `crates/calisto-build/src/build.rb` | Bundler: `walk_requires`, BFS collection, `split_end_marker`, gems do Gemfile.lock (pure + nativos `.so` p/ `$calisto_native` + pré-índice), bundle generation with loader |
 | `crates/calisto-build/src/lib.rs` | `bundle(ruby, entry, out, root) -> Result<BundleStats, String>`; parses `BUNDLED <n>` |
 | `scripts/build-ruby.sh` | Pin `RUBY_VERSION` (default 3.4.10; sha conhecido p/ 3.4.4 também), vendored libyaml, `--enable-shared` (Fase L: `lib/libruby.so.<v>` p/ o daemon embutido), `vendor/ruby-<v>/` + symlink `vendor/current` (não troca ao construir versão extra), `CALISTO_REBUILD=1` força rebuild **destrutivo** (rm -rf do prefixo — ver armadilha no fim) |

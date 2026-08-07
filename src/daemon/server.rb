@@ -375,7 +375,24 @@ end
 
 # ---- main loop ---------------------------------------------------------------
 loop do
-  ready = IO.select([$server] + $clients.values.map(&:io), nil, nil, 0.01) || [[], [], []]
+  begin
+    ready = IO.select([$server] + $clients.values.map(&:io), nil, nil, 0.01) || [[], [], []]
+  rescue Errno::EBADF
+    # fd invalido no set (numero de fd reaproveitado por outro io — o objeto
+    # Ruby nao sabe que o fd foi fechado por baixo). O cliente afetado e
+    # irrecuperavel: derruba clientes + children e segue — melhor perder
+    # conexoes ativas do que o daemon inteiro (o cliente stop re-tenta).
+    $children.each_value do |c|
+      _, status = kill_child(c.pid)
+      next unless status
+      code = status.exitstatus || (128 + (status.termsig || 0))
+      respond(c.io, "STATUS #{code}\r\n") rescue nil
+    end
+    $children.clear
+    $clients.each_value { |c| c.io.close rescue nil }
+    $clients.clear
+    retry
+  end
   readables = ready[0] || []
 
   if readables.include?($server)
