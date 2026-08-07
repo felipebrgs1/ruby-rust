@@ -80,9 +80,21 @@ fi
 RUBY_TARBALL="$SRC/ruby-${RUBY_VERSION}.tar.gz"
 fetch "$RUBY_URL" "$RUBY_TARBALL" "$RUBY_SHA256"
 
-if [[ -x "$PREFIX/bin/ruby" ]]; then
-  log "already built: $PREFIX/bin/ruby"
+if [[ -x "$PREFIX/bin/ruby" && "${CALISTO_REBUILD:-0}" != "1" ]]; then
+  log "already built: $PREFIX/bin/ruby (CALISTO_REBUILD=1 forca rebuild)"
 else
+  # Rebuild FORCADO e destrutivo: o prefixo antigo precisa sumir ANTES do
+  # make. O passo de instalacao das default gems com C ext roda durante o
+  # `make` com o ruby JA INSTALADO; com um bin/ruby stale (build anterior,
+  # ex.: static) no prefixo, as exts saem nos dirs da api antiga
+  # (extensions/.../<ver>-static/) e specs "regulares" orfaos das default
+  # gems — o rubygems passa a "Ignoring <gem> because its extensions are
+  # not built" no boot do daemon. Prefixo limpo => o passo usa o miniruby
+  # do build atual e grava no dir de api correto.
+  if [[ "${CALISTO_REBUILD:-0}" == "1" ]]; then
+    log "rebuild forcado: removendo $PREFIX"
+    rm -rf "$PREFIX"
+  fi
   log "extracting ruby $RUBY_VERSION"
   rm -rf "$SRC/ruby-$RUBY_VERSION"
   tar -xzf "$RUBY_TARBALL" -C "$SRC"
@@ -91,6 +103,7 @@ else
   ( cd "$SRC/ruby-$RUBY_VERSION" \
     && ./configure \
         --prefix="$PREFIX" \
+        --enable-shared \
         --disable-install-doc \
         --quiet )
 

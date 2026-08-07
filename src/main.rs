@@ -122,6 +122,9 @@ fn main() {
         Some("add") => cmd_bundle_wrapper("add", &argv[1..]),
         Some("remove") => cmd_bundle_wrapper("remove", &argv[1..]),
         Some("lock") => cmd_bundle_wrapper("lock", &argv[1..]),
+        // interno (Fase L): spawnado pelo proprio cliente quando o ruby
+        // resolvido tem libruby.so — roda o daemon com a VM embutida
+        Some("daemon") => cmd_daemon(&argv[1..]),
         Some("status") => cmd_status(),
         Some("stop") => cmd_stop(),
         Some("doctor") => cmd_doctor(),
@@ -395,12 +398,31 @@ fn connect_or_spawn_daemon_in(
     fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let rb = dir.join("calisto.rb");
     fs::write(&rb, DAEMON_RB).map_err(|e| format!("cannot write daemon script: {e}"))?;
-    let mut cmd = Command::new(ruby);
-    // flags ANTES do script: `ruby -r... <daemon.rb>` — depois do script seria
-    // ARGV do daemon, nao flag do interpretador
-    cmd.args(flags)
-        .arg(&rb)
-        .env("CALISTO_SOCKET", &sock)
+    // Fase L: com libruby.so disponivel o daemon roda EMBUTIDO — o proprio
+    // binario calisto vira o processo do daemon (VM in-process via dlopen),
+    // sem spawnar o interpretador externo. CALISTO_NO_EMBED=1 força o modo
+    // legado (spawn `ruby <daemon.rb>`) — ex.: rubies antigos sem .so, ou
+    // debug. flags sao repassadas ao ruby_options em ambos os modos
+    // (`-rbundler/setup` antes do script continua sendo flag de verdade).
+    let embedded = env::var_os("CALISTO_NO_EMBED").is_none() && calisto_ruby::libruby_path(ruby).is_some();
+    let mut cmd = if embedded {
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("cannot resolve own executable: {e}"))?;
+        let mut c = Command::new(exe);
+        c.arg("daemon")
+            .arg("--internal")
+            .args(flags)
+            .arg(&rb)
+            .env("CALISTO_EMBED_RUBY", ruby);
+        c
+    } else {
+        let mut c = Command::new(ruby);
+        // flags ANTES do script: `ruby -r... <daemon.rb>` — depois do script seria
+        // ARGV do daemon, nao flag do interpretador
+        c.args(flags).arg(&rb);
+        c
+    };
+    cmd.env("CALISTO_SOCKET", &sock)
         .env("CALISTO_PIDFILE", dir.join("calisto.pid"))
         .env("CALISTO_PRELOAD", preload)
         .stdin(Stdio::null());
@@ -461,6 +483,32 @@ fn connect_or_spawn_app_daemon_in(
             cmd.env(k, v);
         }
     })
+}
+
+/// Uso interno (Fase L): `calisto daemon --internal [flags...] <script>` —
+/// roda o script com o CRuby EMBUTIDO (libruby dlopen'd pelo
+/// calisto_ruby::Ruby::open), sem spawnar o interpretador externo.
+/// Spawnado pelo proprio cliente quando o ruby resolvido tem libruby.so;
+/// `CALISTO_EMBED_RUBY` aponta esse ruby (para achar a .so). O restante do
+/// argv e repassado como argv do `ruby` (flags como `-rbundler/setup`
+/// primeiro, script por ultimo) — ruby_options + ruby_run_node dao $0,
+/// ARGV, at_exit e exit code iguais aos do modo legado.
+fn cmd_daemon(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) != Some("--internal") {
+        eprintln!("calisto daemon: uso interno: calisto daemon --internal [flags...] <script>");
+        return 1;
+    }
+    let Some(ruby) = env::var_os("CALISTO_EMBED_RUBY") else {
+        eprintln!("calisto daemon: CALISTO_EMBED_RUBY nao definido (uso interno)");
+        return 1;
+    };
+    match calisto_ruby::Ruby::open(Path::new(&ruby)) {
+        Err(e) => {
+            eprintln!("calisto daemon: {e}");
+            1
+        }
+        Ok(vm) => vm.run_script(&args[1..]),
+    }
 }
 
 // ---- commands -----------------------------------------------------------------

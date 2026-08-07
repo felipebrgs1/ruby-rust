@@ -110,26 +110,43 @@ Crates esboçados (ainda vazios): `calisto-{test,task,serve,sqlite,tooling}`.
 Hoje o daemon é `spawn vendor/ruby server.rb`. Esta fase move o daemon para
 **dentro do binário calisto**, com a VM CRuby inicializada in-process.
 
-- [ ] **L.1 — build compartilhado**: `scripts/build-ruby.sh` ganha
-      `--enable-shared` → `vendor/ruby-<v>/lib/libruby.so.3.4`. Rubies
-      antigos (sem .so) continuam válidos: fallback para o spawn externo
-      atual (modo legado), detectado em runtime.
-- [ ] **L.2 — crate `crates/calisto-ruby`**: bindings FFI hand-rolled
+- [x] **L.1 — build compartilhado**: `scripts/build-ruby.sh` ganha
+      `--enable-shared` → `vendor/ruby-<v>/lib/libruby.so.3.4.10` (mais
+      symlinks `.so.3.4`/`.so`). Rubies antigos (sem .so) continuam válidos:
+      fallback para o spawn externo atual (modo legado), detectado em
+      runtime. `CALISTO_REBUILD=1` força rebuild **destrutivo** (rm -rf do
+      prefixo) — sem isso, o `make` roda o passo de instalação das default
+      gems com o bin/ruby stale ainda no prefixo e grava as exts no dir de
+      api da build antiga (`extensions/.../<ver>-static/`) + specs
+      "regulares" órfãos → rubygems passa a "Ignoring <gem> because its
+      extensions are not built" no boot do daemon (bug real encontrado no
+      rebuild in-place; o warning quebrou o teste de paridade de backtrace
+      do `-e`).
+- [x] **L.2 — crate `crates/calisto-ruby`**: bindings FFI hand-rolled
       (zero deps, convenção do repo) via **dlopen** — carrega a
       `libruby.so.<v>` do ruby resolvido pela Fase I (multi-versão continua
-      funcionando: cada versão tem sua .so). Superfície mínima:
-      `ruby_init`/`ruby_setup`/`ruby_init_loadpath`, `rb_protect`,
-      `rb_eval_string_protect`, `rb_load_protect`, `rb_funcall`,
-      `rb_intern`, `rb_errinfo`/`rb_set_errinfo`, `ruby_cleanup`.
-      Estado de erro sempre via `rb_protect` + `state` (nunca longjmp sem
-      proteção — pânico/abort em Rust seria corrupção).
-- [ ] **L.3 — daemon in-process**: subcomando interno
-      `calisto daemon --internal <dir>` (spawnado pelo cliente como hoje,
-      mesmo socket/protocolo RESP — client não muda). A VM boota in-process;
-      o preload stdlib e o entrypoint da app rodam via `rb_load_protect`.
-      Elimina o boot do interpretador no spawn do daemon e a dependência do
-      executável `vendor/current/bin/ruby` (a lib tree continua necessária:
-      stdlib .rb/.so).
+      funcionando: cada versão tem sua .so; prefere o SONAME mais específico
+      `libruby.so.3.4.10`). Símbolos resolvidos por **dlsym** (nunca extern
+      link-time — o binário calisto não ganha dependência de link da
+      libruby), `RTLD_NOW | RTLD_GLOBAL` (C extensions dos children resolvem
+      `rb_*` contra a libruby — o que o executável ruby exportava no modo
+      legado). Superfície: `ruby_sysinit`/`ruby_init_stack`/`ruby_init`/
+      `ruby_options`/`ruby_run_node` + `rb_protect`/`rb_eval_string_protect`/
+      `rb_load_protect`/`rb_errinfo`/`rb_set_errinfo`/`rb_intern`/
+      `rb_funcall`/`rb_str_new_cstr`/`rb_string_value_cstr`/`rb_gc_start`
+      (as de proteção ficam para L.4).
+- [x] **L.3 — daemon in-process**: subcomando interno
+      `calisto daemon --internal <flags...> <daemon.rb>` — o cliente spawna
+      o **próprio binário** (`current_exe`) quando o ruby resolvido tem
+      libruby.so; o daemon dlopen'a e roda a VM com a sequência do `main.c`
+      do CRuby (`ruby_sysinit` → `ruby_init_stack` → `ruby_init` →
+      `ruby_options` → `ruby_run_node`): flags (`-rbundler/setup`), script,
+      $0/ARGV, at_exit e exit codes idênticos ao modo legado. O loadpath do
+      stdlib vem da localização da própria libruby via dladdr
+      (LOAD_RELATIVE no Linux) — relocável por design, sem depender do
+      executável `vendor/current/bin/ruby`. Socket/protocolo/env
+      (CALISTO_SOCKET/PIDFILE/PRELOAD/APP_PRELOAD) inalterados — server.rb
+      não mudou. `CALISTO_NO_EMBED=1` força o modo legado (fallback).
 - [ ] **L.4 — accept loop em Rust**: `select`/`poll` + `fork` no Rust
       (substitui o `select` + `waitpid WNOHANG` do server.rb); `child_enter`
       vira Rust (dup2 dos fds SCM_RIGHTS, chdir, setenv do env_blob) + um
@@ -143,11 +160,19 @@ Hoje o daemon é `spawn vendor/ruby server.rb`. Esta fase move o daemon para
       partir do daemon Ruby). Signal handling: o CRuby instala traps no
       `ruby_init` — o daemon Rust restaura o que precisa (SIGPIPE já é
       tratado; revisar SIGCHLD/SIGINT).
-- Marco: suíte inteira verde com o daemon in-process (paridade cold/warm
-  intacta), `calisto run -e 'puts 1+1'` quente ≤ **25ms** (hoje 36ms),
-  spawn do daemon frio ~40–80ms mais rápido (sem exec do interpretador), e
-  modo legado (ruby sem .so) provado por um teste que força
-  `CALISTO_NO_EMBED=1`. Golden Maybe/Chatwoot verde sem mudança de fixture.
+- Marco (L.1–L.3) ✅: suíte inteira verde (15 targets, 0 falhas — paridade
+  cold/warm, app daemon com `-rbundler/setup`, daemon de teste
+  RAILS_ENV=test, versions com 3.4.4 no modo legado natural); `calisto
+  run -e 'puts 1+1'` quente **37ms**; o processo do daemon É o binário
+  calisto (teste lê o pidfile → `/proc/<pid>/exe` == calisto) e
+  `CALISTO_NO_EMBED=1` prova o modo legado (exe == `bin/ruby`) —
+  `test/daemon.rs` (2 testes novos). Spawn do daemon (1º comando):
+  180ms nos dois modos — dominado pelo preload stdlib, o ganho do embed é
+  o exec do interpretador (~10ms); o valor real é arquitetural (M/N/P
+  dependem dele). Golden Maybe/Chatwoot não re-rodados (checkouts
+  gitignored + bundle instalado sob a build antiga) — a suíte hermética
+  cobre a semântica; re-rodar `bundle install` nos fixtures e os goldens
+  fica para o ciclo realapps da Fase L.4.
 - Risco: dlopen de libruby exige símbolos estáveis — travar na ABI
   `libruby.so.3.4` por série (3.4.x), como o nome do arquivo já indica.
 - Estimativa: 3–4 semanas (é a fundação; L.1–L.3 entregam valor sem L.4,

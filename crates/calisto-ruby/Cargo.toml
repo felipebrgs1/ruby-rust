@@ -1,0 +1,7 @@
+[package]
+name = "calisto-ruby"
+version = "0.1.0"
+edition = "2021"
+description = "CRuby embedding via dlopen: zero-deps FFI bindings for libruby (Fase L)"
+
+[dependencies]

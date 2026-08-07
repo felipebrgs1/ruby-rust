@@ -8,10 +8,11 @@ description = "A Bun-like runtime for Ruby: pinned CRuby 3.4 + fork-based fast s
 # independente (build/test isolados), agregado pelo binario calisto-cli.
 # Members entram aqui quando cada crate ganhar Cargo.toml.
 [workspace]
-members = ["crates/calisto-build"]
+members = ["crates/calisto-build", "crates/calisto-ruby"]
 
 [dependencies]
 calisto-build = { path = "crates/calisto-build" }
+calisto-ruby = { path = "crates/calisto-ruby" }
 
 [[bin]]
 name = "calisto"

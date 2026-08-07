@@ -149,3 +149,47 @@ fn pipeline_does_not_hang() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("exploded"));
     stop(&dir);
 }
+
+/// Fase L: o daemon roda EMBUTIDO (VM in-process via dlopen da libruby) —
+/// o processo do daemon e o proprio binario calisto, nao um ruby externo.
+#[test]
+fn daemon_runs_embedded_in_process() {
+    let dir = runtime_dir("embed");
+    let out = run(&dir, &["run", "-e", "puts RUBY_VERSION"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3.4.10");
+
+    // o daemon vivo e o binario calisto (pidfile -> /proc/<pid>/exe)
+    let pid = std::fs::read_to_string(dir.join("calisto.pid")).expect("pidfile");
+    let pid = pid.trim().parse::<u32>().expect("pid numerico");
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).expect("exe do daemon");
+    let bin = std::fs::canonicalize(BIN).expect("binario calisto");
+    assert_eq!(exe, bin, "daemon deve ser o proprio calisto (embutido)");
+    stop(&dir);
+}
+
+/// Fase L: CALISTO_NO_EMBED=1 forca o modo legado (spawn do ruby externo) —
+/// fallback para rubies sem libruby.so (ex.: builds pre --enable-shared).
+#[test]
+fn daemon_legacy_fallback_with_no_embed() {
+    let dir = runtime_dir("embedlegacy");
+    let out = run_opt(
+        &dir,
+        RunOpts {
+            args: &["run", "-e", "puts RUBY_VERSION"],
+            env: &[("CALISTO_NO_EMBED", "1")],
+            stdin: None,
+            cwd: None,
+            timeout: 30,
+        },
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3.4.10");
+
+    let pid = std::fs::read_to_string(dir.join("calisto.pid")).expect("pidfile");
+    let pid = pid.trim().parse::<u32>().expect("pid numerico");
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).expect("exe do daemon");
+    let exe = exe.to_string_lossy().into_owned();
+    assert!(exe.contains("/bin/ruby"), "daemon legado deve ser o ruby externo: {exe}");
+    stop(&dir);
+}

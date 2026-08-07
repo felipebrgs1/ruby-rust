@@ -7,8 +7,13 @@ name = "calisto"
 version = "0.1.0"
 dependencies = [
  "calisto-build",
+ "calisto-ruby",
 ]
 
 [[package]]
 name = "calisto-build"
+version = "0.1.0"
+
+[[package]]
+name = "calisto-ruby"
 version = "0.1.0"
