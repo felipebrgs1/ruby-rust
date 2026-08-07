@@ -9,10 +9,9 @@ Bundler), Fase B (preload de app), Fase C (Rails mínimo), Fase D completa
 (escada real: Sinatra → Rails → Maybe Finance/Sidekiq → Chatwoot/API+ActionCable)
 e **Fase E completa** (test/task/serve/.env/watch; daemon multi-conexão — o
 risco conhecido do accept loop single-connection foi resolvido) do ROADMAP.md
-done. O roadmap agora mira **Fase F** — `calisto build --compile` com gems
-(pure-Ruby embutidas; C exts = item "década"). Fica da Fase E: golden de uma
-suíte rspec real (Maybe usa minitest na prática; detecção `.rspec`/`spec/`
-testada, fixture rspec de verdade ainda não).
+done. Golden rspec real validado no Chatwoot (119 examples: frio 5.0s → quente
+0.70s, 7.2×). O roadmap agora mira **Fase F** — `calisto build --compile` com
+gems (pure-Ruby embutidas; C exts = item "década").
 
 ## Architecture & Data Flow
 
@@ -136,3 +135,8 @@ Coverage contract:
 - `testcmd.rs` — **Fase E (test/task/serve/.env)**: `calisto test` hermético no preloadapp (boot 2s pago UMA vez no daemon de teste; suite de 2 arquivos — um com sleep 0.6s — <1s quente, provando paralelismo de arquivos via accept loop multi-conexão; contador de boot == 1); teste falhando → exit 1; sem testes → erro claro; detecção rspec via `.rspec`/`spec/`; **golden railsapp** (minitest, gated em bundle install): `calisto test` 2 arquivos <1s quente e o teste `rails_env_test.rb` prova `Rails.env == "test"` (daemon de teste com RAILS_ENV=test no boot — o daemon dev deixaria "development"); `.env` warm == cold (paridade), aspas/`export`/não-sobrescreve; `calisto task db:migrate` idempotente e quente (<1s; limpa db/schema.rb do fixture no fim); `calisto serve` GET /up → 200 com o daemon CONTINUANDO a servir `runner` enquanto o server roda (multi-conexão).
 
 QA rule of thumb: for any change to `run` semantics, the acceptance test is `cold_and_warm_agree` plus the upstream parity harness — if pure `ruby` and calisto diverge, it's a bug in calisto.
+
+## Armadilhas conhecidas do ambiente
+
+- **Bundler restart por shebang**: o ruby 3.4.10 embute bundler 2.6.9; app cujo `Gemfile.lock` pina outra versão (ex.: Chatwoot locka 2.5.16) dispara `Bundler::SelfManager#restart_with_locked_bundler_if_needed` no `require 'bundler/setup'` frio — o bundler re-executa o processo via shebang `#!/usr/bin/env ruby` e **precisa de `ruby` no PATH** (senão: `env: 'ruby': No such file`). O daemon warm não é afetado (o restart acontece no boot do daemon, que não tem shebang; o child herda o bundler já ativo). `calisto run --cold bin/rails ...` num app com bundler divergente exige `PATH` com o ruby pinado.
+- **Shell persistente**: `export RAILS_ENV=test`/`POSTGRES_*` no shell do dev vaza para o `cargo test` (o teste `rails_console_runs_in_app_context` espera `development` e quebra). Rodar a suíte com o ambiente limpo.

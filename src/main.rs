@@ -810,8 +810,18 @@ fn cmd_test(args: &[String]) -> i32 {
         });
         for pat in &filters {
             let p = Path::new(pat);
-            if p.is_file() && !files.contains(&p.to_path_buf()) {
-                files.push(p.to_path_buf());
+            if p.is_file() {
+                // arquivo explicito: resolve contra o root para dedup com o
+                // descoberto (que e absoluto) — um pat relativo nao deve
+                // adicionar o mesmo arquivo duas vezes
+                let abs = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    root.join(p)
+                };
+                if !files.contains(&abs) {
+                    files.push(abs);
+                }
             }
         }
     }

@@ -37,7 +37,7 @@ Crates esboçados (ainda vazios): `calisto-{test,task,serve,sqlite,tooling}`.
 - [x] `calisto task` — rake no daemon quente (`calisto task db:migrate`)
 - [x] `calisto serve` — HTTP (rackup/rack handler) como child do fork
 - [x] `.env` loading (no cliente: spawn do daemon, env_blob do RUN e `--cold` herdam)
-- Marco: `calisto test` roda a suíte do `railsapp` (minitest) **<1s total, <500ms/arquivo**; `calisto task db:migrate` idempotente no daemon. Fica: golden de uma suíte rspec real (o Maybe usa minitest na prática; a detecção `.rspec`/`spec/*_spec.rb` está testada, falta um fixture rspec de verdade)
+- Marco: `calisto test` roda a suíte do `railsapp` (minitest) **<1s total, <500ms/arquivo**; `calisto task db:migrate` idempotente no daemon. **Golden rspec real validado no Chatwoot** (119 examples em `account`+`user`+`label_spec`): `bundle exec rspec` frio **5006ms** → `calisto test` quente **698ms (7.2×)**, 1ª execução (com boot) 2509ms — os 3 arquivos rodam em paralelo via accept loop multi-conexão. Nota: o Chatwoot locka bundler 2.5.16 e o ruby 3.4.10 embute 2.6.9 — o `require 'bundler/setup'` frio dispara `Bundler::SelfManager#restart_with_locked_bundler_if_needed`, que re-executa o processo via shebang (precisa de ruby no PATH); o daemon warm não é afetado (o restart acontece no boot sem shebang, o child herda o bundler ativo)
 
 ### Fase F — build --compile com gems
 - [ ] gems **pure-Ruby** embutidas no bundle (o loader já intercepta `require`)

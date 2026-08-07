@@ -87,9 +87,36 @@ fn minitest_runs_warm_with_frozen_boot() {
 }
 
 #[test]
+fn filter_does_not_duplicate_files() {
+    // Filtro com caminho relativo (ex.: `calisto test test/foo_test.rb`) deve
+    // casar com o arquivo descoberto (absoluto) SEM duplica-lo — o summary
+    // mostra o arquivo UMA vez (regressao achada no comparativo do chatwoot).
+    let dir = runtime_dir("testfilter");
+    let app = fixture("preloadapp");
+    let bc = dir.join("boot_count");
+    let env = [("BOOT_COUNT_FILE", bc.to_str().unwrap())];
+    let out = run_opt(
+        &dir,
+        RunOpts {
+            args: &["test", "test/boot_state_test.rb"],
+            env: &env,
+            stdin: None,
+            cwd: Some(&app),
+            timeout: 60,
+        },
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("1 arquivo(s) de teste"), "{out}");
+    stop_app(&dir, "preloadapp");
+}
+
+#[test]
 fn failing_test_exits_nonzero() {
     let dir = runtime_dir("testfail");
     let app = fixture("preloadapp");
+    let bc = dir.join("boot_count");
+    let env = [("BOOT_COUNT_FILE", bc.to_str().unwrap())];
     let failing = dir.join("failing_test.rb");
     std::fs::write(
         &failing,
@@ -100,7 +127,7 @@ fn failing_test_exits_nonzero() {
         &dir,
         RunOpts {
             args: &["test", failing.to_str().unwrap()],
-            env: &[],
+            env: &env,
             stdin: None,
             cwd: Some(&app),
             timeout: 60,
@@ -194,12 +221,14 @@ fn dotenv_loaded_warm_and_cold_with_parity() {
     // sobrescrita.
     let dir = runtime_dir("testenv");
     let app = fixture("preloadapp");
+    let bc = dir.join("boot_count");
+    let env = [("BOOT_COUNT_FILE", bc.to_str().unwrap())];
     let env_check = ["run", "env_check.rb"];
     let env_check_cold = ["run", "--cold", "env_check.rb"];
 
     let warm = run_opt(
         &dir,
-        RunOpts { args: &env_check, env: &[], stdin: None, cwd: Some(&app), timeout: 60 },
+        RunOpts { args: &env_check, env: &env, stdin: None, cwd: Some(&app), timeout: 60 },
     );
     assert!(warm.status.success(), "{}", String::from_utf8_lossy(&warm.stderr));
     let warm_out = String::from_utf8_lossy(&warm.stdout);
@@ -209,7 +238,7 @@ fn dotenv_loaded_warm_and_cold_with_parity() {
 
     let cold = run_opt(
         &dir,
-        RunOpts { args: &env_check_cold, env: &[], stdin: None, cwd: Some(&app), timeout: 30 },
+        RunOpts { args: &env_check_cold, env: &env, stdin: None, cwd: Some(&app), timeout: 30 },
     );
     assert!(cold.status.success(), "{}", String::from_utf8_lossy(&cold.stderr));
     assert_eq!(
@@ -223,7 +252,7 @@ fn dotenv_loaded_warm_and_cold_with_parity() {
         &dir,
         RunOpts {
             args: &env_check_cold,
-            env: &[("CALISTO_DOTENV", "override")],
+            env: &[("BOOT_COUNT_FILE", bc.to_str().unwrap()), ("CALISTO_DOTENV", "override")],
             stdin: None,
             cwd: Some(&app),
             timeout: 30,
