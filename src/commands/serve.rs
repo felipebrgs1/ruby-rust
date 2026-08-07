@@ -112,5 +112,5 @@ pub fn cmd_serve(args: &[String]) -> i32 {
         ("CALISTO_SERVE_PORT", port.as_str()),
         ("CALISTO_SERVE_HOST", host.as_str()),
     ];
-    run_request_full(&mut stream, &root.to_string_lossy(), &extra, &launcher.to_string_lossy(), &[])
+    run_request_full(&mut stream, &root.to_string_lossy(), &extra, &launcher.to_string_lossy(), &[], &crate::commands::run::RunFlags::default())
 }

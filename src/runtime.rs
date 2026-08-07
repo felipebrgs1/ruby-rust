@@ -57,9 +57,20 @@ pub fn runtime_dir() -> PathBuf {
 
 
 
-/// Dir que contem `vendor/` (subindo do proprio executavel, mesma busca do
-/// ruby_path antigo) — a base dos rubies empacotados.
+/// Dir que contem `vendor/` — a base dos rubies empacotados (Fase Q.3).
+/// Ordem: `CALISTO_HOME` (instalacao portatil do curl|sh — `~/.calisto`,
+/// vendor la dentro; se apontar para um dir sem vendor, o resolve_ruby erra
+/// com a mensagem de build — a instalacao esta quebrada) > busca subindo do
+/// proprio executavel (comportamento de checkout/desenvolvimento — o
+/// binario vive em target/debug e o vendor na raiz do repo) > `vendor`
+/// relativo ao cwd (fallback historico).
 pub fn vendor_root() -> Option<PathBuf> {
+    if let Ok(home) = env::var("CALISTO_HOME") {
+        let v = PathBuf::from(&home).join("vendor");
+        if !home.is_empty() {
+            return Some(v);
+        }
+    }
     let mut dir = env::current_exe().ok()?.parent().map(Path::to_path_buf);
     while let Some(d) = dir {
         if d.join("vendor").is_dir() {

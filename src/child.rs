@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::os::fd::{RawFd};
 use std::ffi::{c_char, c_int, CString};
+use std::env;
 use crate::daemon::*;
 
 
@@ -59,6 +60,77 @@ warn e.full_message(highlight: false, order: :top)"#;
 
 
 
+fn ruby_str_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+
+
+/// -w / -W<n>: $VERBOSE true/nil/false (semantica do ruby — -W0 silencia).
+fn apply_run_verbose(vm: &calisto_ruby::Ruby, verbose: Option<i8>) {
+    match verbose {
+        Some(-1) | Some(2) => vm.set_gv("$VERBOSE", calisto_ruby::Qtrue),
+        Some(0) => vm.set_gv("$VERBOSE", calisto_ruby::Qnil),
+        Some(1) => vm.set_gv("$VERBOSE", calisto_ruby::Qfalse),
+        _ => {}
+    }
+}
+
+
+
+/// -E enc[:enc2]: default_external (e default_internal). Best-effort por
+/// design (o roadmap marca a paridade via Encoding.default_*=*).
+fn apply_run_encoding(vm: &calisto_ruby::Ruby, enc: &str) -> Result<(), calisto_ruby::VALUE> {
+    let (ext, int) = match enc.split_once(':') {
+        Some((e, i)) => (e, Some(i)),
+        None => (enc, None),
+    };
+    let mut snippet = format!("Encoding.default_external = Encoding.find({})", ruby_str_literal(ext));
+    if let Some(i) = int {
+        snippet.push_str(&format!("\nEncoding.default_internal = Encoding.find({})", ruby_str_literal(i)));
+    }
+    vm.eval(&snippet).map(|_| ())
+}
+
+
+
+/// -c: compila o subject (arquivo ou codigo -e) sem executar. Err =
+/// SyntaxError pendente (o child_error imprime no formato do ruby 3.4:
+/// "path:1: syntax errors found (SyntaxError)" + frame do codigo).
+fn syntax_check(vm: &calisto_ruby::Ruby, is_eval: bool, subject: &str) -> Result<(), calisto_ruby::VALUE> {
+    let klass = match vm.eval("RubyVM::InstructionSequence") {
+        Ok(k) => k,
+        Err(e) => return Err(e),
+    };
+    if is_eval {
+        // compile(source, file, path, line) — backtrace idem `ruby -c -e`
+        vm.funcall_protected(
+            klass,
+            "compile",
+            &[vm.str(subject), vm.str("-e"), vm.str("-e"), calisto_ruby::fixnum(1)],
+        )
+        .map(|_| ())
+    } else {
+        // compile_file lida com __END__/DATA (o parser para no marcador)
+        vm.funcall_protected(klass, "compile_file", &[vm.str(subject)]).map(|_| ())
+    }
+}
+
+
+
 /// Corpo do child (RUN/EVAL) — espelho do child_enter + start_child do
 /// server.rb: traps default, stdio do cliente, hygiene de fds, cwd, env do
 /// RUN (ENV.replace), bundler/setup, CALISTO_LOAD_PATH, $0/ARGV, setup_data,
@@ -106,6 +178,45 @@ pub fn child_main(
             unsafe { setenv(ck.as_ptr(), cv.as_ptr(), 1) };
         }
     }
+    // Fase R: flags ruby do child (-I/-r/-w/-W/-c/-E) — via CALISTO_RUN_FLAGS
+    // no env_blob (sem mudanca de protocolo; daemons antigos ignoram). A var
+    // e removida do env do child ANTES do script (so o calisto le).
+    let run_flags = crate::commands::run::RunFlags::parse(
+        &env::var("CALISTO_RUN_FLAGS").unwrap_or_default(),
+    );
+    env::remove_var("CALISTO_RUN_FLAGS");
+    apply_run_verbose(vm, run_flags.verbose);
+    if let Some(enc) = &run_flags.encoding {
+        // -E: paridade com o ruby (erro de encoding sobe ANTES do -c, como o
+        // process_options do CLI — o -E e processado em qualquer ordem).
+        // Report limpo (one-liner como `ruby -E bogus`) — o full_message com
+        // backtrace cortado re-atribui o erro ao frame atual (confunde).
+        if let Err(e) = apply_run_encoding(vm, enc) {
+            eprintln!("calisto: {} ({})", vm.message(e), vm.classname(e));
+            vm.set_errinfo(calisto_ruby::Qnil);
+            let _ = vm.cleanup(0);
+            std::process::exit(1);
+        }
+    }
+    if run_flags.syntax_check {
+        // -c: syntax check (como `ruby -c`) — compila e sai 0/1 SEM executar;
+        // pula bundler/setup e requires (o ruby -c nao roda os -r).
+        // Report: e.message do SyntaxError — o full_message com backtrace de
+        // frame interno re-atribui o erro ao local atual (confunde).
+        match syntax_check(vm, is_eval, subject) {
+            Ok(_) => {
+                let _ = vm.eval("puts \"Syntax OK\"");
+                let st = vm.cleanup(0);
+                std::process::exit(st);
+            }
+            Err(e) => {
+                eprintln!("{}", vm.message(e));
+                vm.set_errinfo(calisto_ruby::Qnil);
+                let _ = vm.cleanup(0);
+                std::process::exit(1);
+            }
+        }
+    }
     // child_enter: ativacao do Gemfile do cwd (no-op fora de bundle)
     if let Err(e) = vm.require("bundler/setup") {
         child_error(vm, e);
@@ -122,6 +233,16 @@ if (d = $calisto_native_dir)
 end"#;
     if let Err(e) = vm.eval(loadpath_snippet) {
         child_error(vm, e);
+    }
+    // Fase R: -I dirs (reversos — unshift na frente preserva a ordem do
+    // `-I a -I b` do ruby: [a, b] no topo), -E e -r depois do Bundler.setup
+    for d in run_flags.load_paths.iter().rev() {
+        vm.funcall(vm.get_gv("$LOAD_PATH"), "unshift", &[vm.str(d)]);
+    }
+    for lib in &run_flags.requires {
+        if let Err(e) = vm.require(lib) {
+            child_error(vm, e);
+        }
     }
     // $0/ARGV: $0 NAO pode ser setado com o setter original do CRuby — o
     // setter (set_arg0 -> setproctitle) reescreve argv/env in-place com um

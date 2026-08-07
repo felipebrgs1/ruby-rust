@@ -81,6 +81,10 @@ name = "native"
 path = "test/native.rs"
 
 [[test]]
+name = "runflags"
+path = "test/runflags.rs"
+
+[[test]]
 name = "realapps"
 path = "test/realapps.rs"
 

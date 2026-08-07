@@ -315,6 +315,39 @@ def child_enter(io, reader, cwd, env_blob)
     i = kv.index("=") and [kv[0...i], kv[(i + 1)..]]
   end
   ENV.replace(env_pairs.to_h)
+  # Fase R: flags ruby do child (-I/-r/-w/-W/-c/-E) — espelho do child.rs
+  # embutido. CALISTO_RUN_FLAGS vem no env_blob do RUN (sem mudanca de
+  # protocolo); removida do env antes do script.
+  $calisto_check = false
+  $calisto_run_iflags = nil
+  $calisto_run_requires = nil
+  if (blob = ENV.delete("CALISTO_RUN_FLAGS"))
+    blob.split("\u001f").each do |seg|
+      if seg == "w"
+        $VERBOSE = true
+      elsif seg.start_with?("W:")
+        $VERBOSE = { "0" => nil, "1" => false, "2" => true }[seg[2..]]
+      elsif seg == "c"
+        $calisto_check = true
+      elsif seg.start_with?("E:")
+        begin
+          ext, int = seg[2..].split(":", 2)
+          Encoding.default_external = Encoding.find(ext)
+          Encoding.default_internal = Encoding.find(int) if int
+        rescue SystemExit
+          raise
+        rescue Exception => e # rubocop:disable Lint/RescueException -- one-liner como `ruby -E bogus`
+          warn "#{e.class}: #{e.message}"
+          exit 1
+        end
+      elsif seg.start_with?("I:")
+        ($calisto_run_iflags ||= []) << seg[2..]
+      elsif seg.start_with?("r:")
+        ($calisto_run_requires ||= []) << seg[2..]
+      end
+    end
+  end
+  return if $calisto_check # -c: pula bundler/setup (ruby -c nao roda requires)
   require "bundler/setup"
   # -I do child: usado por `calisto test` para `require "test_helper"` /
   # `require "rails_helper"` funcionar sem o runner do framework. Depois
@@ -322,6 +355,24 @@ def child_enter(io, reader, cwd, env_blob)
   if (lp = ENV["CALISTO_LOAD_PATH"])
     lp.split(":").reject(&:empty?).each do |p|
       $LOAD_PATH.unshift(p) unless $LOAD_PATH.include?(p)
+    end
+  end
+  # Fase R: -I (reversos — unshift na frente preserva `-I a -I b`), -r depois
+  if $calisto_run_iflags
+    $calisto_run_iflags.reverse_each do |d|
+      $LOAD_PATH.unshift(d) unless $LOAD_PATH.include?(d)
+    end
+  end
+  if $calisto_run_requires
+    $calisto_run_requires.each do |lib|
+      begin
+        require lib
+      rescue SystemExit
+        raise
+      rescue Exception => e # rubocop:disable Lint/RescueException -- espelho do child.rs
+        report_child_error(e)
+        exit 1
+      end
     end
   end
 end
@@ -360,6 +411,19 @@ def start_child(io, reader, fields)
   pid = Process.fork do
     # child: behave like `ruby <script> <args...>`
     child_enter(io, reader, cwd, env_blob)
+    if $calisto_check
+      # -c: compila sem executar (paridade com `ruby -c`)
+      begin
+        RubyVM::InstructionSequence.compile_file(script)
+        puts "Syntax OK"
+        exit 0
+      rescue SystemExit
+        raise
+      rescue Exception => e # rubocop:disable Lint/RescueException -- mimic `ruby -c`
+        warn e.message
+        exit 1
+      end
+    end
     $0 = script
     ARGV.replace(args)
     setup_data(script) if File.file?(script)
@@ -387,6 +451,19 @@ def start_child_eval(io, reader, fields)
   pid = Process.fork do
     # child: behave like `ruby -e '<code>' <args...>`
     child_enter(io, reader, cwd, env_blob)
+    if $calisto_check
+      # -c com -e: compila o codigo como `ruby -c -e` (sem executar)
+      begin
+        RubyVM::InstructionSequence.compile(code, "-e", "-e", 1)
+        puts "Syntax OK"
+        exit 0
+      rescue SystemExit
+        raise
+      rescue Exception => e # rubocop:disable Lint/RescueException -- mimic `ruby -c -e`
+        warn e.message
+        exit 1
+      end
+    end
     $0 = "-e"
     ARGV.replace(args)
     begin

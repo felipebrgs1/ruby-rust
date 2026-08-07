@@ -13,6 +13,7 @@ pub mod serve;
 pub mod task;
 pub mod test;
 pub mod tooling;
+pub mod version;
 
 pub use build::cmd_build;
 pub use deps::cmd_bundle_wrapper;
@@ -24,3 +25,4 @@ pub use serve::cmd_serve;
 pub use task::cmd_task;
 pub use test::cmd_test;
 pub use tooling::{cmd_completions, cmd_init, cmd_upgrade};
+pub use version::cmd_version;

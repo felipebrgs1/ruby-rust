@@ -18,10 +18,10 @@ graph LR
     L --> M[Fase M: memória / CoW]
     L --> N[Fase N: YJIT quente no fork ✅]
     L --> P[Fase P: APIs nativas calisto.* ✅]
-    M --> O[Fase O: snapshot de boot]
+    M --> O[Fase O: snapshot — spike: criu inviável ✅]
     N --> O
-    P --> Q[Fase Q: distribuição — binário único]
-    Q --> R[Fase R: paridade de CLI do interpretador]
+    P --> Q[Fase Q: distribuição — binário único ✅]
+    Q --> R[Fase R: paridade de CLI do interpretador ✅]
 ```
 
 ## Pronto (Fases 1-2 + A-K) — resumo
@@ -111,11 +111,12 @@ Crates esboçados (ainda vazios): `calisto-{test,task,serve,sqlite,tooling}`.
 |---|---|---|
 | `ruby <script>` | ✅ `calisto run` | parity contract (cold/warm + upstream) |
 | `ruby -e 'code'` | ✅ `calisto run -e` (múltiplos -e, $0/ARGV/backtrace/exit) | `exec.rs` |
-| `ruby -I DIR` / `-r LIB` | ❌ (só internos: CALISTO_LOAD_PATH no test; -r do daemon) | probe: `cannot open -I` |
-| `ruby -w` / `-W` / `-d` | ❌ | probe |
-| `ruby -c` (syntax check) | ❌ | probe |
-| `ruby -v` / `--version` | ❌ (`calisto --version` = unknown command; `doctor` mostra a versão) | probe |
-| `-E enc`, `-n/-p/-a/-F/-l/-0/-i/-s/-S/-x/-C` | ❌ (raros) | — |
+| `ruby -I DIR` / `-r LIB` | ✅ `calisto run -I/-r` (child pós-Bundler.setup; anexado -Ilib/-rlib) | `runflags.rs` |
+| `ruby -w` / `-W0..2` | ✅ (`$VERBOSE` true/nil/false; `-d` não) | `runflags.rs` |
+| `ruby -c` (syntax check) | ✅ (exit 0/1 + "Syntax OK"; pula requires como o ruby) | `runflags.rs` |
+| `ruby -v` / `--version` | ✅ `calisto --version` (calisto + VM) e `calisto run -v` (só a VM) | `runflags.rs` |
+| `-E enc` | ✅ best-effort (default_external/internal; `-E bogus` → erro claro) | `runflags.rs` |
+| `-n/-p/-a/-F/-l/-0/-i/-s/-S/-x/-C` | ❌ (não-fazer documentado; `ruby` do vendor via PATH/--cold) | — |
 | `--yjit` | ✅ parcial: `[run] yjit` no daemon de app (não como flag do run) | Fase N |
 | `irb` | ✅ `calisto repl` | `exec.rs` |
 | `rake` | ✅ `calisto task` | `testcmd.rs` |
@@ -128,14 +129,19 @@ Crates esboçados (ainda vazios): `calisto-{test,task,serve,sqlite,tooling}`.
 
 **Gaps reais de uso cotidiano**: `-I`, `-r`, `-w`, `-c`, `-v/--version` — os
 primeiros flags do `ruby --help` que um dev usa (gems com `-I lib`, CI com
-`-c`, warnings com `-w`). O resto é uso marginal e vira "não fazer"
-documentado.
+`-c`, warnings com `-w`) — **fechados pela Fase R**. O resto é uso marginal
+e vira "não fazer" documentado.
 
-## Próximo ciclo — fechando a runtime (O → Q) e a cobertura (R)
+## Próximo ciclo — fechado: runtime (L–O) + distribuição (Q) + CLI (R)
 
-> Pedido: começar pelo runtime. **O (snapshot) e Q (distribuição) fecham o
-> ciclo L–Q**; R fecha a superfície do CLI ruby nos gaps reais (a
-> semântica do interpretador já é 100% por construção).
+> Pedido: começar pelo runtime. O ciclo inteiro fechou: **O (snapshot)
+> fechou com a decisão documentada** (spike: criu exige privilégio demais
+> para o dev laptop), **Q (distribuição) concluída** (tarballs + curl|sh +
+> upgrade baixa rubies pré-compilados + CALISTO_HOME) e **R (paridade de
+> CLI) concluída** (`-I/-r/-w/-W/-c/-E/-v` com paridade cold/warm).
+> Próximos candidatos (fora do escopo L–R): APIs nativas novas (`calisto.*`
+> além de hash/sqlite), degraus reais (Chatwoot com `calisto run`/build),
+> snapshot gated em feature detect se o cenário de privilégio mudar.
 
 ### Fase L — CRuby embutido (libruby): o calisto vira o runtime
 Hoje o daemon é `spawn vendor/ruby server.rb`. Esta fase move o daemon para
@@ -310,27 +316,57 @@ compartilhadas).
   FILEs padrão).
 - Estimativa: ~~1–2 semanas~~ (concluída).
 
-### Fase O — Snapshot de boot (daemon frio instantâneo)
+### Fase O — Snapshot de boot (daemon frio instantâneo) ✅ (decisão: não fazer)
 Mesmo com tudo acima, o **primeiro** comando numa app paga o boot do daemon
-(Chatwoot: ~5s). Esta fase elimina o boot frio com checkpoint/restore.
+(Chatwoot: ~5s). Esta fase eliminaria o boot frio com checkpoint/restore via
+criu. **O spike provou que criu exige privilégio/maquinário demais para o
+alvo "dev laptop" — a fase fecha com a decisão documentada** (o escape
+hatch do plano) e o gancho de invalidação fica reutilizado: o hash do
+socket do daemon da app (fnv1a de app_root+preload+versão) JÁ invalida por
+mudança de app/versão; um snapshot futuro (se o cenário de privilégio
+mudar) rodaria no mesmo mecanismo (mtime de Gemfile.lock/entrypoint no
+hash), sem trabalho novo de desenho.
 
-- [ ] **O.1 — spike criu**: checkpoint do daemon pós-boot
-      (`criu dump --shell-job`) → restore em vez de bootar. Verificar
-      permissões (`CAP_CHECKPOINT_RESTORE`/`sysctl kernel.yama`), socket
-      rebind no restore, e invalidação (mtime do Gemfile.lock/entrypoint no
-      hash do snapshot, como o hash do socket da app).
-- [ ] **O.2 — alternativa sem root**: se criu for inviável sem privilégio,
-      avaliar dump de heap via `ObjectSpace` + marshal seletivo (frágil,
-      provavelmente não) — ou aceitar O.1 gated em feature detect.
-- [ ] **O.3 — integração**: `calisto run` restaura o snapshot se presente e
-      válido; `calisto stop` + mudança de app invalidam. Snapshot por
-      (app, versão ruby, salt) no runtime dir.
-- Marco: 1º `bin/rails runner` no railsapp **<500ms** numa máquina sem
-  daemon vivo (hoje paga o boot completo). Se o spike O.1 provar que criu
-  exige privilégio demais para o alvo "dev laptop", a fase fecha com a
-  decisão documentada e o gancho de invalidação reutilizado.
-- Estimativa: 2–3 semanas (spike primeiro; fase de risco, escopada para
-  falhar barato).
+- [x] **O.1 — spike criu** (criu 4.2.1 compilado do source, sem root):
+      achados empíricos:
+      - **Dump unprivileged**: funciona SÓ com o alvo num **user
+        namespace** (sem ele: "CRIU needs to have the CAP_SYS_ADMIN or the
+        CAP_CHECKPOINT_RESTORE capability") e o criu rodando como root no
+        **mesmo** userns (cada `unshare -U` cria um userns novo — criu num
+        ns diferente não tem caps no ns do alvo) com **caps dropadas**
+        (`cap_net_admin,cap_sys_resource` via capsh — sem o drop, o probe
+        de netlink do kerndat contra o netns inicial dá EPERM fatal) +
+        `--unprivileged --shell-job`. Provado: dump rc=0 de um processo em
+        userns (14 imagens).
+      - **Restore unprivileged é IMPOSSÍVEL no pid ns compartilhado**:
+        `clone3(set_tid)` → EPERM (set_tid sem CLONE_NEWPID exige
+        CAP_SYS_ADMIN no userns inicial; o fallback ns_last_pid idem) →
+        o alvo precisa de **pid ns próprio** (`unshare -p`).
+      - Com pid ns próprio, criu precisa enxergar o /proc do ns (mount
+        privado de proc — senão enumera o ns inicial e falha com
+        "Unseizable non-zombie <pid estranho>") → o alvo vira um
+        **mini-container rootless**: userns + pidns + mntns + proc privado.
+      - Custo por snapshot: criu instalado (não é padrão em distro
+        nenhuma), restore **duplica o RSS** do daemon (Chatwoot ~500MB →
+        pico 1GB+), e o cliente teria que orquestrar o unshare + drop de
+        caps + criu com fallback quando ausente.
+- [x] **O.2 — alternativa sem root**: dump de heap via ObjectSpace +
+      marshal seletivo descartado (não captura C-ext/threads/sockets/
+      libruby — frágil, como o plano já previa). O caminho PRIVILEGIADO
+      (uma vez `sudo setcap cap_checkpoint_restore+eip criu` — fluxo padrão
+      do criu, sem mini-container) fica documentado como o "se um dia":
+      gated em feature detect (criu presente + cap disponível → snapshot;
+      senão boot normal), invalidação pelo hash de socket existente.
+- [x] **O.3 — integração**: NÃO implementada (sem snapshot não há o que
+      restaurar). O gancho de invalidação já existe na forma do hash do
+      socket (Fase B) — reutilizado por construção; o mtime do
+      Gemfile.lock/entrypoint entraria no hash se o snapshot um dia
+      existir.
+- Marco: **não alcançado** (1º comando quente <500ms exige o daemon vivo —
+  o gap do primeiro comando pós-boot é inerente sem snapshot; o daemon
+  persistente já cobre tudo depois dele). Decisão documentada: **criu
+  exige privilégio demais para o alvo dev laptop**.
+- Estimativa: ~~2–3 semanas~~ (spike ~1 dia; fechada com a decisão).
 
 ### Fase P — APIs nativas `calisto.*` (o Bun.* do Ruby) ✅
 Com a VM embutida, o calisto registra métodos Ruby implementados em Rust
@@ -398,58 +434,97 @@ no calisto. É o equivalente ao `Bun.sql`/`Bun.CryptoHasher`. O stub
   — caminhos de erro viraram Result com finalize no caller.
 - Estimativa: ~~2 semanas~~ (concluída).
 
-### Fase Q — Distribuição: o instalador do Bun
+### Fase Q — Distribuição: o instalador do Bun ✅
 Fecha o ciclo "Bun de verdade": hoje o calisto exige o checkout +
 `scripts/build-ruby.sh` (~15min de compilação).
 
-- [ ] **Q.1 — release tarball**: CI (GitHub Actions) publica
-      `calisto-linux-x86_64.tar.gz` com o binário + `vendor/ruby-<v>/` dos
-      rubies suportados (3.4.10, 3.4.4) — dlopen da Fase L torna o binário
-      relocável (rpath `$ORIGIN/../lib`).
-- [ ] **Q.2 — `curl | sh`**: script instalador que baixa, verifica sha256 e
-      instala em `~/.calisto` (+ shim no PATH); `calisto upgrade` passa a
-      **baixar** rubies pré-compilados em vez de compilar (compilação vira
-      fallback `--source`).
-- [ ] **Q.3 — vendor_root portátil**: `vendor_root()` hoje sobe do
-      executável — generalizar para `CALISTO_HOME` (default `~/.calisto`),
-      mantendo o comportamento de checkout para desenvolvimento.
-- Marco: máquina limpa (container `ubuntu:24.04` sem ruby/rust):
-  `curl … | sh && calisto init app && cd app && calisto run` → Hello em
-  <1min total. Teste de fumaça em CI, não na suíte local.
-- Estimativa: 1–2 semanas.
+- [x] **Q.1 — release tarball**: `scripts/release.sh` monta
+      `calisto-linux-x86_64.tar.gz` (binário + `vendor/` com os rubies
+      empacotados — o `vendor_root` acha o vendor subindo do binário,
+      então bin/calisto + vendor/ lado a lado bastam; relocável por design,
+      Fase L) e `calisto-ruby-<v>-linux-x86_64.tar.gz` por ruby (layout
+      `ruby-<v>/` na raiz — extraído em `<vendor>/`), com `.sha256` por
+      tarball (formato do `sha256sum -c`). CI: `.github/workflows/release.yml`
+      (ubuntu-24.04, build do ruby com cache do vendor, `gh release create`
+      a cada tag v*).
+- [x] **Q.2 — `curl | sh`**: `install.sh` baixa, verifica sha256 e instala
+      em `~/.calisto` (shim em `~/.local/bin/calisto` com `CALISTO_HOME`
+      setado); `CALISTO_VERSION`/`CALISTO_BASE`/`CALISTO_HOME`/
+      `CALISTO_BIN_DIR` sobrepõem. `calisto upgrade` (sem `scripts/` no
+      tarball — instalação portátil) **baixa** o ruby pré-compilado
+      (`curl` + `sha256sum -c` + `tar` — tools do sistema, zero deps;
+      `CALISTO_UPGRADE_URL` sobrepõe a base — ex.: `file://` nos testes);
+      `--source` força o build pelo script (erro claro sem ele); o caminho
+      com `CALISTO_BUILD_SCRIPT` explícito continua errando se ausente.
+      Armadilha real: o nome do tarball por-ruby divergia do URL do upgrade
+      (`-linux-` no meio) — (37) deterministicamente; alinhado.
+- [x] **Q.3 — vendor_root portátil**: `CALISTO_HOME` (default `~/.calisto`
+      no instalador) vira a base — `$CALISTO_HOME/vendor`; sem a var, o
+      comportamento de checkout (walk-up do executável) fica intacto.
+- Marco ✅ (fumaça local — o CI roda o mesmo em máquina limpa): release.sh
+  → `install.sh` com `CALISTO_BASE=file://…` → binário instalado roda
+  `--version` e `run -e 'puts 1+1'` → 2 (daemon embutido com o vendor
+  portátil); `upgrade 3.4.4` baixa o tarball real, verifica sha e instala;
+  app com `.ruby-version` 3.4.4 no instalado roda `RUBY_VERSION` 3.4.4
+  (Fase I multi-versão no layout portátil). `test/tooling.rs` +4 (10 total):
+  CALISTO_HOME vence o walk-up (--version mostra o ruby fake do home),
+  download com sha ok/bad (file://, hermético), `--source` força o build.
+- Estimativa: ~~1–2 semanas~~ (concluída).
 
-### Fase R — Paridade de CLI do interpretador (os gaps reais)
+### Fase R — Paridade de CLI do interpretador (os gaps reais) ✅
 Fecha o "NOTE: -e/-E VM flags ainda não suportados" do help. Escopo = os
 gaps de uso cotidiano do levantamento acima; os raros ficam como não-fazer
 documentado.
 
-- [ ] **R.1 — flags do `run`**: `calisto run` aceita `-I DIR` (repetível),
-      `-r LIB` (repetível), `-w`/`-W[0-2]`, `-c` (syntax check — compila e
-      sai 0/1 como o ruby, sem executar) e `-E enc[:in]` (best-effort via
-      `Encoding.default_*=`). **Design**: opções do CHILD, não do boot do
-      daemon — o daemon é compartilhado entre comandos diferentes e o
-      `$LOAD_PATH` do `-I` precisa ser reaplicado DEPOIS do Bundler.setup
-      (mesmo mecanismo do CALISTO_LOAD_PATH); `-r` vira require no child
-      antes do script; `-w` vira `$VERBOSE`; `-c` vira uma opção do RUN
-      (compila a iseq, não avalia). Flags vão no env_blob/campos do RUN.
-- [ ] **R.2 — `calisto --version` / `-v`**: imprime a versão do calisto +
-      a VM embutida no formato do `ruby -v` (`ruby 3.4.10 (...) +PRISM
-      [x86_64-linux]` — mesma string do `RUBY_DESCRIPTION`), do ruby
-      resolvido (Fase I). Trivial: `doctor` já mostra.
-- [ ] **R.3 — não fazer documentado**: `-n/-p/-a/-F/-l/-0/-i/-s/-S/-x/-C`
+- [x] **R.1 — flags do `run`**: `calisto run` aceita `-I DIR` (repetível),
+      `-r LIB` (repetível), `-w`/`-W0..2` (anexado, como o ruby), `-c`
+      (syntax check — compila e sai 0/1, imprime "Syntax OK", sem executar;
+      **pula requires e bundler/setup como o `ruby -c`** — verificado
+      empiricamente: `ruby -r inexistente -c` → Syntax OK) e `-E enc[:in]`
+      (best-effort via `Encoding.default_*=`; erro de encoding = one-liner
+      `calisto: unknown encoding name - X (ArgumentError)` + exit 1). Formas
+      anexadas do ruby (-Ilib/-rlib/-Eutf-8), `--` termina as flags e
+      `calisto run -v` imprime a VM (como `ruby -v`). **Design**: opções do
+      CHILD, não do boot do daemon — serializadas em `CALISTO_RUN_FLAGS` no
+      env_blob do RUN/EVAL (sem mudança de protocolo — daemons antigos e o
+      server.rb legado ignoram a var desconhecida) e **removidas do env
+      antes do script**. No child: `$VERBOSE` cedo (antes do bundler/setup,
+      paridade com o `-w` do cold), `-I` reaplicado DEPOIS do Bundler.setup
+      (que limpa o $LOAD_PATH — mesmo mecanismo do CALISTO_LOAD_PATH),
+      `-r` require protegido (LoadError como o ruby), `-E` antes do `-c`
+      (como o process_options). `-c` compila via
+      `RubyVM::InstructionSequence.compile(_file)` (lida com __END__) e o
+      erro sai como `e.message` do SyntaxError (o full_message com backtrace
+      cortado re-atribui o erro ao frame atual — confunde). Cold: argv do
+      ruby na MESMA ordem (`-w` antes do `-rbundler/setup`, `-I/-r/-E`
+      depois, `-c` por último). Em scripts do calisto.toml as flags ruby
+      dão erro claro (o comando é outro — bin/rails server etc.). Armadilha
+      real: o separador do blob (`\x1e`) colidia com o framing do env_blob
+      (pares k=v separados por `\x1e`) — o `r:lib` virava um par órfão sem
+      `=` e era descartado; trocado para `\x1f` nos DOIS lados.
+- [x] **R.2 — `calisto --version` / `-v`**: imprime a versão do calisto
+      (`calisto 0.1.0`) + a descrição da VM do ruby resolvido (Fase I —
+      `.ruby-version`/Gemfile, não só o pin) no formato do `ruby -v`
+      (RUBY_DESCRIPTION exata via `ruby -v` do resolvedo).
+- [x] **R.3 — não fazer documentado**: `-n/-p/-a/-F/-l/-0/-i/-s/-S/-x/-C`
       (awk-mode e companhia — uso marginal; o `ruby` do vendor segue
-      disponível via PATH/--cold para esses).
-- Marco: app de gems com `calisto run -I lib -r helper -w script.rb` roda
-  quente com paridade cold/warm (`cold_and_warm_agree` com cada flag);
-  `calisto run -c` == `ruby -c` em exit codes e mensagens; `calisto
-  --version` imprime a VM embutida.
-- Estimativa: 1 semana (R.1 é o grosso; R.2 é trivial).
+      disponível via PATH/--cold para esses) — nota no help + tabela abaixo.
+- Marco ✅: `test/runflags.rs` (16 testes): `-I`/`-r` (isolados, combinados,
+  anexados, LoadError), `-w`/`-W0`/`-W2` (warnings), `-c` (ok/bad/`-e`/
+  `__END__`/não executa), `-E` (ext, ext:int, inválido), `--`, `-v`/`--version`
+  (topo e run), flags+script do toml → erro claro, flags no daemon da app —
+  todos com **paridade cold/warm** (invariante da casa). `calisto run -c` ==
+  `ruby -c` em exit codes e "Syntax OK"; erro de sintaxe com o frame de
+  código do 3.4 (error_highlight). Suíte inteira verde (16 targets, incluindo
+  o server.rb legado via CALISTO_NO_EMBED — o child_enter do legacy ganhou o
+  mesmo parse).
+- Estimativa: ~~1 semana~~ (concluída).
 
 ### Ordem e dependências
 
 ```
 L (embutir) ──┬─→ M (memória) ─┐
-              ├─→ N (YJIT) ────┴─→ O (snapshot)
+              ├─→ N (YJIT) ────┴─→ O (snapshot — decisão: criu inviável) ✅
               └─→ P (APIs nativas) ✅ ─→ Q (distribuição) ─→ R (CLI parity)
 ```
 
@@ -457,13 +532,14 @@ L (embutir) ──┬─→ M (memória) ─┐
   in-process sem reescrever o accept loop (L.4 pode ser L-bis se o risco
   subir).
 - **M e N em paralelo** depois de L — independentes, ambos curtos.
-- **O é o único com risco de não sair** (criu) — spike de 2–3 dias decide;
-  se falhar, o marco documentado é a decisão.
+- **O fechou com a decisão documentada** (spike criu: dump unprivileged
+  exige userns+caps dropadas; restore exige pid ns próprio + proc privado
+  = mini-container rootless; restore duplica RSS) — o gap do 1º comando
+  pós-boot fica aceito; o daemon persistente cobre todo o resto.
 - **P antes de Q** para o binário distribuído já sair com as APIs nativas.
-- Sequência sugerida: **L → M → N → P → Q**, com O spikado em background
-  assim que L.3 estabilizar. P concluída; **o próximo ciclo abre com a
-  runtime: Q em paralelo com o spike do O; R (CLI parity) depois** — o
-  usuário pediu para começar pelo runtime.
+- Sequência: **L → M → N → P → Q → R**, com O spikado em background
+  (decidido: não). O próximo ciclo: **Q (distribuição) e R (CLI parity)** —
+  o usuário pediu para começar pelo runtime; O não bloqueia mais nada.
 
 ## Riscos técnicos conhecidos
 

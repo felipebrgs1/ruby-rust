@@ -72,6 +72,7 @@ fn main() {
         Some("status") => cmd_status(),
         Some("stop") => cmd_stop(),
         Some("doctor") => cmd_doctor(),
+        Some("-v" | "--version") => cmd_version(),
         Some("help" | "-h" | "--help") => {
             print_help();
             0
@@ -95,7 +96,7 @@ fn print_help() {
         "calisto - a Bun-like runtime for Ruby (pinned CRuby + fork-based fast startup)
 
 USAGE:
-  calisto run [--cold] [--time] [--preload LIST] [-e 'code' | <script.rb> | <script>] [args...]
+  calisto run [--cold] [--time] [--preload LIST] [-I DIR] [-r LIB] [-w|-W0..2] [-c] [-E enc] [-e 'code' | <script.rb> | <script>] [args...]
   calisto test [--watch] [file|dir...]
   calisto task <args...>
   calisto serve [-p PORT] [-o HOST]
@@ -116,6 +117,15 @@ USAGE:
           sao concatenados com newline, como o ruby). Tambem aceita --cold.
           --preload LIST overrides the stdlib the daemon preloads (\"0\" disables;
           default: {DEFAULT_PRELOAD}).
+          Flags ruby do child (Fase R — paridade com o interpretador), para
+          <script.rb> e -e: -I DIR (repetivel; $LOAD_PATH pos-Bundler.setup),
+          -r LIB (repetivel; require no child antes do script), -w / -W0..2
+          ($VERBOSE), -c (syntax check: compila e imprime \"Syntax OK\", exit
+          0/1, sem executar — pula requires como o ruby), -E enc[:enc2]
+          (default_external/internal; best-effort). Formas anexadas do ruby
+          funcionam (-Ilib, -rlib, -W0, -Eutf-8); `--` termina as flags.
+          `calisto run -v` imprime a descricao da VM (como `ruby -v`) e sai 0.
+          Em scripts do calisto.toml as flags ruby nao se aplicam (erro claro).
           A Gemfile do diretorio atual (buscando para cima) e ativada como em
           `bundle exec ruby`; instale as gems com `bundle install` normal.
           Com um calisto.toml no diretorio atual (walk up) o daemon vira o
@@ -207,9 +217,11 @@ CONFIG:
                       rodado no daemon pos-boot (ex.: requests contra a Rack
                       app em memoria) antes da compactacao/bind
 
-NOTE: calisto run is equivalent to `bundle exec ruby <script>` with -e/-E VM
-flags (alem de -e) ainda nao suportados; fora de Gemfile, identico a
-`ruby <script>`.
+NOTE: calisto run is equivalent to `bundle exec ruby <script>` with the
+common ruby CLI flags supported (-e/-I/-r/-w/-W/-c/-E/-v; --version no topo
+imprime o calisto + a VM). Nao fazer documentado (uso marginal; o `ruby` do
+vendor segue disponivel via PATH/--cold): -n/-p/-a/-F/-l/-0/-i/-s/-S/-x/-C
+(awk-mode e companhia), -d, -T, --jit-only flags de VM.
 Linux only (fork)."
     );
 }

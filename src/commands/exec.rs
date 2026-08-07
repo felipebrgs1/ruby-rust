@@ -48,7 +48,7 @@ pub fn exec_argv(ruby: &Path, app: &Option<AppConfig>, cold: bool, argv: &[Strin
     }
 
     if cold {
-        return run_cold(ruby, &shim.to_string_lossy(), argv, &root);
+        return run_cold(ruby, &shim.to_string_lossy(), argv, &root, &crate::commands::run::RunFlags::default());
     }
 
     let mut stream = match app_daemon(app) {
@@ -67,7 +67,7 @@ pub fn exec_argv(ruby: &Path, app: &Option<AppConfig>, cold: bool, argv: &[Strin
             }
         },
     };
-    run_request_full(&mut stream, &root.to_string_lossy(), &[], &shim.to_string_lossy(), argv)
+    run_request_full(&mut stream, &root.to_string_lossy(), &[], &shim.to_string_lossy(), argv, &crate::commands::run::RunFlags::default())
 }
 
 

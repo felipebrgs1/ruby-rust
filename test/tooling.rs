@@ -223,6 +223,171 @@ fn upgrade_propagates_failure_and_validates_version_fast() {
     assert_eq!(out.status.code(), Some(1));
 }
 
+// --- Fase Q: distribuicao ----------------------------------------------------
+
+/// "Ruby" fake: script executavel que imprime a versao falsa — prova que o
+/// calisto resolveu o ruby do CALISTO_HOME (e nao o vendor do checkout).
+fn fake_ruby(dir: &Path, version: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("vendor").join(format!("ruby-{version}/bin"));
+    std::fs::create_dir_all(&bin).unwrap();
+    let rb = bin.join("ruby");
+    std::fs::write(&rb, "#!/bin/sh\necho fake ruby 9.9.9\n").unwrap();
+    let mut perm = std::fs::metadata(&rb).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&rb, perm).unwrap();
+}
+
+#[test]
+fn calisto_home_selects_vendor() {
+    let dir = runtime_dir("q3-home");
+    fake_ruby(&dir, "3.4.10");
+    let env: &[(&str, &str)] = &[("CALISTO_HOME", dir.to_str().unwrap())];
+    // o exe do teste subiria ate o vendor REAL do checkout — o CALISTO_HOME
+    // precisa vencer: o --version mostra o ruby fake
+    let out = run_opt(
+        &dir,
+        RunOpts { args: &["--version"], env, stdin: None, cwd: None, timeout: 30 },
+    );
+    assert!(
+        out.status.success(),
+        "--version falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("calisto 0.1.0"), "{stdout}");
+    assert!(
+        stdout.contains("fake ruby 9.9.9"),
+        "CALISTO_HOME deveria vencer o walk-up do checkout: {stdout}"
+    );
+
+    // CALISTO_HOME sem vendor: o ruby do pin nao existe -> erro com o build
+    let empty = runtime_dir("q3-empty");
+    let out = run_opt(
+        &dir,
+        RunOpts {
+            args: &["run", "-e", "puts 1"],
+            env: &[("CALISTO_HOME", empty.to_str().unwrap())],
+            stdin: None,
+            cwd: None,
+            timeout: 30,
+        },
+    );
+    assert_eq!(out.status.code(), Some(1));
+}
+
+/// Monta um release fake num dir: tarball do ruby <v> (layout ruby-<v>/ na
+/// raiz, como o release.sh) + .sha256 no formato do sha256sum -c.
+fn fake_release(serve: &Path, version: &str, corrupt: bool) {
+    let name = format!("calisto-ruby-{version}-linux-x86_64.tar.gz");
+    let staging = serve.join("staging");
+    std::fs::create_dir_all(&staging.join(format!("ruby-{version}/bin"))).unwrap();
+    std::fs::write(
+        staging.join(format!("ruby-{version}/bin/ruby")),
+        "#!/bin/sh\necho fake ruby\n",
+    )
+    .unwrap();
+    let st = std::process::Command::new("tar")
+        .arg("czf")
+        .arg(serve.join(&name))
+        .arg("-C")
+        .arg(&staging)
+        .arg(format!("ruby-{version}"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let hash = if corrupt {
+        "0".repeat(64)
+    } else {
+        let out = std::process::Command::new("sha256sum")
+            .arg(serve.join(&name))
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().split_whitespace().next().unwrap().to_string()
+    };
+    std::fs::write(serve.join(format!("{name}.sha256")), format!("{hash}  {name}\n")).unwrap();
+    std::fs::remove_dir_all(&staging).unwrap();
+}
+
+#[test]
+fn upgrade_downloads_prebuilt_without_build_script() {
+    let dir = runtime_dir("q2-download");
+    let serve = runtime_dir("q2-serve");
+    fake_release(&serve, "3.4.4", false);
+    let env: &[(&str, &str)] = &[
+        // instalacao portatil: CALISTO_HOME sem scripts/ (sem build possivel)
+        ("CALISTO_HOME", dir.to_str().unwrap()),
+        ("CALISTO_UPGRADE_URL", &format!("file://{}", serve.display())),
+    ];
+    let out = run_opt(
+        &dir,
+        RunOpts { args: &["upgrade", "3.4.4"], env, stdin: None, cwd: None, timeout: 60 },
+    );
+    assert!(
+        out.status.success(),
+        "upgrade falhou: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let installed = dir.join("vendor/ruby-3.4.4/bin/ruby");
+    assert!(installed.is_file(), "ruby baixado deveria estar em {}", installed.display());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("instalado em"));
+}
+
+#[test]
+fn upgrade_download_rejects_bad_sha256() {
+    let dir = runtime_dir("q2-badsha");
+    let serve = runtime_dir("q2-serve-bad");
+    fake_release(&serve, "3.4.4", true);
+    let env: &[(&str, &str)] = &[
+        ("CALISTO_HOME", dir.to_str().unwrap()),
+        ("CALISTO_UPGRADE_URL", &format!("file://{}", serve.display())),
+    ];
+    let out = run_opt(
+        &dir,
+        RunOpts { args: &["upgrade", "3.4.4"], env, stdin: None, cwd: None, timeout: 60 },
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("sha256"), "erro deveria citar o sha: {err}");
+    assert!(
+        !dir.join("vendor/ruby-3.4.4").exists(),
+        "sha invalido nao pode extrair"
+    );
+}
+
+#[test]
+fn upgrade_source_flag_forces_build() {
+    let dir = runtime_dir("q2-source");
+    let script = fake_build_script(&dir);
+    let log = dir.join("build.log");
+    let env: &[(&str, &str)] = &[
+        ("CALISTO_BUILD_SCRIPT", script.to_str().unwrap()),
+        ("FAKE_BUILD_LOG", log.to_str().unwrap()),
+    ];
+    let out = run_opt(
+        &dir,
+        RunOpts { args: &["upgrade", "--source"], env, stdin: None, cwd: None, timeout: 30 },
+    );
+    assert!(
+        out.status.success(),
+        "--source com script presente deveria buildar: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // sem script + --source: erro claro (nao tenta download)
+    let out = run_opt(
+        &dir,
+        RunOpts {
+            args: &["upgrade", "--source"],
+            env: &[("CALISTO_HOME", dir.to_str().unwrap())],
+            stdin: None,
+            cwd: None,
+            timeout: 30,
+        },
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--source"));
+}
+
 // --- completions -------------------------------------------------------------
 
 #[test]

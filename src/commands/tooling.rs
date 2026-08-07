@@ -6,7 +6,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use crate::runtime::*;
 
@@ -133,19 +133,42 @@ pub const KNOWN_RUBY_VERSIONS: &[&str] = &["3.4.10", "3.4.4"];
 
 
 
-/// `calisto upgrade [version]` — roda scripts/build-ruby.sh no checkout:
-/// sem versao rebuilda o pin (vendor/current); com versao constroi
-/// vendor/ruby-<v> (Fase I — disponibiliza o ruby que o .ruby-version/Gemfile
-/// pede). Idempotente: o script pula rubies ja construidos (verifica o sha do
-/// tarball baixado antes). `CALISTO_BUILD_SCRIPT` (testes) aponta outro
-/// script; o caminho real e resolvido junto ao vendor (subindo do binario).
+/// `calisto upgrade [version] [--source]`:
+/// - no checkout (scripts/build-ruby.sh presente): roda o script — sem
+///   versao rebuilda o pin (vendor/current); com versao constroi
+///   vendor/ruby-<v> (Fase I). Idempotente: o script pula rubies ja
+///   construidos (verifica o sha do tarball baixado antes).
+/// - instalacao portatil (Fase Q.2 — CALISTO_HOME do curl|sh; o tarball nao
+///   traz scripts/): BAIXA o ruby pre-compilado do release em vez de
+///   compilar (curl + tar + sha256 — tools do sistema, zero deps).
+/// `--source` forca o build pelo script (erro claro se ausente).
+/// `CALISTO_BUILD_SCRIPT` (testes) aponta outro script; o caminho real e
+/// resolvido junto ao vendor (subindo do binario). `CALISTO_UPGRADE_URL`
+/// (testes) troca a base dos downloads pre-compilados (qualquer URL que o
+/// curl entenda, ex.: file://).
 pub fn cmd_upgrade(args: &[String]) -> i32 {
-    if args.len() > 1 {
-        eprintln!("calisto: upgrade precisa de no maximo um argumento: calisto upgrade [version]");
-        return 1;
+    let mut source_only = false;
+    let mut version: Option<&str> = None;
+    for a in args {
+        match a.as_str() {
+            "--source" => source_only = true,
+            v if v.starts_with('-') => {
+                eprintln!("calisto: upgrade: flag desconhecida '{v}'");
+                return 1;
+            }
+            v => {
+                if version.is_some() {
+                    eprintln!(
+                        "calisto: upgrade precisa de no maximo um argumento: calisto upgrade [version] [--source]"
+                    );
+                    return 1;
+                }
+                version = Some(v);
+            }
+        }
     }
-    if let Some(v) = args.first() {
-        if !KNOWN_RUBY_VERSIONS.contains(&v.as_str()) {
+    if let Some(v) = version {
+        if !KNOWN_RUBY_VERSIONS.contains(&v) {
             eprintln!(
                 "calisto: upgrade: versao {v} sem sha256 conhecido ({}); \
                  rode RUBY_SHA256=<sha> scripts/build-ruby.sh manualmente",
@@ -154,33 +177,129 @@ pub fn cmd_upgrade(args: &[String]) -> i32 {
             return 1;
         }
     }
-    let script = match env::var_os("CALISTO_BUILD_SCRIPT") {
-        Some(p) => PathBuf::from(p),
-        None => match vendor_root() {
-            Some(vendor) => vendor.join("../scripts/build-ruby.sh"),
-            None => {
-                eprintln!("calisto: upgrade: vendor/ nao encontrado (rode do checkout do calisto)");
-                return 1;
-            }
-        },
+    let script_env = env::var_os("CALISTO_BUILD_SCRIPT").map(PathBuf::from);
+    let script = match &script_env {
+        Some(p) => Some(p.clone()),
+        None => vendor_root().map(|vendor| vendor.join("../scripts/build-ruby.sh")),
     };
-    if !script.is_file() {
+    let script_exists = script.as_deref().is_some_and(|s| s.is_file());
+    if source_only && !script_exists {
         eprintln!(
-            "calisto: upgrade: {} nao encontrado (rode scripts/build-ruby.sh manualmente)",
-            script.display()
+            "calisto: upgrade: --source pediu o build, mas {} nao existe \
+             (instalacao portatil; use upgrade sem --source para baixar)",
+            script
+                .as_deref()
+                .map(|s| s.display().to_string())
+                .unwrap_or_else(|| "<sem vendor>".into())
         );
         return 1;
     }
-    let mut cmd = Command::new("sh");
-    cmd.arg(&script).stdin(Stdio::null());
-    if let Some(v) = args.first() {
-        cmd.env("RUBY_VERSION", v);
+    if script_exists {
+        let script = script.unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.arg(&script).stdin(Stdio::null());
+        if let Some(v) = version {
+            cmd.env("RUBY_VERSION", v);
+        }
+        return match cmd.status() {
+            // stdio herdado: o build (10-15min) mostra o progresso ao vivo
+            Ok(st) => st.code().unwrap_or(1),
+            Err(e) => {
+                eprintln!("calisto: upgrade: cannot run {}: {e}", script.display());
+                1
+            }
+        };
     }
-    match cmd.status() {
-        // stdio herdado: o build (10-15min) mostra o progresso ao vivo
-        Ok(st) => st.code().unwrap_or(1),
+    // override EXPLICITO ausente = erro (o caller pediu esse script);
+    // resolucao por vendor ausente (instalacao portatil Fase Q.2) = download
+    if script_env.is_some() {
+        eprintln!(
+            "calisto: upgrade: {} nao encontrado (rode scripts/build-ruby.sh manualmente)",
+            script.as_deref().unwrap().display()
+        );
+        return 1;
+    }
+    upgrade_download(version)
+}
+
+
+
+/// Baixa um ruby pre-compilado do release (Fase Q.2). Layout do tarball:
+/// `ruby-<v>/...` extraido em <vendor>/ (CALISTO_HOME/vendor na instalacao
+/// portatil). Verifica sha256 contra o arquivo `.sha256` publicado junto.
+pub fn upgrade_download(version: Option<&str>) -> i32 {
+    let Some(vendor) = vendor_root() else {
+        eprintln!("calisto: upgrade: vendor/ nao encontrado (rode do checkout do calisto)");
+        return 1;
+    };
+    let v = version.unwrap_or(PINNED_RUBY);
+    let base = env::var("CALISTO_UPGRADE_URL").unwrap_or_else(|_| {
+        format!(
+            "https://github.com/felipebrgs1/ruby-rust/releases/download/v{}",
+            env!("CARGO_PKG_VERSION")
+        )
+    });
+    let url = format!("{base}/calisto-ruby-{v}-linux-x86_64.tar.gz");
+    let tmp = env::temp_dir().join(format!("calisto-upgrade-{}", std::process::id()));
+    let _ = fs::create_dir_all(&tmp);
+    // o nome do arquivo baixado = basename da URL: o .sha256 publicado
+    // referencia esse nome (sha256sum -c valida contra ele)
+    let name = url.rsplit('/').next().unwrap_or("ruby.tar.gz");
+    let tarball = tmp.join(name);
+    let sha_file = tmp.join(format!("{name}.sha256"));
+    eprintln!("calisto: upgrade: baixando {url}");
+    let curl = |out: &Path, u: &str| {
+        Command::new("curl")
+            .args(["-fsSL", "-o"])
+            .arg(out)
+            .arg(u)
+            .stdin(Stdio::null())
+            .status()
+    };
+    if curl(&tarball, &url).map(|s| !s.success()).unwrap_or(true)
+        || curl(&sha_file, &format!("{url}.sha256"))
+            .map(|s| !s.success())
+            .unwrap_or(true)
+    {
+        eprintln!("calisto: upgrade: download falhou ({url}; verifique a rede)");
+        let _ = fs::remove_dir_all(&tmp);
+        return 1;
+    }
+    // sha256 -c: o arquivo .sha256 contem "<hash>  <nome>" (release.sh)
+    let mut check = Command::new("sha256sum");
+    check
+        .arg("-c")
+        .arg(&sha_file)
+        .current_dir(&tmp)
+        .stdin(Stdio::null());
+    let ok = check.status().map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        eprintln!("calisto: upgrade: sha256 do download nao confere (abortando)");
+        let _ = fs::remove_dir_all(&tmp);
+        return 1;
+    }
+    let _ = fs::create_dir_all(&vendor);
+    let st = Command::new("tar")
+        .arg("-xzf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&vendor)
+        .status();
+    let _ = fs::remove_dir_all(&tmp);
+    match st {
+        Ok(s) if s.success() => {
+            eprintln!(
+                "calisto: upgrade: ruby {v} instalado em {}",
+                vendor.join(format!("ruby-{v}")).display()
+            );
+            0
+        }
+        Ok(_) => {
+            eprintln!("calisto: upgrade: extracao do tarball falhou");
+            1
+        }
         Err(e) => {
-            eprintln!("calisto: upgrade: cannot run {}: {e}", script.display());
+            eprintln!("calisto: upgrade: cannot run tar: {e}");
             1
         }
     }

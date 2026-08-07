@@ -355,34 +355,37 @@ pub fn wait_status_code(status: i32) -> i32 {
 
 
 
-pub fn eval_request(stream: &mut UnixStream, code: &str, args: &[String]) -> i32 {
+pub fn eval_request(stream: &mut UnixStream, code: &str, args: &[String], flags: &crate::commands::run::RunFlags) -> i32 {
     let cwd = env::current_dir()
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_default();
-    eval_request_full(stream, &cwd, &[], code, args)
+    eval_request_full(stream, &cwd, &[], code, args, flags)
 }
 
 
 
-pub fn run_request(stream: &mut UnixStream, script: &str, args: &[String]) -> i32 {
+pub fn run_request(stream: &mut UnixStream, script: &str, args: &[String], flags: &crate::commands::run::RunFlags) -> i32 {
     let cwd = env::current_dir()
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_default();
-    run_request_full(stream, &cwd, &[], script, args)
+    run_request_full(stream, &cwd, &[], script, args, flags)
 }
 
 
 
 /// Variante com cwd e env extras explicitos (usada por `calisto test`: cwd na
 /// raiz do projeto, RAILS_ENV=test e CALISTO_LOAD_PATH injetados no child).
+/// `flags` (Fase R): flags ruby do child (-I/-r/-w/-W/-c/-E) serializadas em
+/// CALISTO_RUN_FLAGS no env_blob — o child aplica e remove antes do script.
 pub fn run_request_full(
     stream: &mut UnixStream,
     cwd: &str,
     extra: &[(&str, &str)],
     script: &str,
     args: &[String],
+    flags: &crate::commands::run::RunFlags,
 ) -> i32 {
-    send_run_request(stream, "RUN", cwd, extra, script, args)
+    send_run_request(stream, "RUN", cwd, extra, script, args, flags)
 }
 
 
@@ -395,8 +398,9 @@ pub fn eval_request_full(
     extra: &[(&str, &str)],
     code: &str,
     args: &[String],
+    flags: &crate::commands::run::RunFlags,
 ) -> i32 {
-    send_run_request(stream, "EVAL", cwd, extra, code, args)
+    send_run_request(stream, "EVAL", cwd, extra, code, args, flags)
 }
 
 
@@ -408,6 +412,7 @@ pub fn send_run_request(
     extra: &[(&str, &str)],
     subject: &str,
     args: &[String],
+    flags: &crate::commands::run::RunFlags,
 ) -> i32 {
     let mut env_pairs: Vec<String> = env::vars()
         .filter(|(k, _)| {
@@ -429,6 +434,9 @@ pub fn send_run_request(
         // extra SEMPRE vence (incluindo .env): `calisto test` precisa de
         // RAILS_ENV=test mesmo se o .env do projeto setar development
         env_pairs.push(format!("{k}={v}"));
+    }
+    if flags.any() {
+        env_pairs.push(format!("CALISTO_RUN_FLAGS={}", flags.blob()));
     }
     let env_blob = env_pairs.join("\u{1e}");
     let mut fields = vec![b64(cwd), b64(&env_blob), b64(subject)];

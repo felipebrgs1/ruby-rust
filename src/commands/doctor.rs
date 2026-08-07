@@ -172,7 +172,7 @@ pub fn report_daemon_memory() {
             ("CALISTO_PROBE_PID", pid_path.as_str()),
             ("CALISTO_PROBE_DONE", done_path.as_str()),
         ];
-        let _ = eval_request_full(&mut s, &cwd, &extra, PROBE_CODE, &[]);
+        let _ = eval_request_full(&mut s, &cwd, &extra, PROBE_CODE, &[], &crate::commands::run::RunFlags::default());
     });
     // pid aparece em ~10ms; DONE depois do trabalho do probe (alocacao + GC)
     let mut child: Option<i32> = None;

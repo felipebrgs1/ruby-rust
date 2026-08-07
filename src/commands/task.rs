@@ -70,5 +70,5 @@ pub fn cmd_task(args: &[String]) -> i32 {
             }
         },
     };
-    run_request_full(&mut stream, &root.to_string_lossy(), &[], &shim.to_string_lossy(), args)
+    run_request_full(&mut stream, &root.to_string_lossy(), &[], &shim.to_string_lossy(), args, &crate::commands::run::RunFlags::default())
 }

@@ -254,6 +254,7 @@ pub fn cmd_test(args: &[String]) -> i32 {
                             &extra,
                             &file.to_string_lossy(),
                             &[],
+                            &crate::commands::run::RunFlags::default(),
                         );
                         results.push((file.display().to_string(), code, t0.elapsed(), String::new()));
                     }
