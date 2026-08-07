@@ -61,7 +61,12 @@ por construção — CRuby embutido).
 ## Architecture & Data Flow
 
 ```
-src/main.rs (Rust CLI, zero deps)
+src/main.rs (Rust CLI, zero deps — dispatch; lógica em módulos por domínio)
+  ├─ commands/run.rs, test.rs, task.rs, serve.rs, exec.rs, repl.rs,
+  │    build.rs, tooling.rs, deps.rs, doctor.rs (um módulo por comando)
+  ├─ daemon.rs + child.rs (daemon embutido Fase L + child do fork)
+  ├─ protocol.rs (RESP-style + SCM_RIGHTS), runtime.rs, appconfig.rs,
+  │    shims.rs, base64.rs
   ├─ include_str! embeds src/daemon/server.rb (Ruby — LEGADO only, rubies sem .so)
   ├─ spawns the daemon: EMBEDDED (Fase L) — o próprio binário calisto com a
   │    VM CRuby in-process (dlopen da libruby.so.<v> via crates/calisto-ruby,
@@ -110,7 +115,7 @@ Fase B (preload de app): `calisto.toml` na raiz da app (walk-up do cwd) com `[ru
 
 | Path | Purpose |
 |---|---|
-|`src/`|Rust CLI (`main.rs`) + embedded Ruby daemon (`daemon/server.rb`)|
+|`src/`|Rust CLI dividido em módulos por domínio (estrutura inspirada no cli/ do Deno/Bun): `main.rs` (dispatch + help, ~210 linhas), `commands/` (um módulo por comando: run/test/task/serve/exec/repl/build/tooling/deps/doctor), `daemon.rs` (accept loop embutido), `child.rs` (bootstrap do fork), `protocol.rs` (wire protocol RESP-style + SCM_RIGHTS), `runtime.rs` (dirs/spawn/resolução do ruby), `appconfig.rs` (calisto.toml/dotenv), `shims.rs` (shims ruby gerados), `base64.rs`; `daemon/server.rb` (daemon legado, embeddado via include_str!)|
 |`crates/calisto-build/`|Workspace crate: `src/lib.rs` (spawns bundler) + `src/build.rb` (Ripper bundler, embedded)|
 |`crates/calisto-ruby/`|Workspace crate (Fase L): CRuby embedding via dlopen — FFI hand-rolled zero deps (libruby.so.<v>, símbolos por dlsym, RTLD_GLOBAL), `libruby_path()` decide embutido vs legado; `NativeFns` (Fase P) — símbolos das APIs nativas (rb_define_method/TypedData/conversões)|
 |`crates/calisto-hash/`|Workspace crate (Fase P): `Calisto::Hash` — sha256 escalar + **SHA-NI** (`std::arch`, dispatch por `is_x86_feature_detected!`) e blake3 hand-rolled (port do reference_impl, vetores oficiais em `test/native.rs`)|
@@ -152,7 +157,7 @@ cargo test --test ruby_upstream    # just the ruby/ruby parity harness
 
 ## Code Conventions & Common Patterns
 
-**Rust** (`src/main.rs`, `crates/calisto-build/src/lib.rs`):
+**Rust** (`src/` módulos + crates):
 - Zero external dependencies. Raw FFI for `sendmsg`/`signal` via `unsafe extern "C"` + `#[repr(C)]` structs (`SOL_SOCKET`/`SCM_RIGHTS` = 1), hand-rolled base64, RESP framing.
 - Errors: `Result<T, String>` with `format!` (no anyhow/thiserror); CLI commands return `i32` and `main` does `std::process::exit(code)`. User-facing errors: `eprintln!("calisto: ...")` + `return 1`; warnings prefixed `calisto: warning:`.
 - `main()` calls `reset_sigpipe()` first (restores `SIG_DFL` — Rust ignores SIGPIPE by default, which panics on `calisto doctor | head`).
@@ -172,7 +177,7 @@ cargo test --test ruby_upstream    # just the ruby/ruby parity harness
 
 | File | Role |
 |---|---|
-|`src/main.rs`|CLI: `run` (`--cold`/`--time`/`--preload LIST`/`-e`), `test` (`--watch`), `task`, `serve` (`-p`/`-o`), `exec`, `repl`, `build` (`-o`/`--root`/`--compile`), `init` (`--force`), `upgrade` (`[version]`), `completions` (bash/zsh), `add`/`remove`/`lock`, `status`, `stop`, `doctor`, `help`; interno: `daemon --internal` (Fase L — daemon embutido, spawnado pelo próprio cliente quando o ruby resolvido tem libruby.so)|
+|`src/main.rs`|Ponto de entrada (~210 linhas): `reset_sigpipe` + dispatch dos comandos + `print_help`. A lógica vive nos módulos: `commands/` (run/test/task/serve/exec/repl/build/tooling/deps/doctor), `daemon.rs` (daemon embutido — Fase L), `child.rs`, `protocol.rs`, `runtime.rs`, `appconfig.rs`, `shims.rs`, `base64.rs`|
 |`src/daemon/server.rb`|Daemon LEGADO (rubies sem libruby.so — ex.: 3.4.4 — ou CALISTO_NO_EMBED=1): preload → bind (stale socket `EADDRINUSE`) → detach → `RequestReader` (recvmsg SCM_RIGHTS) → **accept loop multi-conexão** (select + waitpid WNOHANG; client-death kill TERM→KILL por conexão; STOP derruba children) → `child_enter` + `start_child`/`start_child_eval`. **Sem `require "base64"` no boot** (decoder hand-rolled). Fix Fase L: rescue `Errno::EBADF` no select (fd reaproveitado por outro io — derruba clientes+children e segue; o `calisto stop` do cliente re-tenta) |
 | `crates/calisto-ruby/src/lib.rs` | (Fase L) CRuby embedding: dlopen `libruby.so.<v>` (RTLD_NOW\|GLOBAL, símbolos por dlsym), `libruby_path(ruby)` decide embutido vs legado, `Ruby::open` + `boot` (ruby_sysinit → init_stack → init → `ruby_options(["-e",""])` = boot completo do CLI — prelude/rubygems incluído; `rb_path2class`/`rb_cObject` só depois do init — BSS), `require`/`load` via Kernel (hook do rubygems / rb_f_load — CWD p/ relativo), `eval_main_iseq` (parser → compile "-e" → iseq MAIN → eval_main — sem frames de eval), chamadas protegidas via `rb_protect` + trampolines (Mutex), `thread_atfork`, `cleanup(TAG)` |
 | `crates/calisto-build/src/build.rb` | Bundler: `walk_requires`, BFS collection, `split_end_marker`, gems do Gemfile.lock (pure + nativos `.so` p/ `$calisto_native` + pré-índice), bundle generation with loader |
