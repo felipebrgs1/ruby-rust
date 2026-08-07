@@ -24,7 +24,7 @@
 #![allow(non_camel_case_types)]
 #![allow(non_upper_case_globals)] // Qnil/Qfalse/Qtrue: constantes do ruby.h
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -34,6 +34,34 @@ pub type ID = usize;
 pub const Qnil: VALUE = 0x04;
 pub const Qfalse: VALUE = 0x00;
 pub const Qtrue: VALUE = 0x14;
+
+/// Callbacks do TypedData do CRuby (rtypeddata.h do 3.4 — layout estavel).
+#[repr(C)]
+pub struct RbDataTypeFunction {
+    pub dmark: Option<unsafe extern "C" fn(*mut c_void)>,
+    pub dfree: Option<unsafe extern "C" fn(*mut c_void)>,
+    pub dsize: Option<unsafe extern "C" fn(*const c_void) -> usize>,
+    pub dcompact: Option<unsafe extern "C" fn(*mut c_void)>,
+    /// Campo reservado do CRuby — precisa ser ZERO.
+    pub reserved: [*mut c_void; 1],
+}
+
+#[repr(C)]
+pub struct RbDataType {
+    pub wrap_struct_name: *const c_char,
+    pub function: RbDataTypeFunction,
+    pub parent: *const RbDataType,
+    pub data: *mut c_void,
+    pub flags: VALUE,
+}
+
+/// Fase P: libera o dfree no sweep phase (sem a maquina de defer do GC —
+/// os callbacks so tocam libs externas, nunca a VM).
+pub const RUBY_TYPED_FREE_IMMEDIATELY: VALUE = 1;
+
+/// Assinatura de metodo nativo (rb_define_method com argc=-1):
+/// `VALUE func(int argc, VALUE *argv, VALUE self)` — como C extension.
+pub type RbMethodFn = unsafe extern "C" fn(c_int, *mut VALUE, VALUE) -> VALUE;
 
 /// INT2FIX (valores pequenos): `(n << 1) | 1`, layout fixo do ruby.
 pub fn fixnum(n: i32) -> VALUE {
@@ -87,6 +115,49 @@ struct RubyFns {
     rb_parser_compile_string_path: unsafe extern "C" fn(VALUE, VALUE, VALUE, c_int) -> VALUE,
     rb_iseq_new_main: unsafe extern "C" fn(VALUE, VALUE, VALUE, VALUE, c_int) -> VALUE,
     rb_iseq_eval_main: unsafe extern "C" fn(VALUE) -> VALUE,
+}
+
+/// Fase P (APIs nativas `calisto.*`): simbolos extras do CRuby 3.4 usados
+/// pelos crates calisto-hash/calisto-sqlite para registrar metodos nativos
+/// (rb_define_method) e converter valores. Todos confirmados exportados no
+/// 3.4 (class.c/vm.c/string.c/error.c/gc.c/numeric.c/array.c/bignum.c).
+/// Globals (`rb_e*`) sao ENDERECOS dlsym'ados — o deref so e valido depois
+/// do boot (BSS da libruby inicializado pelo ruby_init), por isso ficam
+/// como `*const VALUE` e os getters do `Ruby` deref'am sob demanda.
+#[allow(non_snake_case)]
+pub struct NativeFns {
+    pub rb_define_module: unsafe extern "C" fn(*const c_char) -> VALUE,
+    pub rb_define_module_under: unsafe extern "C" fn(VALUE, *const c_char) -> VALUE,
+    pub rb_define_class_under: unsafe extern "C" fn(VALUE, *const c_char, VALUE) -> VALUE,
+    pub rb_define_method: unsafe extern "C" fn(VALUE, *const c_char, *const c_void, c_int),
+    pub rb_define_singleton_method: unsafe extern "C" fn(VALUE, *const c_char, *const c_void, c_int),
+    pub rb_define_alloc_func: unsafe extern "C" fn(VALUE, unsafe extern "C" fn(VALUE) -> VALUE),
+    pub rb_str_new: unsafe extern "C" fn(*const c_char, c_long) -> VALUE,
+    pub rb_utf8_str_new: unsafe extern "C" fn(*const c_char, c_long) -> VALUE,
+    pub rb_string_value: unsafe extern "C" fn(*mut VALUE) -> VALUE,
+    pub rb_string_value_ptr: unsafe extern "C" fn(*mut VALUE) -> *mut c_char,
+    pub rb_num2ll: unsafe extern "C" fn(VALUE) -> i64,
+    pub rb_ll2inum: unsafe extern "C" fn(i64) -> VALUE,
+    pub rb_ull2inum: unsafe extern "C" fn(u64) -> VALUE,
+    pub rb_num2dbl: unsafe extern "C" fn(VALUE) -> f64,
+    pub rb_float_new: unsafe extern "C" fn(f64) -> VALUE,
+    pub rb_ary_entry: unsafe extern "C" fn(VALUE, c_long) -> VALUE,
+    pub rb_ary_store: unsafe extern "C" fn(VALUE, c_long, VALUE),
+    pub rb_ary_new: unsafe extern "C" fn() -> VALUE,
+    pub rb_ary_push: unsafe extern "C" fn(VALUE, VALUE) -> VALUE,
+    pub rb_exc_new_cstr: unsafe extern "C" fn(VALUE, *const c_char) -> VALUE,
+    pub rb_exc_raise: unsafe extern "C" fn(VALUE),
+    pub rb_data_typed_object_wrap: unsafe extern "C" fn(VALUE, *mut c_void, *const RbDataType) -> VALUE,
+    pub rb_check_typeddata: unsafe extern "C" fn(VALUE, *const RbDataType) -> *mut c_void,
+    pub rb_id2sym: unsafe extern "C" fn(ID) -> VALUE,
+    pub rb_obj_is_kind_of: unsafe extern "C" fn(VALUE, VALUE) -> VALUE,
+    pub rb_eStandardError: *const VALUE,
+    pub rb_eArgError: *const VALUE,
+    pub rb_eTypeError: *const VALUE,
+    pub rb_eLoadError: *const VALUE,
+    pub rb_cString: *const VALUE,
+    pub rb_cInteger: *const VALUE,
+    pub rb_cFloat: *const VALUE,
 }
 
 fn last_dlerror() -> String {
@@ -277,6 +348,8 @@ pub struct Ruby {
     start_timer_thread: Option<unsafe extern "C" fn()>,
     c_object: VALUE,        // rb_cObject (global da VM)
     system_exit_class: VALUE,
+    /// Fase P: simbolos das APIs nativas (rb_define_method etc.).
+    native: NativeFns,
 }
 
 impl Ruby {
@@ -323,6 +396,42 @@ impl Ruby {
                 rb_iseq_eval_main: load_sym(handle, b"rb_iseq_eval_main\0")?,
             }
         };
+        let native = unsafe {
+            NativeFns {
+                rb_define_module: load_sym(handle, b"rb_define_module\0")?,
+                rb_define_module_under: load_sym(handle, b"rb_define_module_under\0")?,
+                rb_define_class_under: load_sym(handle, b"rb_define_class_under\0")?,
+                rb_define_method: load_sym(handle, b"rb_define_method\0")?,
+                rb_define_singleton_method: load_sym(handle, b"rb_define_singleton_method\0")?,
+                rb_define_alloc_func: load_sym(handle, b"rb_define_alloc_func\0")?,
+                rb_str_new: load_sym(handle, b"rb_str_new\0")?,
+                rb_utf8_str_new: load_sym(handle, b"rb_utf8_str_new\0")?,
+                rb_string_value: load_sym(handle, b"rb_string_value\0")?,
+                rb_string_value_ptr: load_sym(handle, b"rb_string_value_ptr\0")?,
+                rb_num2ll: load_sym(handle, b"rb_num2ll\0")?,
+                rb_ll2inum: load_sym(handle, b"rb_ll2inum\0")?,
+                rb_ull2inum: load_sym(handle, b"rb_ull2inum\0")?,
+                rb_num2dbl: load_sym(handle, b"rb_num2dbl\0")?,
+                rb_float_new: load_sym(handle, b"rb_float_new\0")?,
+                rb_ary_entry: load_sym(handle, b"rb_ary_entry\0")?,
+                rb_ary_store: load_sym(handle, b"rb_ary_store\0")?,
+                rb_ary_new: load_sym(handle, b"rb_ary_new\0")?,
+                rb_ary_push: load_sym(handle, b"rb_ary_push\0")?,
+                rb_exc_new_cstr: load_sym(handle, b"rb_exc_new_cstr\0")?,
+                rb_exc_raise: load_sym(handle, b"rb_exc_raise\0")?,
+                rb_data_typed_object_wrap: load_sym(handle, b"rb_data_typed_object_wrap\0")?,
+                rb_check_typeddata: load_sym(handle, b"rb_check_typeddata\0")?,
+                rb_id2sym: load_sym(handle, b"rb_id2sym\0")?,
+                rb_obj_is_kind_of: load_sym(handle, b"rb_obj_is_kind_of\0")?,
+                rb_eStandardError: std::mem::transmute_copy(&dlsym(handle, b"rb_eStandardError\0".as_ptr() as *const c_char)),
+                rb_eArgError: std::mem::transmute_copy(&dlsym(handle, b"rb_eArgError\0".as_ptr() as *const c_char)),
+                rb_eTypeError: std::mem::transmute_copy(&dlsym(handle, b"rb_eTypeError\0".as_ptr() as *const c_char)),
+                rb_eLoadError: std::mem::transmute_copy(&dlsym(handle, b"rb_eLoadError\0".as_ptr() as *const c_char)),
+                rb_cString: std::mem::transmute_copy(&dlsym(handle, b"rb_cString\0".as_ptr() as *const c_char)),
+                rb_cInteger: std::mem::transmute_copy(&dlsym(handle, b"rb_cInteger\0".as_ptr() as *const c_char)),
+                rb_cFloat: std::mem::transmute_copy(&dlsym(handle, b"rb_cFloat\0".as_ptr() as *const c_char)),
+            }
+        };
         // Protocolo de fork: rb_thread_stop/start_timer_thread sao simbolos
         // LOCAIS (sem dlsym) — resolvidos pelo .symtab do arquivo, ancorados
         // no ruby_options ja dlsym'ado (load bias cancela). Sem eles, o
@@ -349,6 +458,7 @@ impl Ruby {
             // system_exit_class/c_object so existem apos o boot (BSS da
             // libruby inicializado pelo ruby_init; rb_path2class antes = crash)
             system_exit_class: Qnil,
+            native,
         })
     }
 
@@ -521,6 +631,78 @@ impl Ruby {
     pub fn intern(&self, name: &str) -> ID {
         let cname = CString::new(name).unwrap_or_else(|_| CString::new("").unwrap());
         unsafe { (self.fns.rb_intern)(cname.as_ptr()) }
+    }
+
+    /// Fase P: tabela de simbolos das APIs nativas (calisto-hash/sqlite).
+    pub fn native(&self) -> &NativeFns {
+        &self.native
+    }
+
+    pub fn c_object(&self) -> VALUE {
+        self.c_object
+    }
+
+    // Globals de excecao — deref do endereco dlsym'ado SO apos o boot
+    // (BSS da libruby inicializado pelo ruby_init).
+    pub fn e_standard_error(&self) -> VALUE {
+        unsafe { *self.native.rb_eStandardError }
+    }
+
+    pub fn e_arg_error(&self) -> VALUE {
+        unsafe { *self.native.rb_eArgError }
+    }
+
+    pub fn e_type_error(&self) -> VALUE {
+        unsafe { *self.native.rb_eTypeError }
+    }
+
+    pub fn e_load_error(&self) -> VALUE {
+        unsafe { *self.native.rb_eLoadError }
+    }
+
+    pub fn c_string(&self) -> VALUE {
+        unsafe { *self.native.rb_cString }
+    }
+
+    pub fn c_integer(&self) -> VALUE {
+        unsafe { *self.native.rb_cInteger }
+    }
+
+    pub fn c_float(&self) -> VALUE {
+        unsafe { *self.native.rb_cFloat }
+    }
+
+    pub fn is_kind_of(&self, obj: VALUE, klass: VALUE) -> bool {
+        unsafe { (self.native.rb_obj_is_kind_of)(obj, klass) == Qtrue }
+    }
+
+    /// Bytes (ptr, len) de um VALUE String (converte via to_str; TypeError
+    /// via longjmp em caso de falha). Pode conter NUL embutido — usa
+    /// rb_string_value_ptr (sem o check de C string do _cstr). O tamanho
+    /// vem de `String#bytesize` (rb_str_bytesize NAO e exportado no 3.4;
+    /// rb_str_strlen devolve caracteres para multibyte).
+    pub fn string_bytes(&self, v: &mut VALUE) -> (*const u8, usize) {
+        let sv = unsafe { (self.native.rb_string_value)(v) };
+        let mid = self.intern("bytesize");
+        let len_v = unsafe { (self.fns.rb_funcallv)(sv, mid, 0, std::ptr::null()) };
+        let len = unsafe { (self.native.rb_num2ll)(len_v) };
+        let mut sv2 = sv;
+        let ptr = unsafe { (self.native.rb_string_value_ptr)(&mut sv2) };
+        (ptr as *const u8, len.max(0) as usize)
+    }
+
+    /// `raise` equivalente ao rb_raise (longjmp para o frame de protecao da
+    /// VM — o metodo nativo roda sob rb_protect do dispatch). Nunca retorna.
+    pub fn raise(&self, class: VALUE, msg: &str) -> ! {
+        let c = CString::new(msg).unwrap_or_else(|_| CString::new("(mensagem invalida)").unwrap());
+        let exc = unsafe { (self.native.rb_exc_new_cstr)(class, c.as_ptr()) };
+        unsafe { (self.native.rb_exc_raise)(exc) };
+        unreachable!("rb_exc_raise longjmp nunca retorna")
+    }
+
+    /// Nova String UTF-8 de bytes (para hexdigest etc.).
+    pub fn utf8_str(&self, bytes: &[u8]) -> VALUE {
+        unsafe { (self.native.rb_utf8_str_new)(bytes.as_ptr() as *const c_char, bytes.len() as c_long) }
     }
 
     /// Constante de Object (ex.: TOPLEVEL_BINDING).

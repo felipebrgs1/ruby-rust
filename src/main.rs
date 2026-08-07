@@ -937,6 +937,36 @@ fn install_daemon_signal_handlers() {
 /// preload -> app preload -> bind (stale socket) -> pidfile -> detach ->
 /// traps -> loop (select 10ms, accept, comandos, waitpid WNOHANG).
 fn daemon_main(vm: &calisto_ruby::Ruby, requires: &[String]) -> Result<i32, String> {
+    let sock = PathBuf::from(
+        env::var("CALISTO_SOCKET").map_err(|_| "CALISTO_SOCKET nao definido".to_string())?,
+    );
+    // Fase P: APIs nativas calisto.* — registradas no boot (Rust ->
+    // rb_define_method na VM embutida), antes do preload/compact para o
+    // heap dos modulos entrar na compactacao. Os shims vivem no dir do
+    // socket (que o child injeta no $LOAD_PATH apos o Bundler.setup) e o
+    // daemon da app preload/warmup tambem enxerga o dir (unshift no boot).
+    let native_dir = sock
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    ensure_native_shims(&native_dir);
+    let native_dir_s = native_dir.to_string_lossy().into_owned();
+    vm.set_gv("$calisto_native_dir", vm.str(&native_dir_s));
+    // o proprio daemon tambem precisa do dir no loadpath (app preload/warmup)
+    let lp_snippet = r#"if (d = $calisto_native_dir) && !$LOAD_PATH.include?(d)
+  $LOAD_PATH.unshift(d)
+end"#;
+    if let Err(e) = vm.eval(lp_snippet) {
+        return Err(format!("native loadpath: {}", vm.error_summary(e)));
+    }
+    if let Err(e) = calisto_hash::register(vm) {
+        return Err(format!("registro calisto/hash falhou: {e}"));
+    }
+    if let Err(e) = calisto_sqlite::register(vm) {
+        // sem libsqlite3 do sistema: degrada — o shim do require levanta
+        // LoadError claro (o calisto segue util sem o sqlite nativo)
+        eprintln!("calisto: warning: calisto/sqlite indisponivel: {e}");
+    }
     // boot: flags -r (ex.: -rbundler/setup do daemon da app) antes do preload
     for name in requires {
         if let Err(e) = vm.require(name) {
@@ -1013,9 +1043,6 @@ end
         }
     }
     // bind com stale-socket recovery (EADDRINUSE -> live? -> exit 0 | unlink)
-    let sock = PathBuf::from(
-        env::var("CALISTO_SOCKET").map_err(|_| "CALISTO_SOCKET nao definido".to_string())?,
-    );
     let pidfile = env::var_os("CALISTO_PIDFILE").map(PathBuf::from);
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
@@ -1300,11 +1327,15 @@ fn child_main(
     if let Err(e) = vm.require("bundler/setup") {
         child_error(vm, e);
     }
-    // -I do child (calisto test): depois do Bundler.setup (limpa $LOAD_PATH)
+    // -I do child (calisto test) + dir nativo (Fase P: shims calisto/*).
+    // Depois do Bundler.setup (limpa $LOAD_PATH).
     let loadpath_snippet = r#"if (lp = ENV["CALISTO_LOAD_PATH"])
   lp.split(":").reject(&:empty?).each do |p|
     $LOAD_PATH.unshift(p) unless $LOAD_PATH.include?(p)
   end
+end
+if (d = $calisto_native_dir)
+  $LOAD_PATH.unshift(d) unless $LOAD_PATH.include?(d)
 end"#;
     if let Err(e) = vm.eval(loadpath_snippet) {
         child_error(vm, e);
@@ -1858,7 +1889,13 @@ fn app_daemon(app: &Option<AppConfig>) -> Option<&AppConfig> {
 fn run_cold(ruby: &Path, script: &str, args: &[String], cwd: &Path) -> i32 {
     // -rbundler/setup: ativa o Gemfile do cwd (como `bundle exec ruby`);
     // no-op fora de bundle, mantendo a paridade com o daemon warm.
+    // -I <runtime>: shims nativos calisto/sqlite.rb + calisto/hash.rb (o
+    // hash cai no fallback Digest — paridade cold/warm; o sqlite levanta
+    // LoadError claro, e nativo do daemon).
+    let shims = native_shims_dir(ruby);
     match Command::new(ruby)
+        .arg("-I")
+        .arg(&shims)
         .arg("-rbundler/setup")
         .arg(script)
         .args(args)
@@ -1874,7 +1911,10 @@ fn run_cold(ruby: &Path, script: &str, args: &[String], cwd: &Path) -> i32 {
 
 /// `--cold -e 'code'`: interpretador direto com `-e`, idem `ruby -e`.
 fn run_cold_eval(ruby: &Path, code: &str, args: &[String]) -> i32 {
+    let shims = native_shims_dir(ruby);
     match Command::new(ruby)
+        .arg("-I")
+        .arg(&shims)
         .arg("-rbundler/setup")
         .arg("-e")
         .arg(code)
@@ -2365,7 +2405,10 @@ fn cmd_task(args: &[String]) -> i32 {
         None => daemon_dir_for(&ruby),
     };
     fs::create_dir_all(&dir).ok();
-    let shim = dir.join("rake.rb");
+    // nome "task.rb" (nao "rake.rb"): com o dir de runtime no $LOAD_PATH
+    // (Fase P — shims calisto/*), um "rake.rb" no dir sombrearia o
+    // `require "rake"` do proprio rake (o exe/rake faz require "rake")
+    let shim = dir.join("task.rb");
     if !shim.is_file() {
         if let Err(e) = fs::write(&shim, RAKE_SHIM) {
             eprintln!("calisto: cannot write rake shim: {e}");
@@ -2390,6 +2433,72 @@ fn cmd_task(args: &[String]) -> i32 {
         },
     };
     run_request_full(&mut stream, &root.to_string_lossy(), &[], &shim.to_string_lossy(), args)
+}
+
+// ---- Fase P: APIs nativas calisto.* -----------------------------------------
+
+/// Shim de `require "calisto/sqlite"` (Fase P): os metodos nativos sao
+/// registrados no boot do daemon (Rust -> rb_define_method); este arquivo so
+/// torna o require resolvivel no $LOAD_PATH. Sem o modulo (--cold, daemon
+/// legado, libsqlite3 ausente) levanta LoadError claro.
+const SQLITE_SHIM: &str = "# frozen_string_literal: true
+# Gerado pelo calisto (Fase P): marcador das APIs nativas `calisto/sqlite`
+# (binding Rust sobre libsqlite3 do sistema, registrado no boot do daemon).
+unless defined?(Calisto::SQLite)
+  raise LoadError, \"calisto/sqlite e nativo do daemon calisto (indisponivel em --cold ou com daemon legado)\"
+end
+Calisto::SQLite
+";
+
+/// Shim de `require "calisto/hash"`: no daemon o modulo e nativo (Rust);
+/// em --cold cai no fallback puro com Digest::SHA256 (mesmo hexdigest —
+/// paridade cold/warm). blake3 nao existe na stdlib — erro claro no cold.
+const HASH_SHIM: &str = "# frozen_string_literal: true
+# Gerado pelo calisto (Fase P): marcador das APIs nativas `calisto/hash`
+# (sha256/blake3 em Rust no daemon). Fallback puro em --cold: sha256 via
+# Digest (mesmo hexdigest — paridade cold/warm); blake3 e so nativo.
+if defined?(Calisto::Hash)
+  Calisto::Hash
+else
+  require \"digest\"
+  module Calisto
+    module Hash
+      def self.sha256(data)
+        Digest::SHA256.hexdigest(data)
+      end
+
+      def self.blake3(_data)
+        raise NotImplementedError, \"Calisto::Hash.blake3 requer o daemon calisto (indisponivel em --cold)\"
+      end
+    end
+  end
+end
+";
+
+/// Escreve os shims nativos no dir (idempotente). O daemon chama no boot
+/// (cobre run/test/task/serve/exec/repl/status/stop) e o cold mode chama
+/// via `native_shims_dir` para o `-I`.
+fn ensure_native_shims(dir: &Path) {
+    let _ = fs::create_dir_all(dir.join("calisto"));
+    for (name, content) in [
+        ("calisto/sqlite.rb", SQLITE_SHIM),
+        ("calisto/hash.rb", HASH_SHIM),
+    ] {
+        let p = dir.join(name);
+        if !p.is_file() {
+            if let Err(e) = fs::write(&p, content) {
+                eprintln!("calisto: warning: nao consegui escrever {}: {e}", p.display());
+            }
+        }
+    }
+}
+
+/// Dir de runtime com os shims nativos (para o `-I` do cold mode).
+fn native_shims_dir(ruby: &Path) -> PathBuf {
+    let dir = daemon_dir_for(ruby);
+    fs::create_dir_all(&dir).ok();
+    ensure_native_shims(&dir);
+    dir
 }
 
 // ---- Fase E: calisto serve ---------------------------------------------------

@@ -1,0 +1,8 @@
+[package]
+name = "calisto-sqlite"
+version = "0.1.0"
+edition = "2021"
+description = "Fase P: binding nativo Calisto::SQLite sobre libsqlite3 do sistema (FFI hand-rolled, zero crates)"
+
+[dependencies]
+calisto-ruby = { path = "../calisto-ruby" }

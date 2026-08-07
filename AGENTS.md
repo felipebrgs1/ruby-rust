@@ -45,8 +45,15 @@ argv da heap com env da stack → strlcpy+zeroing gigantes; o teste
 `concurrent_runs_serialize_through_daemon` pegava 8 NULs no script path),
 timer thread da VM parada antes do fork (`rb_thread_stop/start_timer_thread`
 via .symtab da libruby — deadlock do sched.lock) e fork-safety do stdio do
-glibc via pthread_atfork). O roadmap mira a **Fase O (snapshot criu)** e
-depois P (APIs nativas `calisto.*`) e Q (distribuição).
+glibc via pthread_atfork) e **Fase P completa** (APIs nativas `calisto.*` —
+`rb_define_method` via FFI no boot do daemon: `Calisto::Hash.sha256/blake3`
+em Rust puro — blake3 validado contra os vetores oficiais, sha256 com
+SHA-NI — e `Calisto::SQLite` sobre a libsqlite3 do sistema com TypedData;
+shims `calisto/sqlite.rb`+`calisto/hash.rb` no dir de runtime injetado no
+`$LOAD_PATH` do child pós-Bundler.setup; cold: hash cai no fallback Digest,
+sqlite levanta LoadError claro; benchmark sha256 100MB: **6.9×** o
+Digest::SHA256). O roadmap mira a **Fase Q (distribuição)**; O (snapshot
+criu) segue como spike de risco.
 
 ## Architecture & Data Flow
 
@@ -72,7 +79,7 @@ src/main.rs (Rust CLI, zero deps)
 
 **`calisto test` flow** (Fase E): detecta minitest (`test/**/*_test.rb`) ou rspec (`.rspec`/`spec/**/*_spec.rb`), usa um **daemon de teste dedicado** — igual ao da app, mas com `RAILS_ENV=test`/`RACK_ENV=test` no boot e socket próprio (hash inclui sal `"test"`; o Rails fixa o env no boot, um fork do boot dev nunca enxergaria `:test`). Cada arquivo é um `RUN` (fork) no daemon quente, em paralelo (worker por CPU, teto = nº de arquivos; o accept loop multi-conexão é o que permite). `CALISTO_LOAD_PATH=test|spec` no env do RUN injeta `-I` no child (depois do `Bundler.setup`, que limpa o `$LOAD_PATH`) para `require "test_helper"`/`rails_helper` funcionar. `--watch` roda no cliente Rust (polling de mtime a cada 300ms) — fork-safe por construção, sem listen/inotify (lição do Chatwoot).
 
-**`calisto task`** (Fase E): rake no daemon quente via shim `load Gem.bin_path("rake", "rake")` (equivale ao `bin/rake` do Rails, sem exigir binstub), gerado no dir de runtime; roda no daemon da app (dev).
+**`calisto task`** (Fase E): rake no daemon quente via shim `load Gem.bin_path("rake", "rake")` (equivale ao `bin/rake` do Rails, sem exigir binstub), gerado no dir de runtime como `task.rb` (não `rake.rb` — o dir de runtime entrou no `$LOAD_PATH` na Fase P e um `rake.rb` lá sombrearia o `require "rake"` do próprio rake); roda no daemon da app (dev).
 
 **`calisto serve`** (Fase E): launcher `serve.rb` no dir de runtime → `Rack::Builder.parse_file(config.ru)` + `Rackup::Server.start` (rack 3/rackup) com fallback `Rack::Server` (rack 2); o server roda como child do fork; kill no cliente derruba via client-death kill.
 
@@ -102,8 +109,10 @@ Fase B (preload de app): `calisto.toml` na raiz da app (walk-up do cwd) com `[ru
 |---|---|
 |`src/`|Rust CLI (`main.rs`) + embedded Ruby daemon (`daemon/server.rb`)|
 |`crates/calisto-build/`|Workspace crate: `src/lib.rs` (spawns bundler) + `src/build.rb` (Ripper bundler, embedded)|
-|`crates/calisto-ruby/`|Workspace crate (Fase L): CRuby embedding via dlopen — FFI hand-rolled zero deps (libruby.so.<v>, símbolos por dlsym, RTLD_GLOBAL), `libruby_path()` decide embutido vs legado|
-|`crates/calisto-{test,task,serve,sqlite,tooling,cli,runtime}/`|Planned modules, only `.gitkeep` — do not implement until they get a `Cargo.toml`|
+|`crates/calisto-ruby/`|Workspace crate (Fase L): CRuby embedding via dlopen — FFI hand-rolled zero deps (libruby.so.<v>, símbolos por dlsym, RTLD_GLOBAL), `libruby_path()` decide embutido vs legado; `NativeFns` (Fase P) — símbolos das APIs nativas (rb_define_method/TypedData/conversões)|
+|`crates/calisto-hash/`|Workspace crate (Fase P): `Calisto::Hash` — sha256 escalar + **SHA-NI** (`std::arch`, dispatch por `is_x86_feature_detected!`) e blake3 hand-rolled (port do reference_impl, vetores oficiais em `test/native.rs`)|
+|`crates/calisto-sqlite/`|Workspace crate (Fase P): binding `Calisto::SQLite` sobre libsqlite3 do sistema (dlopen `libsqlite3.so.0`, FFI hand-rolled) — Database/Statement via TypedData com dfree no GC|
+|`crates/calisto-{test,task,serve,tooling,cli,runtime}/`|Planned modules, only `.gitkeep` — do not implement until they get a `Cargo.toml`|
 |`test/`|Integration suite (`common/mod.rs` harness, `cli.rs`, `stdio.rs`, `daemon.rs`, `preload.rs`, `build.rs`, `ruby_upstream.rs`, `bundler.rs`, `app.rs`, `realapps.rs`, `testcmd.rs`, `exec.rs`, `scripts.rs`, `versions.rs`, `tooling.rs`, `deps.rs`), `fixtures/` (inclui `gemapp/`, `sinatraapp/` da Fase A, `preloadapp/`, `railsapp/` da Fase B/C e `maybe/`, `chatwoot/` — checkouts gitignored — dos degraus 4/5 da Fase D), `vendor/ruby/` (upstream ruby/ruby tests)|
 | `scripts/` | `build-ruby.sh` — builds the pinned CRuby |
 | `examples/` | `hello.rb` (preload smoke), `bench.rb` (stdlib workload for `--time`) |
@@ -165,6 +174,8 @@ cargo test --test ruby_upstream    # just the ruby/ruby parity harness
 | `crates/calisto-ruby/src/lib.rs` | (Fase L) CRuby embedding: dlopen `libruby.so.<v>` (RTLD_NOW\|GLOBAL, símbolos por dlsym), `libruby_path(ruby)` decide embutido vs legado, `Ruby::open` + `boot` (ruby_sysinit → init_stack → init → `ruby_options(["-e",""])` = boot completo do CLI — prelude/rubygems incluído; `rb_path2class`/`rb_cObject` só depois do init — BSS), `require`/`load` via Kernel (hook do rubygems / rb_f_load — CWD p/ relativo), `eval_main_iseq` (parser → compile "-e" → iseq MAIN → eval_main — sem frames de eval), chamadas protegidas via `rb_protect` + trampolines (Mutex), `thread_atfork`, `cleanup(TAG)` |
 | `crates/calisto-build/src/build.rb` | Bundler: `walk_requires`, BFS collection, `split_end_marker`, gems do Gemfile.lock (pure + nativos `.so` p/ `$calisto_native` + pré-índice), bundle generation with loader |
 | `crates/calisto-build/src/lib.rs` | `bundle(ruby, entry, out, root) -> Result<BundleStats, String>`; parses `BUNDLED <n>` |
+| `crates/calisto-hash/src/lib.rs` | (Fase P) registro de `Calisto::Hash` (rb_define_singleton_method); `sha256.rs` (escalar + dispatch SHA-NI) e `blake3.rs` (one-shot fiel ao reference_impl) |
+| `crates/calisto-sqlite/src/lib.rs` | (Fase P) dlopen da libsqlite3 + FFI hand-rolled, TypedData (Database/Statement com dfree), `register(vm)` best-effort (sem a lib → daemon degrada, shim levanta LoadError) |
 | `scripts/build-ruby.sh` | Pin `RUBY_VERSION` (default 3.4.10; sha conhecido p/ 3.4.4 também), vendored libyaml, `--enable-shared` (Fase L: `lib/libruby.so.<v>` p/ o daemon embutido), `vendor/ruby-<v>/` + symlink `vendor/current` (não troca ao construir versão extra), `CALISTO_REBUILD=1` força rebuild **destrutivo** (rm -rf do prefixo — ver armadilha no fim) |
 | `test/common/mod.rs` | Integration harness shared by all test targets |
 
@@ -178,7 +189,7 @@ cargo test --test ruby_upstream    # just the ruby/ruby parity harness
 
 ## Testing & QA
 
-Framework: **cargo integration tests** (15 targets in `test/`, declared as `[[test]]` in `Cargo.toml`). No unit tests in `main.rs` (0 tests there is expected).
+Framework: **cargo integration tests** (16 targets in `test/`, declared as `[[test]]` in `Cargo.toml`). No unit tests in `main.rs` (0 tests there is expected).
 
 Harness (`test/common/mod.rs`): each test spawns the real binary via `env!("CARGO_BIN_EXE_calisto")` with a **unique `CALISTO_RUNTIME_DIR`** (isolated daemon per test → parallel-safe). `run_opt` pipes stdio, writes stdin, and enforces a **timeout** (kills + panics if the daemon ever holds a pipe — a known regression class). `spawn_stdout` for live-process tests (read child pid, send signals).
 
@@ -199,6 +210,7 @@ Coverage contract:
 - `versions.rs` — **Fase I (multi-versões)**: gated em `vendor/ruby-3.4.4` (RUBY_VERSION=3.4.4 scripts/build-ruby.sh): `.ruby-version` seleciona (prefixo `ruby-` tolerado) com cold/warm concordando; diretiva `ruby "3.4.4"` do Gemfile seleciona (lock vazio hermético); versão não instalada → erro claro com o build; daemons genéricos isolados por versão (`runtime_dir/ruby-3.4.4/` — stop de um não derruba o outro); daemon da app por versão (hash do socket inclui a versão — o mesmo app em 3.4.4 e default paga o boot UMA vez cada, `apps/` com 2 dirs). O gate `bundle_check` do harness resolve a versão da app (`.ruby-version`/Gemfile → bundler do vendor certo).
 - `tooling.rs` — **Fase J (init/upgrade/completions)**: `calisto init` (cwd explícito no teste — nunca herdar o cwd do processo!) gera calisto.toml + hello.rb executável + .gitignore e o app roda com `calisto run` BARE (= `[scripts] start`, convenção npm/bun — `run` sem script sem `start` continua erro de uso), com `run hello.rb` (arquivo vence) e `--cold` (paridade); nunca sobrescreve sem `--force`; nome-é-arquivo/flag desconhecida → erro. `upgrade` roda o build script (fake via `CALISTO_BUILD_SCRIPT`; sem versão = pin default, com versão passa `RUBY_VERSION`), propaga o exit code do script, versão sem sha conhecido (3.4.10/3.4.4) falha ANTES de spawnar e script ausente/args demais → erro claro. `completions bash|zsh` imprimem scripts instaláveis (`complete -F _calisto calisto`/`#compdef calisto`); shell ausente/desconhecido → erro de uso.
 - `deps.rs` — **Fase K (add/remove/lock)**: wrapper fino do bundle com fake via `CALISTO_BUNDLE` (hermético): args passam direto, cwd na raiz do projeto (dir do Gemfile — walk-up), `BUNDLE_GEMFILE` setado, PATH prefixado com o bin dir do ruby (trap do restart do bundler), `CALISTO_BUNDLE_RUBY` exportado e exit code propaga (FAKE_BUNDLE_RC); sem Gemfile → erro claro sugerindo `bundle init`; `.ruby-version` 3.4.4 → bundle do `vendor/ruby-3.4.4` (gated, como versions.rs).
+- `native.rs` — **Fase P (APIs nativas calisto.\*)**: blake3 contra os **vetores oficiais** (13 comprimentos: 0..102400 — chunk único/cheio/árvore; input = padrão cíclico de 251 bytes como o test_vectors.json); sha256 com paridade cold/warm E com `Digest::SHA256` em 7 tamanhos (cobre SHA-NI vs stdlib); sqlite hermético em `:memory:` (binds de todos os tipos, prepared statement reutilizado com re-bind, changes/rowid/columns, close/closed?, `Calisto::SQLite::Error` com errmsg, multi-statement → erro, TypeError em bind inválido); cold sqlite → LoadError claro; benchmark sha256 de 100MB: ratio ≥3× o Digest no **--release** (debug não mede — Rust sem otimização; skip sem `sha_ni` na CPU).
 
 QA rule of thumb: for any change to `run` semantics, the acceptance test is `cold_and_warm_agree` plus the upstream parity harness — if pure `ruby` and calisto diverge, it's a bug in calisto.
 
@@ -207,3 +219,4 @@ QA rule of thumb: for any change to `run` semantics, the acceptance test is `col
 - **Bundler restart por shebang**: o ruby 3.4.10 embute bundler 2.6.9; app cujo `Gemfile.lock` pina outra versão (ex.: Chatwoot locka 2.5.16) dispara `Bundler::SelfManager#restart_with_locked_bundler_if_needed` no `require 'bundler/setup'` frio — o bundler re-executa o processo via shebang `#!/usr/bin/env ruby` e **precisa de `ruby` no PATH** (senão: `env: 'ruby': No such file`). O daemon warm não é afetado (o restart acontece no boot do daemon, que não tem shebang; o child herda o bundler já ativo). `calisto run --cold bin/rails ...` num app com bundler divergente exige `PATH` com o ruby pinado; o `calisto add/remove/lock` (Fase K) já prefixa o PATH com o bin dir do ruby resolvido.
 - **Rebuild in-place do ruby (Fase L)**: `CALISTO_REBUILD=1` agora é **destrutivo** (rm -rf do prefixo) — sem isso, o `make` roda o passo de instalação das default gems com C ext usando o `bin/ruby` **stale** ainda no prefixo e grava as exts no dir de api da build antiga (`extensions/.../<ver>-static/`), criando specs "regulares" órfãos das default gems (cgi/date/erb/stringio). O rubygems passa a "Ignoring <gem> because its extensions are not built" no boot do daemon — sintoma: teste de paridade de backtrace do `-e` falha (warm com a linha extra no stderr). Se aparecer, limpar `specifications/<gem>.gemspec` + `gems/<gem>/` órfãos resolve (default gems voltam a ser default).
 - **Shell persistente**: `export RAILS_ENV=test`/`POSTGRES_*` no shell do dev vaza para o `cargo test` (o teste `rails_console_runs_in_app_context` espera `development` e quebra). Rodar a suíte com o ambiente limpo.
+- **`rb_str_bytesize` não é exportado** (Fase P): o CRuby 3.4 não exporta o bytesize em bytes (só `rb_str_strlen`, que devolve CARACTERES para multibyte) — `Ruby::string_bytes` usa `String#bytesize` via `rb_funcallv`. Qualquer binding nativo novo deve conferir o símbolo com `nm -D` antes de assumir.

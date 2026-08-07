@@ -1,0 +1,8 @@
+[package]
+name = "calisto-hash"
+version = "0.1.0"
+edition = "2021"
+description = "Fase P: APIs nativas Calisto::Hash (sha256/blake3 em Rust) registradas na VM embutida"
+
+[dependencies]
+calisto-ruby = { path = "../calisto-ruby" }

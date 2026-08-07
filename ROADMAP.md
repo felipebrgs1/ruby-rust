@@ -17,7 +17,7 @@ graph LR
     K --> L[Fase L: CRuby embutido — libruby]
     L --> M[Fase M: memória / CoW]
     L --> N[Fase N: YJIT quente no fork ✅]
-    L --> P[Fase P: APIs nativas calisto.*]
+    L --> P[Fase P: APIs nativas calisto.* ✅]
     M --> O[Fase O: snapshot de boot]
     N --> O
     P --> Q[Fase Q: distribuição — binário único]
@@ -301,28 +301,60 @@ Mesmo com tudo acima, o **primeiro** comando numa app paga o boot do daemon
 - Estimativa: 2–3 semanas (spike primeiro; fase de risco, escopada para
   falhar barato).
 
-### Fase P — APIs nativas `calisto.*` (o Bun.* do Ruby)
-Com a VM embutida, o calisto pode registrar métodos Ruby implementados em
-Rust (`rb_define_method` via FFI) — APIs rápidas que existem **porque**
-você roda no calisto. É o equivalente ao `Bun.serve`/`Bun.sql`. O stub
-`crates/calisto-sqlite` já existe para isso.
+### Fase P — APIs nativas `calisto.*` (o Bun.* do Ruby) ✅
+Com a VM embutida, o calisto registra métodos Ruby implementados em Rust
+(`rb_define_method` via FFI) — APIs rápidas que existem **porque** você roda
+no calisto. É o equivalente ao `Bun.sql`/`Bun.CryptoHasher`. O stub
+`crates/calisto-sqlite` virou crate de verdade + o novo `crates/calisto-hash`.
 
-- [ ] **P.1 — `calisto/sqlite`**: binding fino sobre `libsqlite3` do sistema
-      (FFI hand-rolled, zero crates — convenção do repo): `Calisto::SQLite.open`,
-      `#execute` com bind params, prepared statements reutilizados.
-      Mesma forma do `bun:sqlite`; não substitui ActiveRecord — é para
-      scripts e tooling (o próprio calisto pode usar para caches futuros).
-- [ ] **P.2 — `calisto/hash`**: `Calisto::Hash.sha256/blake3(string)` em
-      Rust (blake3 hand-rolled é ~500 linhas; sha256 ~80) — 10–50× o
-      `Digest` puro para payloads grandes. Escopo deliberadamente mínimo:
-      prova do mecanismo de extensão nativa, não uma stdlib nova.
-- [ ] **Não fazer (ainda)**: HTTP server em Rust chamando Ruby por request
+- [x] **P.1 — `calisto/sqlite`**: binding fino sobre `libsqlite3` do sistema
+      (dlopen `libsqlite3.so.0`, FFI hand-rolled, zero crates — convenção do
+      repo): `Calisto::SQLite.open(path | :memory:)` → `Database` (`#execute`
+      com bind params, `#prepare` → `Statement` **reutilizado** com reset +
+      re-bind, `#changes`, `#last_insert_rowid`, `#columns`, `#close`/
+      `#closed?`, `Calisto::SQLite::Error < StandardError` com o
+      `sqlite3_errmsg`). Handles via **TypedData** do CRuby
+      (`rb_data_typed_object_wrap` + dfree no GC, `rb_define_alloc_func` —
+      sem o alloc próprio o CRuby avisa "undefining the allocator of T_DATA
+      class" a cada instância). Bind de nil/bool/Integer/Float/String
+      (TypeError para outros tipos); múltiplas statements numa chamada →
+      erro claro (uma por chamada, como o execute do gem).
+- [x] **P.2 — `calisto/hash`**: `Calisto::Hash.sha256/blake3(string)` em
+      Rust puro (blake3 hand-rolled ~250 linhas, port fiel do
+      reference_impl; sha256 escalar + **SHA-NI** via `std::arch` — os
+      intrínsecos SHA são estáveis no toolchain atual). Escopo
+      deliberadamente mínimo: prova do mecanismo de extensão nativa.
+- [x] **Mecânica**: registro no boot do daemon embutido (Rust →
+      `rb_define_module`/`rb_define_method` antes do preload/compact — os
+      children do fork herdam os métodos); shims `calisto/sqlite.rb` +
+      `calisto/hash.rb` escritos no dir de runtime (padrão exec.rb) e o dir
+      injetado no `$LOAD_PATH` do child **depois** do Bundler.setup (que
+      limpa o load path) via gvar `$calisto_native_dir`; **cold mode** com
+      `-I <dir>`: hash cai no fallback `Digest::SHA256` (paridade
+      cold/warm), sqlite levanta LoadError claro (é nativo do daemon).
+      Sem `libsqlite3` no sistema o daemon degrada (avisa e segue — o shim
+      cobre). Daemon legado (server.rb): LoadError natural (sem o gvar).
+- [x] **Não fazer (ainda)**: HTTP server em Rust chamando Ruby por request
       — exige GVL por request + marshalling, complexidade de framework
       inteiro; `calisto serve` + puma já cobre. Revisitar depois de medir.
-- Marco: script stdlib-only `require "calisto/sqlite"` roda no daemon
-  genérico sem gem nenhuma (hermético); benchmark sha256 de 100MB:
-  calisto ≥10× `Digest::SHA256`. Testes novos em `test/native.rs`.
-- Estimativa: 2 semanas (P.1 é o grosso).
+- Marco ✅: `require "calisto/sqlite"` + `require "calisto/hash"` rodam no
+  daemon genérico **sem gem nenhuma** (hermético) — `test/native.rs`, 5
+  testes (blake3 contra os **vetores oficiais** — 13 comprimentos cobrindo
+  chunk único/cheio/árvore; sha256 com paridade cold/warm + Digest;
+  sqlite em memória com binds/prepared/reuso/erros; cold sqlite → erro
+  claro; benchmark). **Benchmark real (sha256 de 100MB, release): 1802 MB/s
+  vs 261 MB/s do `Digest::SHA256` = 6.9×** — o "10×" do plano era contra um
+  Digest "puro" que não existe: o da stdlib é C otimizado (~300 MB/s
+  escalar), e o escalar Rust empata com ele (0.97×); o SHA-NI entrega o
+  salto. Teste gated: ≥3× no `--release` (debug não mede — Rust sem
+  otimização), skip sem `sha_ni` na CPU.
+- Armadilhas encontradas: `rb_str_bytesize` **não é exportado** no 3.4
+  (bytesize via `String#bytesize` funcall; `rb_str_strlen` devolve
+  caracteres); ponteiro de stack num static = segfault (SqliteFns num Box);
+  o shim do task se chamava `rake.rb` e o dir no `$LOAD_PATH` fazia o
+  `require "rake"` do próprio rake carregar o shim recursivamente →
+  renomeado para `task.rb`.
+- Estimativa: ~~2 semanas~~ (concluída).
 
 ### Fase Q — Distribuição: o instalador do Bun
 Fecha o ciclo "Bun de verdade": hoje o calisto exige o checkout +
@@ -349,7 +381,7 @@ Fecha o ciclo "Bun de verdade": hoje o calisto exige o checkout +
 ```
 L (embutir) ──┬─→ M (memória) ─┐
               ├─→ N (YJIT) ────┴─→ O (snapshot)
-              └─→ P (APIs nativas) ─→ Q (distribuição)
+              └─→ P (APIs nativas) ✅ ─→ Q (distribuição)
 ```
 
 - **L primeiro, sempre** — é a fundação; L.1–L.3 já entregam o daemon
@@ -360,7 +392,8 @@ L (embutir) ──┬─→ M (memória) ─┐
   se falhar, o marco documentado é a decisão.
 - **P antes de Q** para o binário distribuído já sair com as APIs nativas.
 - Sequência sugerida: **L → M → N → P → Q**, com O spikado em background
-  assim que L.3 estabilizar.
+  assim que L.3 estabilizar. P concluída; **Q é a próxima** (O segue como
+  spike de risco — criu).
 
 ## Riscos técnicos conhecidos
 

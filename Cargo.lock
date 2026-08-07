@@ -7,7 +7,9 @@ name = "calisto"
 version = "0.1.0"
 dependencies = [
  "calisto-build",
+ "calisto-hash",
  "calisto-ruby",
+ "calisto-sqlite",
 ]
 
 [[package]]
@@ -15,5 +17,19 @@ name = "calisto-build"
 version = "0.1.0"
 
 [[package]]
+name = "calisto-hash"
+version = "0.1.0"
+dependencies = [
+ "calisto-ruby",
+]
+
+[[package]]
 name = "calisto-ruby"
 version = "0.1.0"
+
+[[package]]
+name = "calisto-sqlite"
+version = "0.1.0"
+dependencies = [
+ "calisto-ruby",
+]
