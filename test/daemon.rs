@@ -107,6 +107,30 @@ fn concurrent_runs_serialize_through_daemon() {
 }
 
 #[test]
+fn long_running_child_does_not_block_new_runs() {
+    // Fase E: accept loop multi-conexao. Um child de longa duracao (server,
+    // sidekiq, suíte lenta) nao pode bloquear novos RUNs — o daemon antigo
+    // ficava preso no wait_for e o 2o run pendurava (timeout do run_opt).
+    let dir = runtime_dir("multiconn");
+    let (mut sleeper, pid) = sleep_pid(&dir);
+
+    // o RUN concorrente completa mesmo com o sleeper rodando
+    let out = run(&dir, &["run", "--preload", "0", fixture("hello.rb").to_str().unwrap()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // o sleeper continua vivo (o RUN paralelo nao o matou)
+    assert!(Path::new(&format!("/proc/{pid}")).exists(), "sleeper nao deveria morrer");
+
+    // matar o cliente do sleeper derruba o child (sem orfao) e o daemon
+    // continua servindo
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    let out = run(&dir, &["run", "--preload", "0", fixture("hello.rb").to_str().unwrap()]);
+    assert!(out.status.success(), "daemon deveria continuar servindo");
+    stop(&dir);
+}
+
+#[test]
 fn pipeline_does_not_hang() {
     // O daemon desanexa o proprio stdio; se um pipe ficasse retido, o
     // run_opt com timeout de 10s falharia em vez de pendurar a suite.

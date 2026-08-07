@@ -13,8 +13,14 @@
 #
 # Commands:
 #   PING                          -> OK
-#   STOP                          -> BYE (daemon exits)
+#   STOP                          -> BYE (daemon exits; children rodando sao mortos)
 #   RUN <cwd> <env> <script> <args...>   (each field base64) -> STATUS <code>
+#
+# Loop multi-conexao (Fase E): select sobre o listener + conexoes ativas e
+# waitpid WNOHANG a cada tick. Um child de longa duracao (server, sidekiq,
+# suite lenta) NAO bloqueia novos RUNs — cada conexao e atendida no seu tempo,
+# cada child e reapado ao terminar, e cliente morto com child rodando leva o
+# mesmo TERM -> KILL do wait_for antigo, agora por conexao.
 #
 # Env:
 #   CALISTO_SOCKET   unix socket path
@@ -92,17 +98,46 @@ STDIN.reopen(File::NULL)
 STDOUT.reopen(File::NULL)
 STDERR.reopen(File::NULL)
 
+# Registro global de conexoes/filhos: traps de shutdown e o handler de STOP
+# precisam derrubar children rodando antes de sair (nada de orfaos).
+$clients = {}  # io.object_id => Client
+$children = {} # pid => Client
+
+def kill_child(pid)
+  Process.kill("TERM", pid) rescue nil
+  sleep 0.2
+  Process.kill("KILL", pid) rescue nil
+  Process.wait2(pid) rescue nil
+end
+
+def kill_all_children
+  # shutdown/STOP: derruba children e devolve STATUS aos clientes (um
+  # `calisto serve`/`run` morto pelo stop nao pode ficar sem resposta)
+  $children.each_value do |c|
+    _, status = kill_child(c.pid)
+    next unless status
+    code = status.exitstatus || (128 + (status.termsig || 0))
+    respond(c.io, "STATUS #{code}\r\n")
+  end
+end
+
 trap("INT") { } # survive Ctrl-C; children reset to DEFAULT and die
 trap("TERM") { shutdown }
 trap("HUP") { shutdown }
 
 def shutdown
+  kill_all_children
   File.unlink(SOCKET) rescue nil
   File.unlink(PIDFILE) rescue nil if PIDFILE
   exit 0
 end
 
 # ---- request reader (first recvmsg captures SCM_RIGHTS fds) ------------------
+# Leitura nao-bloqueante: um comando parcial nao trava o loop multi-conexao —
+# `fill` levanta PartialRead e o cliente volta a ser atendido no proximo
+# select (o buffer parcial fica no reader).
+class PartialRead < StandardError; end
+
 class RequestReader
   def initialize(io)
     @io = io
@@ -116,7 +151,7 @@ class RequestReader
   def fill
     if @first
       @first = false
-      data, _addr, _flags, ancdata = @io.recvmsg(65_536, 0, scm_rights: true)
+      data, _addr, _flags, ancdata = @io.recvmsg_nonblock(65_536, 0, scm_rights: true)
       @buf << data
       Array(ancdata).each do |a|
         next unless a.cmsg_is?(Socket::SOL_SOCKET, Socket::SCM_RIGHTS)
@@ -125,8 +160,10 @@ class RequestReader
         @fds.concat(fds)
       end
     else
-      @buf << @io.readpartial(65_536)
+      @buf << @io.read_nonblock(65_536)
     end
+  rescue IO::WaitReadable, Errno::EAGAIN
+    raise PartialRead
   rescue EOFError
     raise "eof"
   end
@@ -157,6 +194,11 @@ def respond(io, msg)
   io.write(msg)
   io.flush
 rescue Errno::EPIPE, Errno::ECONNRESET, IOError
+end
+
+def finish_client(io)
+  $clients.delete(io.object_id)
+  io.close rescue nil
 end
 
 # ---- child stdio --------------------------------------------------------------
@@ -194,7 +236,22 @@ def dup_into_stdio(fds)
 end
 
 # ---- commands ----------------------------------------------------------------
-def handle_run(io, reader, fields)
+class Client
+  attr_reader :io, :reader
+  attr_accessor :pid
+
+  def initialize(io)
+    @io = io
+    @reader = RequestReader.new(io)
+    @pid = nil
+  end
+
+  def waiting?
+    !@pid.nil?
+  end
+end
+
+def start_child(io, reader, fields)
   cwd, env_blob, script, *args = fields.map { |f| Base64.strict_decode64(f) }
   env_pairs = env_blob.split("\u001e").reject(&:empty?).filter_map do |kv|
     i = kv.index("=") and [kv[0...i], kv[(i + 1)..]]
@@ -206,6 +263,9 @@ def handle_run(io, reader, fields)
     trap("TERM", "DEFAULT")
     trap("HUP", "DEFAULT")
     dup_into_stdio(reader.fds)
+    # hygiene: o child nao pode segurar o socket de controle nem o listener
+    io.close rescue nil
+    server.close rescue nil
     Dir.chdir(cwd)
     ENV.replace(env_pairs.to_h)
     $0 = script
@@ -217,6 +277,14 @@ def handle_run(io, reader, fields)
       # Nao da para usar RUBYOPT=-rbundler/setup aqui: RUBYOPT so e lido no
       # boot do interpretador, e um child de fork nao re-boota.
       require "bundler/setup"
+      # -I do child: usado por `calisto test` para `require "test_helper"` /
+      # `require "rails_helper"` funcionar sem o runner do framework. Depois
+      # do Bundler.setup: ele limpa o $LOAD_PATH, entao o unshift e pos-setup.
+      if (lp = ENV["CALISTO_LOAD_PATH"])
+        lp.split(":").reject(&:empty?).each do |p|
+          $LOAD_PATH.unshift(p) unless $LOAD_PATH.include?(p)
+        end
+      end
       load script
     rescue SystemExit
       raise # propaga: o runtime usa o status e roda at_exit hooks UMA vez
@@ -231,54 +299,79 @@ def handle_run(io, reader, fields)
   end
 
   reader.fds.each { |fd| IO.new(fd, autoclose: true).close rescue nil }
-  status = wait_for(pid, io)
-  if status
-    code = status.exitstatus || (128 + (status.termsig || 0))
-    respond(io, "STATUS #{code}\r\n")
-  end
-end
-
-# Waits for the child; if the client disconnects first (calisto killed), kills the child.
-def wait_for(pid, io)
-  loop do
-    done, status = Process.waitpid2(pid, Process::WNOHANG)
-    return status if done
-    # poll readability first -- a blocking recvmsg here would deadlock (the
-    # client is waiting for STATUS and sends nothing more)
-    if IO.select([io], nil, nil, 0)
-      begin
-        data, = io.recvmsg(1, Socket::MSG_PEEK)
-        dead = data.nil? || data.empty? # EOF: recvmsg returns nil, not EOFError
-      rescue EOFError
-        dead = true
-      end
-      if dead
-        Process.kill("TERM", pid) rescue nil
-        sleep 0.2
-        Process.kill("KILL", pid) rescue nil
-        Process.wait2(pid) rescue nil
-        return nil
-      end
-    end
-    sleep 0.01
-  end
+  pid
 end
 
 # ---- main loop ---------------------------------------------------------------
 loop do
-  io = server.accept
-  begin
-    reader = RequestReader.new(io)
-    op, fields = read_command(reader)
-    case op
-    when "PING" then respond(io, "OK\r\n")
-    when "STOP" then respond(io, "BYE\r\n") && shutdown
-    when "RUN"  then handle_run(io, reader, fields)
-    else respond(io, "ERR unknown command: #{op.inspect}\r\n")
+  ready = IO.select([server] + $clients.values.map(&:io), nil, nil, 0.01) || [[], [], []]
+  readables = ready[0] || []
+
+  if readables.include?(server)
+    begin
+      io = server.accept_nonblock
+      $clients[io.object_id] = Client.new(io)
+    rescue IO::WaitReadable, Errno::EINTR
     end
-  rescue StandardError => e
-    respond(io, "ERR #{e.class}: #{e.message}\r\n")
-  ensure
-    io.close rescue nil
+  end
+
+  readables.each do |io|
+    next if io == server
+    client = $clients[io.object_id]
+    next unless client
+
+    if client.waiting?
+      # child rodando: readable aqui so pode ser EOF (cliente morto) ou dados
+      # espurios — o cliente espera STATUS e nao envia mais nada.
+      begin
+        data, = io.recvmsg_nonblock(1, Socket::MSG_PEEK)
+        dead = data.nil? || data.empty?
+      rescue EOFError
+        dead = true
+      rescue IO::WaitReadable, Errno::EAGAIN
+        dead = false
+      end
+      if dead
+        pid = client.pid
+        $children.delete(pid)
+        kill_child(pid)
+        finish_client(io)
+      end
+      next
+    end
+
+    begin
+      op, fields = read_command(client.reader)
+      case op
+      when "PING"
+        respond(io, "OK\r\n")
+      when "STOP"
+        respond(io, "BYE\r\n")
+        shutdown # derruba children antes de sair (sem orfaos)
+      when "RUN"
+        pid = start_child(io, client.reader, fields)
+        client.pid = pid
+        $children[pid] = client
+      else
+        respond(io, "ERR unknown command: #{op.inspect}\r\n")
+        finish_client(io)
+      end
+    rescue PartialRead
+      # comando incompleto: aguarda mais dados (select re-marca readable)
+    rescue StandardError => e
+      respond(io, "ERR #{e.class}: #{e.message}\r\n")
+      finish_client(io)
+    end
+  end
+
+  # children terminados -> STATUS para o cliente (se ainda vivo)
+  $children.keys.each do |pid|
+    done, status = Process.waitpid2(pid, Process::WNOHANG)
+    next unless done
+    client = $children.delete(pid)
+    next unless client
+    code = status.exitstatus || (128 + (status.termsig || 0))
+    respond(client.io, "STATUS #{code}\r\n")
+    finish_client(client.io)
   end
 end

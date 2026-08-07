@@ -110,6 +110,9 @@ fn main() {
     let argv: Vec<String> = env::args().skip(1).collect();
     let code = match argv.first().map(String::as_str) {
         Some("run") => cmd_run(&argv[1..]),
+        Some("test") => cmd_test(&argv[1..]),
+        Some("task") => cmd_task(&argv[1..]),
+        Some("serve") => cmd_serve(&argv[1..]),
         Some("build") => cmd_build(&argv[1..]),
         Some("status") => cmd_status(),
         Some("stop") => cmd_stop(),
@@ -298,14 +301,33 @@ fn connect_or_spawn_daemon(ruby: &Path, preload: &str) -> Result<UnixStream, Str
 }
 
 fn connect_or_spawn_app_daemon(ruby: &Path, app: &AppConfig) -> Result<UnixStream, String> {
-    let dir = app_runtime_dir(app);
+    connect_or_spawn_app_daemon_in(ruby, app, &app_runtime_dir(app), &[])
+}
+
+/// Daemon da app em modo teste (RAILS_ENV=test no boot, socket proprio).
+fn connect_or_spawn_test_daemon(ruby: &Path, app: &AppConfig) -> Result<UnixStream, String> {
+    connect_or_spawn_app_daemon_in(ruby, app, &app_test_runtime_dir(app), &[
+        ("RAILS_ENV", "test"),
+        ("RACK_ENV", "test"),
+    ])
+}
+
+fn connect_or_spawn_app_daemon_in(
+    ruby: &Path,
+    app: &AppConfig,
+    dir: &Path,
+    envs: &[(&str, &str)],
+) -> Result<UnixStream, String> {
     let preload = app.preload.display().to_string();
     // Daemon da app: boota com o Gemfile ativo (-rbundler/setup) e cwd na raiz
     // da app, e o entrypoint e carregado no boot (CALISTO_APP_PRELOAD).
-    connect_or_spawn_daemon_in(ruby, &dir, "", |cmd| {
+    connect_or_spawn_daemon_in(ruby, dir, "", |cmd| {
         cmd.arg("-rbundler/setup")
             .current_dir(&app.root)
             .env("CALISTO_APP_PRELOAD", &preload);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
     })
 }
 
@@ -344,6 +366,8 @@ fn cmd_run(args: &[String]) -> i32 {
     };
     let script_args = &rest[1..];
 
+    load_dotenv(); // .env do cwd (walk up) entra no env do run/cold/daemon
+
     if !Path::new(script).is_file() {
         eprintln!("calisto: cannot open {script}: no such file");
         return 1;
@@ -362,16 +386,7 @@ fn cmd_run(args: &[String]) -> i32 {
     let ruby = ruby_path();
     let preload = match &preload_opt {
         Some(v) => normalize_preload(v),
-        None => {
-            if app.is_some() {
-                String::new() // app: o entrypoint e o preload (Fase B)
-            } else if has_gemfile() {
-                String::new() // Gemfile: bundler ativa as gems; preload colidiria
-            } else {
-                env::var("CALISTO_PRELOAD")
-                    .map_or_else(|_| DEFAULT_PRELOAD.to_string(), |v| normalize_preload(&v))
-            }
-        }
+        None => run_preload(&app),
     };
 
     let t0 = Instant::now();
@@ -408,6 +423,36 @@ fn find_in_parents(name: &str) -> Option<PathBuf> {
         dir = d.parent();
     }
     None
+}
+
+/// .env (Fase E): carrega o primeiro `.env` subindo do cwd, sem sobrescrever
+/// vars ja definidas (semantica dotenv). Roda no CLIENTE: o env resultante
+/// propaga para o spawn do daemon (o boot da app ve DATABASE_URL etc.), para
+/// o env_blob do RUN (o script ve) e para o modo --cold (paridade cold/warm
+/// preservada — um parser so no daemon divergiria o cold).
+fn load_dotenv() {
+    let Some(file) = find_in_parents(".env") else { return };
+    let Ok(content) = fs::read_to_string(&file) else { return };
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let k = k.trim();
+        if k.is_empty() || env::var_os(k).is_some() {
+            continue;
+        }
+        let mut v = v.trim().to_string();
+        if v.len() >= 2 {
+            let q = v.as_bytes()[0] as char;
+            if (q == '"' || q == '\'') && v.ends_with(q) {
+                v = v[1..v.len() - 1].to_string();
+            }
+        }
+        env::set_var(k, v);
+    }
 }
 
 /// Um Gemfile no cwd (ou BUNDLE_GEMFILE) significa que o Bundler.setup do
@@ -515,10 +560,21 @@ fn fnv1a(s: &str) -> u64 {
 
 /// Daemon dedicado por app (como Spring/Zeus): o preload de app vive no boot
 /// do daemon, entao ele so serve aquela app. O hash inclui o entrypoint para
-/// mudancas de calisto.toml ganharem socket novo.
-fn app_runtime_dir(app: &AppConfig) -> PathBuf {
-    let key = format!("{}\0{}", app.root.display(), app.preload.display());
+/// mudancas de calisto.toml ganharem socket novo, e um sal para separar
+/// ambientes (ex.: dev vs teste — o daemon de teste boota com RAILS_ENV=test).
+fn app_runtime_dir_for(app: &AppConfig, salt: &str) -> PathBuf {
+    let key = format!("{}\0{}\0{}", app.root.display(), app.preload.display(), salt);
     runtime_dir().join("apps").join(format!("{:016x}", fnv1a(&key)))
+}
+
+fn app_runtime_dir(app: &AppConfig) -> PathBuf {
+    app_runtime_dir_for(app, "")
+}
+
+/// Daemon de teste: igual ao da app, mas boota com RAILS_ENV=test/RACK_ENV=test
+/// (o Rails fixa o env no boot; um fork do boot dev nunca enxergaria :test).
+fn app_test_runtime_dir(app: &AppConfig) -> PathBuf {
+    app_runtime_dir_for(app, "test")
 }
 
 fn run_cold(ruby: &Path, script: &str, args: &[String]) -> i32 {
@@ -564,7 +620,19 @@ fn run_request(stream: &mut UnixStream, script: &str, args: &[String]) -> i32 {
     let cwd = env::current_dir()
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let env_blob = env::vars()
+    run_request_full(stream, &cwd, &[], script, args)
+}
+
+/// Variante com cwd e env extras explicitos (usada por `calisto test`: cwd na
+/// raiz do projeto, RAILS_ENV=test e CALISTO_LOAD_PATH injetados no child).
+fn run_request_full(
+    stream: &mut UnixStream,
+    cwd: &str,
+    extra: &[(&str, &str)],
+    script: &str,
+    args: &[String],
+) -> i32 {
+    let mut env_pairs: Vec<String> = env::vars()
         .filter(|(k, _)| {
             !matches!(
                 k.as_str(),
@@ -572,9 +640,14 @@ fn run_request(stream: &mut UnixStream, script: &str, args: &[String]) -> i32 {
             )
         })
         .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("\u{1e}");
-    let mut fields = vec![b64(&cwd), b64(&env_blob), b64(script)];
+        .collect();
+    for (k, v) in extra {
+        // extra SEMPRE vence (incluindo .env): `calisto test` precisa de
+        // RAILS_ENV=test mesmo se o .env do projeto setar development
+        env_pairs.push(format!("{k}={v}"));
+    }
+    let env_blob = env_pairs.join("\u{1e}");
+    let mut fields = vec![b64(cwd), b64(&env_blob), b64(script)];
     fields.extend(args.iter().map(|a| b64(a)));
     let bytes = build_cmd("RUN", &fields);
     if let Err(e) = send_with_fds(&mut *stream, &bytes, &[0, 1, 2]) {
@@ -602,6 +675,476 @@ fn run_request(stream: &mut UnixStream, script: &str, args: &[String]) -> i32 {
 
 fn exit_code(st: ExitStatus) -> i32 {
     st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0))
+}
+
+// ---- Fase E: calisto test ----------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum TestFramework {
+    Minitest,
+    Rspec,
+}
+
+impl TestFramework {
+    fn dir(self) -> &'static str {
+        match self {
+            TestFramework::Minitest => "test",
+            TestFramework::Rspec => "spec",
+        }
+    }
+    fn suffix(self) -> &'static str {
+        match self {
+            TestFramework::Minitest => "_test.rb",
+            TestFramework::Rspec => "_spec.rb",
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            TestFramework::Minitest => "minitest",
+            TestFramework::Rspec => "rspec",
+        }
+    }
+}
+
+/// Coleta recursiva de arquivos terminados em `suffix` (sem deps: read_dir).
+fn walk_files(dir: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            walk_files(&p, suffix, out);
+        } else if p
+            .file_name()
+            .map(|n| n.to_string_lossy().ends_with(suffix))
+            .unwrap_or(false)
+        {
+            out.push(p);
+        }
+    }
+}
+
+/// rspec quando ha `.rspec` ou `spec/*_spec.rb`; senao minitest (`test/`).
+fn detect_framework(root: &Path) -> TestFramework {
+    if root.join(".rspec").is_file() {
+        return TestFramework::Rspec;
+    }
+    let mut specs = Vec::new();
+    walk_files(&root.join("spec"), "_spec.rb", &mut specs);
+    if !specs.is_empty() {
+        return TestFramework::Rspec;
+    }
+    TestFramework::Minitest
+}
+
+fn test_file_snapshot(files: &[PathBuf]) -> Vec<(u64, u64)> {
+    files
+        .iter()
+        .map(|f| {
+            fs::metadata(f)
+                .map(|m| {
+                    let mtime = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    (m.len(), mtime)
+                })
+                .unwrap_or((0, 0))
+        })
+        .collect()
+}
+
+/// `calisto test [--watch] [arquivo|dir...]`
+///
+/// Detecta minitest (`test/**/*_test.rb`) ou rspec (`spec/**/*_spec.rb`) e
+/// roda cada arquivo como um fork do daemon quente — o daemon de teste da app
+/// (RAILS_ENV=test no boot, socket proprio) paga o boot UMA vez; por arquivo
+/// e so o fork. Arquivos rodam em paralelo (1 worker por CPU, teto no numero
+/// de arquivos) aproveitando o accept loop multi-conexao do daemon.
+fn cmd_test(args: &[String]) -> i32 {
+    let mut watch = false;
+    let mut filters: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--watch" | "-w" => watch = true,
+            s if s.starts_with('-') => {
+                eprintln!("calisto: flag desconhecida '{s}'");
+                return 1;
+            }
+            s => filters.push(s.to_string()),
+        }
+        i += 1;
+    }
+
+    load_dotenv(); // .env do cwd (walk up) entra no env dos children de teste
+    let app = match load_app_config() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("calisto: {e}");
+            return 1;
+        }
+    };
+    let root = app
+        .as_ref()
+        .map(|a| a.root.clone())
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let framework = detect_framework(&root);
+    let mut files = Vec::new();
+    walk_files(&root.join(framework.dir()), framework.suffix(), &mut files);
+
+    // filtros: diretorios/prefixos restringem a descoberta; arquivos explicitos
+    // entram direto (fora da arvore de testes, ex.: um teste temporario)
+    if !filters.is_empty() {
+        files.retain(|f| {
+            filters.iter().any(|pat| {
+                let p = Path::new(pat);
+                f == p
+                    || f.starts_with(p)
+                    || f.strip_prefix(&root)
+                        .map(|rel| rel == p)
+                        .unwrap_or(false)
+            })
+        });
+        for pat in &filters {
+            let p = Path::new(pat);
+            if p.is_file() && !files.contains(&p.to_path_buf()) {
+                files.push(p.to_path_buf());
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+
+    if files.is_empty() {
+        eprintln!(
+            "calisto: nenhum teste {} encontrado em {} (rode na raiz do projeto)",
+            framework.suffix(),
+            root.join(framework.dir()).display()
+        );
+        return 1;
+    }
+
+    let ruby = ruby_path();
+    let extra = [
+        ("RAILS_ENV", "test"),
+        ("RACK_ENV", "test"),
+        ("CALISTO_LOAD_PATH", framework.dir()),
+    ];
+
+    let dir = match &app {
+        Some(a) => {
+            let dir = app_test_runtime_dir(a);
+            if let Err(e) = connect_or_spawn_test_daemon(&ruby, a) {
+                eprintln!("calisto: {e}");
+                return 1;
+            }
+            dir
+        }
+        None => {
+            let preload = run_preload(&app);
+            if let Err(e) = connect_or_spawn_daemon(&ruby, &preload) {
+                eprintln!("calisto: {e}");
+                return 1;
+            }
+            runtime_dir()
+        }
+    };
+
+    let run_once = || {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(files.len())
+            .max(1);
+        let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let dir = dir.clone();
+                let root = root.clone();
+                let extra = extra;
+                let files = files.clone();
+                let next = next.clone();
+                std::thread::spawn(move || {
+                    let mut results = Vec::new();
+                    loop {
+                        let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if idx >= files.len() {
+                            break;
+                        }
+                        let file = &files[idx];
+                        let t0 = Instant::now();
+                        let mut stream = match UnixStream::connect(dir.join("calisto.sock")) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                results.push((
+                                    file.display().to_string(),
+                                    2,
+                                    t0.elapsed(),
+                                    format!("cannot connect to daemon: {e}"),
+                                ));
+                                continue;
+                            }
+                        };
+                        let code = run_request_full(
+                            &mut stream,
+                            &root.to_string_lossy(),
+                            &extra,
+                            &file.to_string_lossy(),
+                            &[],
+                        );
+                        results.push((file.display().to_string(), code, t0.elapsed(), String::new()));
+                    }
+                    results
+                })
+            })
+            .collect();
+
+        let mut results: Vec<(String, i32, Duration, String)> =
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut failures = 0usize;
+        let mut total_ms: u128 = 0;
+        for (path, code, elapsed, err) in &results {
+            let ms = elapsed.as_millis();
+            total_ms += ms;
+            if *code == 0 {
+                println!("ok {path} ({ms}ms)");
+            } else {
+                failures += 1;
+                println!("FAIL {path} ({ms}ms, exit {code}){err}");
+            }
+        }
+        println!(
+            "calisto: {} arquivo(s) de teste, {} falhou(ram) em {}ms (framework: {})",
+            results.len(),
+            failures,
+            total_ms,
+            framework.name()
+        );
+        if failures > 0 {
+            1
+        } else {
+            0
+        }
+    };
+
+    let code = run_once();
+    if watch {
+        let mut snap = test_file_snapshot(&files);
+        loop {
+            std::thread::sleep(Duration::from_millis(300));
+            let now = test_file_snapshot(&files);
+            if now != snap {
+                snap = now;
+                println!("calisto: mudanca detectada, re-rodando...");
+                run_once();
+            }
+        }
+    }
+    code
+}
+
+// ---- Fase E: calisto task ----------------------------------------------------
+
+/// Preload padrao para daemons nao-app: vazio com Gemfile (bundler ativa as
+/// gems; preload colidiria), senao CALISTO_PRELOAD ou o default.
+fn run_preload(app: &Option<AppConfig>) -> String {
+    match app {
+        Some(_) => String::new(), // app: o entrypoint e o preload (Fase B)
+        None => {
+            if has_gemfile() {
+                String::new()
+            } else {
+                env::var("CALISTO_PRELOAD")
+                    .map_or_else(|_| DEFAULT_PRELOAD.to_string(), |v| normalize_preload(&v))
+            }
+        }
+    }
+}
+
+const RAKE_SHIM: &str = "# frozen_string_literal: true
+# Gerado pelo calisto: equivale ao bin/rake do Rails (`load Gem.bin_path`),
+# sem depender de binstub existir. O child roda com o Gemfile ativo.
+begin
+  load Gem.bin_path(\"rake\", \"rake\")
+rescue Gem::GemNotFoundException => e
+  warn \"calisto task: rake nao encontrado no bundle: #{e.message}\"
+  exit 1
+end
+";
+
+/// `calisto task <args...>` — rake no daemon quente (ex.: `calisto task
+/// db:migrate`). Mesma semantica de `calisto run bin/rake <args>` no daemon
+/// da app (dev); sem calisto.toml usa o daemon generico.
+fn cmd_task(args: &[String]) -> i32 {
+    load_dotenv(); // .env do cwd (walk up) entra no env do rake
+    let app = match load_app_config() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("calisto: {e}");
+            return 1;
+        }
+    };
+    let root = app
+        .as_ref()
+        .map(|a| a.root.clone())
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let ruby = ruby_path();
+    let dir = match &app {
+        Some(a) => app_runtime_dir(a),
+        None => runtime_dir(),
+    };
+    fs::create_dir_all(&dir).ok();
+    let shim = dir.join("rake.rb");
+    if !shim.is_file() {
+        if let Err(e) = fs::write(&shim, RAKE_SHIM) {
+            eprintln!("calisto: cannot write rake shim: {e}");
+            return 1;
+        }
+    }
+
+    let mut stream = match &app {
+        Some(a) => match connect_or_spawn_app_daemon(&ruby, a) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("calisto: {e}");
+                return 1;
+            }
+        },
+        None => match connect_or_spawn_daemon(&ruby, &run_preload(&app)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("calisto: {e}");
+                return 1;
+            }
+        },
+    };
+    run_request_full(&mut stream, &root.to_string_lossy(), &[], &shim.to_string_lossy(), args)
+}
+
+// ---- Fase E: calisto serve ---------------------------------------------------
+
+const SERVE_LAUNCHER: &str = "# frozen_string_literal: true
+# Gerado pelo calisto: serve o config.ru do cwd (Rack app) no daemon quente,
+# como child do fork — o boot da app ja foi pago no daemon.
+require \"rack\"
+begin
+  require \"rackup\"
+rescue LoadError
+  # rack 2: Rack::Server continua no proprio rack
+end
+port = Integer(ENV.fetch(\"CALISTO_SERVE_PORT\", \"3000\"))
+host = ENV.fetch(\"CALISTO_SERVE_HOST\", \"127.0.0.1\")
+config = File.join(Dir.pwd, \"config.ru\")
+abort \"calisto serve: #{config} nao existe (rode na raiz do projeto)\" unless File.file?(config)
+app, = Rack::Builder.parse_file(config)
+if defined?(Rackup::Server)
+  Rackup::Server.start(app: app, Host: host, Port: port,
+                       environment: ENV.fetch(\"RACK_ENV\", \"development\"))
+elsif Rack::Server.respond_to?(:start)
+  Rack::Server.start(app: app, Host: host, Port: port)
+else
+  abort \"calisto serve: precisa de rackup (rack 3) ou rack 2 no Gemfile\"
+end
+";
+
+/// `calisto serve [-p PORT] [-o HOST]` — sobe a Rack app do config.ru como
+/// child do fork do daemon quente (rackup/rack com puma/webrick do bundle).
+/// Fica em foreground; Ctrl-C/kill no cliente derruba o server via
+/// client-death kill do daemon.
+fn cmd_serve(args: &[String]) -> i32 {
+    let mut port = "3000".to_string();
+    let mut host = "127.0.0.1".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" | "--port" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => port = v.clone(),
+                    None => {
+                        eprintln!("calisto: -p precisa de um valor");
+                        return 1;
+                    }
+                }
+            }
+            "-o" | "--host" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => host = v.clone(),
+                    None => {
+                        eprintln!("calisto: -o precisa de um valor");
+                        return 1;
+                    }
+                }
+            }
+            s => {
+                eprintln!("calisto: argumento inesperado '{s}'");
+                return 1;
+            }
+        }
+        i += 1;
+    }
+
+    load_dotenv();
+    let app = match load_app_config() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("calisto: {e}");
+            return 1;
+        }
+    };
+    let root = app
+        .as_ref()
+        .map(|a| a.root.clone())
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if !root.join("config.ru").is_file() {
+        eprintln!(
+            "calisto serve: {} nao tem config.ru (Rack app esperado)",
+            root.display()
+        );
+        return 1;
+    }
+
+    let ruby = ruby_path();
+    let dir = match &app {
+        Some(a) => app_runtime_dir(a),
+        None => runtime_dir(),
+    };
+    fs::create_dir_all(&dir).ok();
+    let launcher = dir.join("serve.rb");
+    if !launcher.is_file() {
+        if let Err(e) = fs::write(&launcher, SERVE_LAUNCHER) {
+            eprintln!("calisto: cannot write serve launcher: {e}");
+            return 1;
+        }
+    }
+
+    let mut stream = match &app {
+        Some(a) => match connect_or_spawn_app_daemon(&ruby, a) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("calisto: {e}");
+                return 1;
+            }
+        },
+        None => match connect_or_spawn_daemon(&ruby, &run_preload(&app)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("calisto: {e}");
+                return 1;
+            }
+        },
+    };
+    let extra = [
+        ("CALISTO_SERVE_PORT", port.as_str()),
+        ("CALISTO_SERVE_HOST", host.as_str()),
+    ];
+    run_request_full(&mut stream, &root.to_string_lossy(), &extra, &launcher.to_string_lossy(), &[])
 }
 
 fn cmd_build(args: &[String]) -> i32 {
@@ -698,30 +1241,48 @@ fn cmd_status() -> i32 {
             } else {
                 println!("daemon: socket present but unresponsive (stale)");
             }
-            0
         }
         None => {
             println!("daemon: not running");
-            0
+        }
+    }
+    // o daemon de teste da app (RAILS_ENV=test) tambem e reportado
+    if let Ok(Some(app)) = load_app_config() {
+        let tdir = app_test_runtime_dir(&app);
+        match daemon_connect_at(&tdir) {
+            Some(mut s) => {
+                let ok = send_cmd(&mut s, "PING", &[]).is_ok()
+                    && read_line(&mut s).map(|l| l == "OK").unwrap_or(false);
+                if ok {
+                    let pid = fs::read_to_string(tdir.join("calisto.pid")).unwrap_or_default();
+                    println!("test daemon: running (pid {})", pid.trim());
+                } else {
+                    println!("test daemon: socket present but unresponsive (stale)");
+                }
+            }
+            None => println!("test daemon: not running"),
+        }
+    }
+    0
+}
+
+fn stop_daemon_at(dir: &Path) {
+    if let Some(mut s) = daemon_connect_at(dir) {
+        if send_cmd(&mut s, "STOP", &[]).is_ok() {
+            let _ = read_line(&mut s);
         }
     }
 }
 
 fn cmd_stop() -> i32 {
     let dir = current_runtime_dir();
-    match daemon_connect_at(&dir) {
-        Some(mut s) => {
-            if send_cmd(&mut s, "STOP", &[]).is_ok() {
-                let _ = read_line(&mut s);
-            }
-            println!("daemon: stopped");
-            0
-        }
-        None => {
-            println!("daemon: not running");
-            0
-        }
+    let had = daemon_connect_at(&dir).is_some();
+    stop_daemon_at(&dir);
+    if let Ok(Some(app)) = load_app_config() {
+        stop_daemon_at(&app_test_runtime_dir(&app)); // test daemon tambem
     }
+    println!("daemon: {}", if had { "stopped" } else { "not running" });
+    0
 }
 
 fn cmd_doctor() -> i32 {
@@ -746,6 +1307,7 @@ fn print_help() {
 
 USAGE:
   calisto run [--cold] [--time] [--preload LIST] <script.rb> [args...]
+  calisto test [--watch] [file|dir...]
   calisto build <app.rb> [-o out.rb] [--root DIR]
   calisto status | stop | doctor | help
 
@@ -759,6 +1321,18 @@ USAGE:
           Com um calisto.toml no diretorio atual (walk up) o daemon vira o
           daemon da app (socket dedicado) e pre-carrega o entrypoint de
           [run].preload no boot — boot congelado, cada comando roda como fork.
+  test    roda a suite de testes no daemon quente: detecta minitest
+          (test/**/*_test.rb) ou rspec (spec/**/*_spec.rb, via .rspec) e roda
+          cada arquivo como um fork — o boot da app (calisto.toml) e pago UMA
+          vez num daemon de teste dedicado (RAILS_ENV=test, socket proprio);
+          arquivos rodam em paralelo. --watch re-roda ao salvar. Exit != 0 se
+          algum arquivo falhar. Args sao filtros (arquivos ou diretorios).
+  task    roda rake no daemon quente: `calisto task db:migrate` == `calisto run
+          bin/rake db:migrate` (equivalente ao bin/rake do Rails, sem exigir
+          binstub). Usa o daemon da app (dev) quando ha calisto.toml.
+  serve   sobe a Rack app do config.ru como child do fork do daemon quente
+          (rackup/rack do bundle; ex.: `calisto serve -p 4567`). Fica em
+          foreground; kill no cliente derruba o server.
   build   empacota <app.rb> e seus requires (arquivos do projeto, stdlib-only)
           num arquivo unico self-contained. Arquivos fora da raiz (stdlib)
           nao sao embutidos. --root define a raiz do projeto (default: o

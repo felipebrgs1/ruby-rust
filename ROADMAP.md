@@ -16,28 +16,28 @@ graph LR
     J --> K[Fase K: deps add/remove]
 ```
 
-## Pronto (Fases 1-2 + A-D) — resumo
+## Pronto (Fases 1-2 + A-E) — resumo
 
 - [x] **Fase 1-2** — runtime pinado + daemon fork (startup 3-4×), `calisto build` stdlib-only
 - [x] **Fase A (gems)** — `run` ativa o Gemfile via Bundler (semântica `bundle exec`), warn de `.ruby-version`, preload desativado com Gemfile
 - [x] **Fase B (preload de app)** — `calisto.toml` + daemon dedicado por app, boot congelado, fork-safe (desconexão AR + `$LOADED_FEATURES`)
 - [x] **Fase C (Rails mínimo)** — dev server e console como child do fork
 - [x] **Fase D (escada real)** — degraus 1-5: stdlib → Sinatra → Rails → Maybe Finance (Sidekiq) → **Chatwoot** (API + ActionCable)
+- [x] **Fase E (Produto Bun: test/task/serve/.env/watch)** — daemon **multi-conexão** (select + waitpid WNOHANG; child de longa duração não bloqueia novos RUNs), `calisto test` (minitest/rspec, daemon de teste dedicado RAILS_ENV=test com socket próprio, fork por arquivo em paralelo, `--watch` no cliente), `calisto task` (rake no daemon quente via `Gem.bin_path`, idem `bin/rake`), `calisto serve` (config.ru via rackup/rack como child do fork), `.env` (parser no cliente — paridade `--cold` preservada, sem sobrescrever vars existentes)
 
-Números de hoje: Rails runner 2162ms → **108ms (20×)** no Chatwoot; 1527→177ms (8.6×) no Maybe; boot Rails 2.2s → 105ms; golden tests gated em `test/{bundler,app,realapps}.rs`.
+Números de hoje: Rails runner 2162ms → **108ms (20×)** no Chatwoot; 1527→177ms (8.6×) no Maybe; boot Rails 2.2s → 105ms; `calisto test` no railsapp: suite de 2 arquivos **<1s** quente (boot pago uma vez, <500ms/arquivo); `calisto task db:migrate` idempotente: 530ms frio → **98ms** quente. Golden tests gated em `test/{bundler,app,realapps,testcmd}.rs`.
 
 ## Fases futuras — em partes
 
-### Fase E — Produto Bun: test / task / serve / .env / watch
-Crates já esboçados: `calisto-{test,task,serve,sqlite,tooling}`.
+### Fase E — Produto Bun: test / task / serve / .env / watch ✅
+Crates esboçados (ainda vazios): `calisto-{test,task,serve,sqlite,tooling}`.
 
-- [ ] `calisto test` — detecta minitest/rspec do projeto, roda no daemon quente, paralelo
-- [ ] `calisto test --watch` — re-roda ao salvar (fork-safe: aprendizado do listen do Chatwoot)
-- [ ] `calisto task` — rake no daemon quente (`calisto task db:migrate`)
-- [ ] `calisto serve` — HTTP (rack handler) como child do fork
-- [ ] `.env` loading no daemon
-- Marco: `calisto test` roda a suíte do `railsapp` (minitest) e do Maybe (rspec) **<500ms por arquivo**; `calisto task db:migrate` idempotente no daemon
-- Estimativa: 2-3 meses
+- [x] `calisto test` — detecta minitest/rspec do projeto, roda no daemon quente, paralelo
+- [x] `calisto test --watch` — re-roda ao salvar (watcher no cliente Rust: polling de mtime — fork-safe, sem listen/inotify)
+- [x] `calisto task` — rake no daemon quente (`calisto task db:migrate`)
+- [x] `calisto serve` — HTTP (rackup/rack handler) como child do fork
+- [x] `.env` loading (no cliente: spawn do daemon, env_blob do RUN e `--cold` herdam)
+- Marco: `calisto test` roda a suíte do `railsapp` (minitest) **<1s total, <500ms/arquivo**; `calisto task db:migrate` idempotente no daemon. Fica: golden de uma suíte rspec real (o Maybe usa minitest na prática; a detecção `.rspec`/`spec/*_spec.rb` está testada, falta um fixture rspec de verdade)
 
 ### Fase F — build --compile com gems
 - [ ] gems **pure-Ruby** embutidas no bundle (o loader já intercepta `require`)
@@ -83,8 +83,7 @@ Crates já esboçados: `calisto-{test,task,serve,sqlite,tooling}`.
 ## Riscos técnicos conhecidos
 
 - **Memória**: daemon com Chatwoot pré-carregado ≈ 500MB+ RSS (preço do preload)
-- **Daemon single-connection**: com um child de longa duração rodando (server/sidekiq), o `wait_for` atual bloqueia novos RUNs — precisa do accept loop multi-conexão (select + waitpid WNOHANG) para o uso Bun real (server + comandos simultâneos)
-- **Watch/fork**: o listen (inotify) quebra o 2º fork (descoberto no Chatwoot) — watch da Fase E precisa de watcher fork-safe
+- **Watch/fork**: o listen (inotify) quebra o 2º fork (descoberto no Chatwoot) — o watch da Fase E roda no cliente Rust (polling de mtime), fork-safe por construção
 - **C exts no build**: limitação estrutural da Fase F
 - **Windows**: impossível (fork)
 - **Não fazer**: reimplementar Bundler, reimplementar o CRuby, bundle de C exts no curto prazo

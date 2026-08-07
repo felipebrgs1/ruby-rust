@@ -50,6 +50,10 @@ name = "app"
 path = "test/app.rs"
 
 [[test]]
+name = "testcmd"
+path = "test/testcmd.rs"
+
+[[test]]
 name = "realapps"
 path = "test/realapps.rs"
 
