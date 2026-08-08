@@ -15,7 +15,25 @@ fn default_preload_loads_stdlib() {
     let dir = runtime_dir("preload-default");
     let s = preload_out(&dir, &["run", fixture("preload.rb").to_str().unwrap()]);
     assert!(s.contains("json=yes"), "default deve preloadar json: {s}");
-    assert!(s.contains("yaml=yes"), "default deve preloadar yaml (psych): {s}");
+    // os pesados ficaram LAZY (dropados do default por causa do cold):
+    // o child carrega no require on demand, o daemon nao paga ~43ms de boot
+    assert!(s.contains("yaml=no"), "yaml e lazy no default: {s}");
+    assert!(s.contains("net_http=no"), "net/http e lazy no default: {s}");
+    assert!(s.contains("csv=no"), "csv e lazy no default: {s}");
+    stop(&dir);
+}
+
+#[test]
+fn default_lazy_modules_load_on_demand_in_child() {
+    // O modulo pesado nao preloaded funciona: o child `require`a e carrega
+    // (custo unico no child, CoW — o daemon nao polui).
+    let dir = runtime_dir("preload-lazy");
+    let out = run(
+        &dir,
+        &["run", "-e", "require \"net/http\"; require \"yaml\"; puts Net::HTTP::VERSION"],
+    );
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(!String::from_utf8_lossy(&out.stdout).trim().is_empty());
     stop(&dir);
 }
 

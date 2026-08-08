@@ -14,9 +14,15 @@ use crate::runtime::*;
 
 
 
+/// Preload default: so os modulos BARATOS (<=4ms cada, ~22ms no total).
+/// Os pesados (yaml/psych ~7ms, uri ~9ms, net/http ~20ms, csv ~7ms — 43ms)
+/// ficam de fora: o child paga o load UMA vez quando o script usa (require
+/// on demand, CoW — nao polui o daemon), e o cold do daemon cai ~43ms. Apps
+/// com preload proprio (calisto.toml) e `--preload`/CALISTO_PRELOAD nao sao
+/// afetados — o default e so o daemon generico.
 pub const DEFAULT_PRELOAD: &str = concat!(
-    "json,yaml,erb,pathname,fileutils,time,date,digest,base64,uri,",
-    "net/http,ostruct,set,csv,stringio,logger,socket"
+    "json,erb,pathname,fileutils,time,date,digest,base64,",
+    "ostruct,set,stringio,logger,socket"
 );
 
 
