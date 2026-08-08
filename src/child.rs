@@ -231,6 +231,9 @@ pub fn child_main(
 end
 if (d = $calisto_native_dir)
   $LOAD_PATH.unshift(d) unless $LOAD_PATH.include?(d)
+end
+if (d = $calisto_native_dir) && (g = File.join(d, "gems")) && File.directory?(g) && !$LOAD_PATH.include?(g)
+  $LOAD_PATH.unshift(g)
 end"#;
     if let Err(e) = vm.eval(loadpath_snippet) {
         child_error(vm, e);

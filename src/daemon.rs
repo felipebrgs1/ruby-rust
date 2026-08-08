@@ -315,6 +315,9 @@ pub fn daemon_main(vm: &calisto_ruby::Ruby, requires: &[String]) -> Result<i32, 
     // o proprio daemon tambem precisa do dir no loadpath (app preload/warmup)
     let lp_snippet = r#"if (d = $calisto_native_dir) && !$LOAD_PATH.include?(d)
   $LOAD_PATH.unshift(d)
+end
+if (d = $calisto_native_dir) && (g = File.join(d, "gems")) && File.directory?(g) && !$LOAD_PATH.include?(g)
+  $LOAD_PATH.unshift(g)
 end"#;
     if let Err(e) = vm.eval(lp_snippet) {
         return Err(format!("native loadpath: {}", vm.error_summary(e)));
@@ -331,6 +334,11 @@ end"#;
         // sem libsqlite3 do sistema: degrada — o shim do require levanta
         // LoadError claro (o calisto segue util sem o sqlite nativo)
         eprintln!("calisto: warning: calisto/sqlite indisponivel: {e}");
+    }
+    if let Err(e) = calisto_pg::register(vm) {
+        // sem libpq (CALISTO_LIBPQ / sistema / vendored): degrada — o shim
+        // do require "pg" levanta LoadError claro (gem real em --cold)
+        eprintln!("calisto: warning: pg nativo indisponivel: {e}");
     }
     let preload = env::var("CALISTO_PRELOAD").unwrap_or_default();
     for name in preload.split(',').map(str::trim).filter(|s| !s.is_empty()) {

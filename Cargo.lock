@@ -9,6 +9,7 @@ dependencies = [
  "calisto-build",
  "calisto-hash",
  "calisto-native",
+ "calisto-pg",
  "calisto-ruby",
  "calisto-sqlite",
 ]
@@ -26,6 +27,13 @@ dependencies = [
 
 [[package]]
 name = "calisto-native"
+version = "0.1.0"
+dependencies = [
+ "calisto-ruby",
+]
+
+[[package]]
+name = "calisto-pg"
 version = "0.1.0"
 dependencies = [
  "calisto-ruby",

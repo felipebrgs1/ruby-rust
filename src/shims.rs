@@ -139,17 +139,187 @@ end
 
 
 
+/// Shim de `require "pg"` (camada de compatibilidade com a gem pg): as
+/// classes PG::Connection/PG::Result sao nativas (Rust sobre libpq,
+/// registradas no boot do daemon); este arquivo completa o surface do
+/// ActiveRecord (constantes, type maps/decoders, PG::Tuple, each/rows) e
+/// torna o require resolvivel. O dir `gems/` so e injetado no daemon/child —
+/// em --cold o require resolve a gem pg REAL (paridade cold/warm; sem o
+/// modulo nativo o shim levanta LoadError claro, como o sqlite).
+pub const PG_SHIM: &str = "# frozen_string_literal: true
+# Gerado pelo calisto: camada de compatibilidade com a gem `pg` no daemon.
+# PG::Connection/PG::Result sao nativos (Rust sobre libpq, registrados no
+# boot do daemon — marcador PG::CALISTO_NATIVE); este arquivo completa o
+# surface do ActiveRecord (constantes, type maps/decoders, PG::Tuple, each)
+# e so torna o require resolvivel. O dir gems/ so e injetado no daemon/
+# child — em --cold o require resolve a gem pg real (paridade). Sem libpq
+# no daemon (register degradou) o shim CAI na gem pg real instalada (mesma
+# semantica do cold) em vez de quebrar o app — e nao define os stubs.
+unless defined?(PG::Connection)
+  begin
+    gem \"pg\"
+    spec = Gem::Specification.find_by_name(\"pg\")
+    require File.join(spec.full_gem_path, \"lib\", \"pg\")
+  rescue Gem::LoadError
+    raise LoadError, \"pg nativo requer o daemon calisto com libpq (CALISTO_LIBPQ/sistema/vendored) e a gem pg nao esta instalada p/ fallback\"
+  end
+end
+
+if defined?(PG::CALISTO_NATIVE)
+  module PG
+  VERSION = \"1.6.0\"
+
+  CONNECTION_OK = 0
+  PQTRANS_IDLE = 0
+  PQTRANS_ACTIVE = 1
+  PQTRANS_INTRANS = 2
+  PQTRANS_INERROR = 3
+  PQTRANS_UNKNOWN = 4
+
+  # --- type maps/decoders (stubs: aceitos e armazenados; a conversao
+  # nativa devolve strings — o typecast do AR e a fonte da verdade) ---
+  class SimpleDecoder
+    attr_reader :oid, :name
+
+    def initialize(oid: nil, name: nil, **)
+      @oid = oid
+      @name = name
+    end
+
+    def to_h = { oid: @oid, name: @name }
+    def decode(value, _tuple = nil, _field = nil) = value
+  end
+
+  module TextEncoder
+    class Integer < PG::SimpleDecoder; end
+    class Boolean < PG::SimpleDecoder; end
+  end
+
+  module TextDecoder
+    class Integer < PG::SimpleDecoder; end
+    class Float < PG::SimpleDecoder; end
+    class Numeric < PG::SimpleDecoder; end
+    class Boolean < PG::SimpleDecoder; end
+    class Date < PG::SimpleDecoder; end
+    class TimestampUtc < PG::SimpleDecoder; end
+    class TimestampWithoutTimeZone < PG::SimpleDecoder; end
+    class TimestampWithTimeZone < PG::SimpleDecoder; end
+    class Bytea < PG::SimpleDecoder; end
+  end
+
+  class TypeMapByOid
+    def initialize
+      @coders = []
+    end
+
+    attr_accessor :default_type_map
+
+    def add_coder(coder)
+      @coders << coder
+      self
+    end
+
+    def clear = @coders.clear
+    def each_coder(&blk) = @coders.each(&blk)
+  end
+
+  class TypeMapByClass
+    def initialize
+      @map = {}
+    end
+
+    def []=(klass, coder)
+      @map[klass] = coder
+    end
+
+    def [](klass) = @map[klass]
+  end
+
+  # --- PG::Tuple: acesso por nome/indice (pg 1.5+; AR usa row[\"typname\"]) ---
+  class Tuple
+    def initialize(result, index)
+      @result = result
+      @index = index
+    end
+
+    def [](key)
+      idx = key.is_a?(Integer) ? key : @result.fields.index(key)
+      return nil unless idx
+      @result.getisnull(@index, idx) ? nil : @result.getvalue(@index, idx)
+    end
+
+    def to_a
+      Array.new(@result.nfields) do |j|
+        @result.getisnull(@index, j) ? nil : @result.getvalue(@index, j)
+      end
+    end
+
+    def values = to_a
+    def to_h = @result.fields.zip(to_a).to_h
+    def length = @result.nfields
+    alias size length
+    def key?(k) = @result.fields.include?(k)
+  end
+end
+
+class PG::Result
+  include Enumerable
+
+  # each com bloco entrega PG::Tuple (semantica pg >= 1.5, que o AR 7.1+
+  # usa em add_pg_decoders: row[\"typname\"]); sem bloco, Enumerator.
+  def each
+    return enum_for(:each) unless block_given?
+    n = ntuples
+    i = 0
+    while i < n
+      yield PG::Tuple.new(self, i)
+      i += 1
+    end
+    self
+  end
+
+  def each_row(&blk)
+    return enum_for(:each_row) unless blk
+    each(&blk)
+  end
+end
+
+class PG::Connection
+  # type maps armazenados como ivars (nunca usados na conversao — strings).
+  def type_map_for_queries=(map)
+    @calisto_type_map_for_queries = map
+    map
+  end
+
+  def type_map_for_queries = @calisto_type_map_for_queries
+
+  def type_map_for_results=(map)
+    @calisto_type_map_for_results = map
+    map
+  end
+
+  def type_map_for_results = @calisto_type_map_for_results
+end
+end
+
+PG
+";
+
+
+
 /// Escreve os shims nativos no dir (idempotente). O daemon chama no boot
 /// (cobre run/test/task/serve/exec/repl/status/stop) e o cold mode chama
 /// via `native_shims_dir` para o `-I`.
 pub fn ensure_native_shims(dir: &Path) {
     let _ = fs::create_dir_all(dir.join("calisto"));
+    let _ = fs::create_dir_all(dir.join("gems"));
     for (name, content) in [
         ("calisto/sqlite.rb", SQLITE_SHIM),
         ("calisto/hash.rb", HASH_SHIM),
         ("calisto/base64.rb", BASE64_SHIM),
         ("calisto/url.rb", URL_SHIM),
         ("calisto/html.rb", HTML_SHIM),
+        ("gems/pg.rb", PG_SHIM),
     ] {
         let p = dir.join(name);
         if !p.is_file() {

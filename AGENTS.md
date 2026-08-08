@@ -51,7 +51,9 @@ em Rust puro — blake3 validado contra os vetores oficiais, sha256 com
 SHA-NI — e `Calisto::SQLite` sobre a libsqlite3 do sistema com TypedData;
 shims `calisto/sqlite.rb`+`calisto/hash.rb` no dir de runtime injetado no
 `$LOAD_PATH` do child pós-Bundler.setup; cold: hash cai no fallback Digest,
-sqlite levanta LoadError claro; benchmark sha256 100MB: **6.9×** o
+sqlite levanta LoadError claro; o shim de gem `gems/pg.rb` (Fase PG) vive no
+subdir `gems/` — injetado só no daemon/child, nunca no `-I` do cold (a gem
+pg real carrega em --cold); benchmark sha256 100MB: **6.9×** o
 Digest::SHA256). **Fase O fechada com decisão documentada** (spike criu:
 dump unprivileged exige userns+caps dropadas; restore exige pid ns próprio
 + proc privado = mini-container rootless; restore duplica o RSS — criu
@@ -79,7 +81,32 @@ Chatwoot revalidado: Private_Dirty do child **−58%** (era −46% no legado)) e
 **Fase T completa** (APIs nativas novas: `Calisto::Hash.xxh64` — o
 `Bun.hash`, hash não-cripto 37× o Digest::SHA256 em 100MB — e os codecs
 `Calisto::Base64`/`Calisto::URL`/`Calisto::HTML` com paridade exata da
-stdlib, cold/warm concordando via shims com fallback puro).
+stdlib, cold/warm concordando via shims com fallback puro) e **Fase PG
+(camadas de compatibilidade com gems — `pg`)** — crate `crates/calisto-pg`:
+`PG::Connection`/`PG::Result` nativos (Rust) sobre **libpq via dlopen**
+(padrão do calisto-sqlite; resolução: `CALISTO_LIBPQ` → `libpq.so.5` do
+sistema → vendored `<vendor>/src/postgresql-*/install/lib` via walk-up do
+ruby). Surface aterrado no postgresql_adapter.rb do AR 7.1/7.2/8.1:
+`PG.connect`/`Connection#new` (conninfo string OU Hash de keywords — o
+`PG.connect(**params)` do AR), exec/exec_params/query/prepare/exec_prepared
++ alias async_* (síncronos, como o pg 1.x), escape/escape_literal/
+escape_identifier, parameter_status/server_version/transaction_status/status,
+reset/cancel/block/socket_io/set_client_encoding/set_notice_receiver
+(aceita-ignora — NOTICEs não entregues, degradação documentada),
+close/finish/closed?/finished?, `get_last_result`, class methods
+`conndefaults_hash` (o AR 7.2 valida params com `slice!`) e `quote_ident`;
+`PG::Result` com values/rows/fields/ntuples/nfields/[]/getvalue/getisnull/
+ftype/fmod/cmd_tuples/result_status/error_message/clear/cleared?/map_types!;
+`PG::Error`/`ConnectionBad`/`FeatureNotSupported`. O resto (constantes, type
+maps `TypeMapByOid`/`TypeMapByClass`/decoders como stubs
+aceitos-mas-ignorados — o typecast do AR é a fonte da verdade, strings são
+entrada válida —, `PG::Tuple` e `each`/`each_row`+Enumerable) vive no shim
+`gems/pg.rb` — **dir novo `gems/`** injetado no $LOAD_PATH do child E do
+daemon (app preload), NUNCA no `-I` do cold (paridade: cold carrega a gem pg
+real do bundle). Sem libpq: daemon degrada com warning e `require "pg"`
+levanta LoadError claro. Marco: goldens maybe (Rails 7.2) e chatwoot (Rails
+7.1, pgvector, ActionCable) rodando com o pg nativo — realapps 3/3 — e
+`test/pgnative.rs` gated em `CALISTO_TEST_PG`.
 Ciclo L–T fechado; próximos candidatos: degraus reais com o instalado,
 snapshot gated se o cenário de privilégio mudar.
 
@@ -144,6 +171,7 @@ Fase A: `calisto run` ativa Gemfile via Bundler com semântica de `bundle exec` 
 |`crates/calisto-hash/`|Workspace crate (Fase P+T): `Calisto::Hash` — sha256 escalar + **SHA-NI** (`std::arch`, dispatch por `is_x86_feature_detected!`), blake3 hand-rolled (port do reference_impl, vetores oficiais em `test/native.rs`) e **xxh64** (o `Bun.hash` — hash não-cripto, vetores do sanity check oficial do xxHash)|
 |`crates/calisto-sqlite/`|Workspace crate (Fase P): binding `Calisto::SQLite` sobre libsqlite3 do sistema (dlopen `libsqlite3.so.0`, FFI hand-rolled) — Database/Statement via TypedData com dfree no GC|
 |`crates/calisto-native/`|Workspace crate (Fase T): codecs de string em Rust — `Calisto::Base64` (espelho do stdlib base64 0.3: encode64 com wrap/strict/urlsafe + decodes lenient/strict), `Calisto::URL` (CGI.escape/unescape) e `Calisto::HTML` (ERB::Util.html_escape — o `Bun.escapeHTML`); shims com fallback puro em cold|
+|`crates/calisto-pg/`|Workspace crate (Fase PG): camada de compatibilidade com a gem `pg` — `PG::Connection`/`PG::Result` sobre libpq (dlopen, FFI hand-rolled; `CALISTO_LIBPQ` → sistema → vendored), TypedData com dfree, shim `gems/pg.rb` no dir de runtime|
 |`crates/calisto-{test,task,serve,tooling,cli,runtime}/`|Planned modules, only `.gitkeep` — do not implement until they get a `Cargo.toml`|
 |Integration suite (`common/mod.rs` harness, `cli.rs`, `stdio.rs`, `daemon.rs`, `preload.rs`, `build.rs`, `ruby_upstream.rs`, `bundler.rs`, `app.rs`, `realapps.rs`, `testcmd.rs`, `exec.rs`, `scripts.rs`, `versions.rs`, `tooling.rs`, `deps.rs`, `native.rs`, `runflags.rs`), `fixtures/`|Integration suite (`common/mod.rs` harness, `cli.rs`, `stdio.rs`, `daemon.rs`, `preload.rs`, `build.rs`, `ruby_upstream.rs`, `bundler.rs`, `app.rs`, `realapps.rs`, `testcmd.rs`, `exec.rs`, `scripts.rs`, `versions.rs`, `tooling.rs`, `deps.rs`, `native.rs`), `fixtures/` (inclui `gemapp/`, `sinatraapp/` da Fase A, `preloadapp/`, `railsapp/` da Fase B/C e `maybe/`, `chatwoot/` — checkouts gitignored — dos degraus 4/5 da Fase D), `test/vendor/ruby/` (upstream ruby/ruby tests)|
 | `scripts/` | `build-ruby.sh` — builds the pinned CRuby |
@@ -206,7 +234,8 @@ cargo test --test ruby_upstream    # just the ruby/ruby parity harness
 | `crates/calisto-build/src/build.rb` | Bundler: `walk_requires`, BFS collection, `split_end_marker`, gems do Gemfile.lock (pure + nativos `.so` p/ `$calisto_native` + pré-índice), bundle generation with loader |
 | `crates/calisto-build/src/lib.rs` | `bundle(ruby, entry, out, root) -> Result<BundleStats, String>`; parses `BUNDLED <n>` |
 | `crates/calisto-hash/src/lib.rs` | (Fase P+T) registro de `Calisto::Hash` (rb_define_singleton_method); `sha256.rs` (escalar + dispatch SHA-NI), `blake3.rs` (one-shot fiel ao reference_impl) e `xxh64.rs` (one-shot fiel ao xxhash.c, vetores do sanity check oficial) |
-| `crates/calisto-sqlite/src/lib.rs` | (Fase P) dlopen da libsqlite3 + FFI hand-rolled, TypedData (Database/Statement com dfree), `register(vm)` best-effort (sem a lib → daemon degrada, shim levanta LoadError) |
+|`crates/calisto-sqlite/src/lib.rs`|(Fase P) dlopen da libsqlite3 + FFI hand-rolled, TypedData (Database/Statement com dfree), `register(vm)` best-effort (sem a lib → daemon degrada, shim levanta LoadError) |
+|`crates/calisto-pg/src/lib.rs`|(Fase PG) dlopen da libpq (CALISTO_LIBPQ → sistema → vendored) + FFI hand-rolled, TypedData (Connection/Result com dfree), `register(vm)` best-effort; surface aterrado no postgresql_adapter.rb do AR 7.1-8.1 |
 | `scripts/build-ruby.sh` | Pin `RUBY_VERSION` (default 3.4.10; sha conhecido p/ 3.4.4 também), vendored libyaml, `--enable-shared` (Fase L: `lib/libruby.so.<v>` p/ o daemon embutido), `vendor/ruby-<v>/` + symlink `vendor/current` (não troca ao construir versão extra), `CALISTO_REBUILD=1` força rebuild **destrutivo** (rm -rf do prefixo — ver armadilha no fim) |
 | `test/common/mod.rs` | Integration harness shared by all test targets |
 
@@ -243,6 +272,7 @@ Coverage contract:
 - `deps.rs` — **Fase K (add/remove/lock)**: wrapper fino do bundle com fake via `CALISTO_BUNDLE` (hermético): args passam direto, cwd na raiz do projeto (dir do Gemfile — walk-up), `BUNDLE_GEMFILE` setado, PATH prefixado com o bin dir do ruby (trap do restart do bundler), `CALISTO_BUNDLE_RUBY` exportado e exit code propaga (FAKE_BUNDLE_RC); sem Gemfile → erro claro sugerindo `bundle init`; `.ruby-version` 3.4.4 → bundle do `vendor/ruby-3.4.4` (gated, como versions.rs).
 - `native.rs` — **Fase P+T (APIs nativas calisto.\*)**: blake3 contra os **vetores oficiais** (13 comprimentos: 0..102400 — chunk único/cheio/árvore; input = padrão cíclico de 251 bytes como o test_vectors.json); sha256 com paridade cold/warm E com `Digest::SHA256` em 7 tamanhos (cobre SHA-NI vs stdlib); sqlite hermético em `:memory:` (binds de todos os tipos, prepared statement reutilizado com re-bind, changes/rowid/columns, close/closed?, `Calisto::SQLite::Error` com errmsg, multi-statement → erro, TypeError em bind inválido); cold sqlite → LoadError claro; benchmark sha256 de 100MB: ratio ≥3× o Digest no **--release** (debug não mede — Rust sem otimização; skip sem `sha_ni` na CPU). **Fase T**: base64 com paridade cold/warm E stdlib (6 métodos × 10 tamanhos cobrindo o wrap de 60 chars, urlsafe com/sem padding) + semântica de decode (lenient com lixo/`=`/grupo parcial; strict com ArgumentError "invalid base64" nos casos inválidos — mesmas regras do pack "m"/"m0", warm E cold); URL escape/unescape == CGI (unicode, `%zz` inválido, hex minúsculo, roundtrip); HTML == ERB::Util.html_escape; xxh64 contra os **vetores do sanity check oficial** do xxHash (buffer determinístico, seeds 0/PRIME32, caminhos tail e blocos; cold → NotImplementedError) + benchmark de 100MB: ratio ≥3× o Digest::SHA256 (medido **37×** no release).
 - `runflags.rs` — **Fase R (flags ruby do run)**: `-I`/`-r` (isolados, combinados, anexados `-Ilib`, LoadError de lib ausente), `-w`/`-W0`/`-W2` (warnings), `-c` (ok/bad/`-e`/`__END__`/não executa), `-E` (ext, ext:int, inválido), `--` termina flags, `-v`/`--version` (topo e `run -v`), flags+script do calisto.toml → erro claro, flags no daemon da app — 16 testes com **paridade cold/warm** em cada flag.
+- `pgnative.rs` — **Fase PG (pg nativo)**: gated em `CALISTO_TEST_PG` (connstring de um postgres vivo — skipa com aviso sem ela): fixture `pgcheck.rb` cobre exec/exec_params/prepare/exec_prepared/values (incl. NULL)/`each`→`PG::Tuple` (padrão AR `row["typname"]`)/escape*/transaction_status/erro PG::Error; `pg_gems_dir_only_in_warm_load_path` prova que o dir `gems/` só entra no $LOAD_PATH warm (no cold o `require "pg"` resolve a gem real — invariante de paridade do mecanismo).
 - `tooling.rs` — **Fase J+Q (init/upgrade/completions/distribuição)**: (Fase J) init/upgrade/completions como antes, 6 testes + (Fase Q) 4: `CALISTO_HOME` vence o walk-up do checkout (--version mostra o ruby fake do home); upgrade sem scripts/ BAIXA o tarball (`CALISTO_UPGRADE_URL=file://` hermético) e extrai em `<vendor>/`; sha256 ruim → erro sem extração; `--source` força o build.
 
 QA rule of thumb: for any change to `run` semantics, the acceptance test is `cold_and_warm_agree` plus the upstream parity harness — if pure `ruby` and calisto diverge, it's a bug in calisto.

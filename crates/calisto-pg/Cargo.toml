@@ -1,0 +1,8 @@
+[package]
+name = "calisto-pg"
+version = "0.1.0"
+edition = "2021"
+description = "Camada de compatibilidade com a gem `pg`: PG::Connection/Result nativos (Rust) sobre libpq (dlopen, FFI hand-rolled, zero crates)"
+
+[dependencies]
+calisto-ruby = { path = "../calisto-ruby" }
