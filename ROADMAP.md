@@ -32,6 +32,7 @@ graph LR
     P --> Q[Fase Q: distribuicao ✅]
     Q --> R[Fase R: paridade de CLI ✅]
     R --> S[Fase S: runtime 100% Rust — fim do server.rb ✅]
+    S --> T[Fase T: APIs nativas — codecs + xxh64 ✅]
 ```
 
 ## Estado — ciclos fechados
@@ -57,8 +58,15 @@ graph LR
   sem `.so` → erro claro com o rebuild); `server.rb` + `include_str!`
   deletados; goldens maybe/chatwoot **ativos** sob o daemon Rust (hook de
   compactação Rust: Private_Dirty −58%).
+- **Fase T** ✅ — APIs nativas novas: `Calisto::Hash.xxh64` (o `Bun.hash`,
+  hash não-cripto — **37×** o Digest::SHA256 em 100MB) + codecs
+  `Calisto::Base64`/`Calisto::URL`/`Calisto::HTML` (paridade exata da
+  stdlib, cold/warm concordando; crate `calisto-native/`).
 
 ## Números de hoje (marcos)
+
+- Fase T: xxh64 100MB **9.3ms vs 345ms** do Digest::SHA256 (**37×**);
+  codecs com paridade exata da stdlib (base64 6 métodos, CGI, ERB).
 
 - Rails runner: Chatwoot 2162 → **108ms (20×)**; Maybe 1527 → **177ms (8.6×)**.
 - `calisto test`: rspec do Chatwoot 5006 → **698ms (7.2×)**; suite do
@@ -132,11 +140,50 @@ graph LR
   e goldens (maybe + chatwoot) sob 3.4.4 no daemon Rust; ruby sem `.so` →
   erro claro com o comando de rebuild.
 
+## Fase T — APIs nativas novas (`calisto.*`, o `Bun.*` do Ruby) ✅
+
+> Depois do hash (sha256/blake3) e do sqlite (Fase P), a Fase T cresce a
+> superfície nativa com o que a stdlib Ruby **não** cobre bem: hash
+> não-criptográfico (xxh64 — o `Bun.hash`) e codecs de string com
+> semântica exata da stdlib (paridade cold/warm via shims com fallback
+> puro). Um crate novo, `crates/calisto-native/`, registra os codecs no
+> boot do daemon (rb_define_singleton_method via NativeFns, como o hash).
+
+- [x] **T.1 — `Calisto::Hash.xxh64`** (crates/calisto-hash/src/xxh64.rs):
+      one-shot fiel ao xxhash.c oficial, vetores do **sanity check oficial**
+      do repo Cyan4973/xxHash (buffer determinístico com PRIME64 do
+      teste — pegadinha: 0x9E3779B185EBCA8D ≠ P1 — seeds 0/PRIME32, caminhos
+      tail <32 e blocos ≥32; validação cruzada com o C compilado). O
+      `Bun.hash` do Ruby: 100MB em 9.3ms vs 345ms do Digest::SHA256
+      (**37×**) — cache keys/sharding de Rails usam SHA256 por falta de
+      hash rápido na stdlib; cold → NotImplementedError.
+- [x] **T.2 — codecs** (crates/calisto-native/): `Calisto::Base64`
+      (espelho do stdlib base64 0.3 — encode64 com newline a cada 60 +
+      final, strict, urlsafe com `padding:` aceito como kwarg OU posicional,
+      decode64 lenient com lixo/`=`/grupo parcial, strict_decode64 com
+      ArgumentError "invalid base64" — mesmas regras do pack "m"/"m0",
+      urlsafe_decode64 com auto-pad de entrada unpadded), `Calisto::URL`
+      (CGI.escape/unescape — `~` NÃO é escapado, `+` para espaço, `%zz`
+      inválido intacto, hex case-insensitive) e `Calisto::HTML.escape`
+      (ERB::Util.html_escape — `&<>"'`). Nota honesta: base64/html usam
+      caminhos **C** da stdlib (pack/gsub com hash) e empatam em velocidade;
+      o win de velocidade real é o xxh64 e o CGI (gsub com bloco).
+- [x] **T.3 — integração**: `calisto_native::register` no boot do daemon
+      (obrigatório, sem degradação), shims `calisto/base64.rb`/`url.rb`/
+      `html.rb` com fallback puro em cold (stdlib base64/CGI/ERB — mesma
+      saída, paridade cold/warm); `rb_path2class`/kwargs-Hash detectado via
+      classe resolvida no register (kwarg `padding:` vira Hash posicional
+      no argc=-1; chave é SÍMBOLO).
+- [x] **T.4 — testes**: vetores oficiais (blake3/xxh64), paridade
+      cold/warm + stdlib em 6 métodos × 10 tamanhos (base64), semântica de
+      decode lenient/strict, URL/HTML vs CGI/ERB, benchmark xxh64 ≥3×
+      (**37×** medido, release).
+- [x] **T.5 — docs**: AGENTS.md (status, tabelas, contrato native.rs).
+
 ## Próximos passos
 
-- **APIs nativas novas** — `calisto.*` além de hash/sqlite (o `Bun.*` do Ruby).
 - **Degraus reais completos** — validar `calisto run`/build no Chatwoot
-  (a S.4 já re-ativa os goldens sob 3.4.4 embutido).
+  (os goldens já rodam sob 3.4.4 embutido; falta o degrau de build).
 - **Snapshot gated** — se o cenário de privilégio mudar (criu + caps),
   o gancho de invalidação (hash do socket do daemon da app) já existe.
 

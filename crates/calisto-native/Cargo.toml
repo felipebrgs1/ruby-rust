@@ -1,0 +1,8 @@
+[package]
+name = "calisto-native"
+version = "0.1.0"
+edition = "2021"
+description = "Fase T: APIs nativas Calisto::Base64/URL/HTML (codecs de string em Rust) registradas na VM embutida"
+
+[dependencies]
+calisto-ruby = { path = "../calisto-ruby" }

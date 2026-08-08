@@ -15,6 +15,7 @@ mod blake3;
 mod sha256;
 #[cfg(target_arch = "x86_64")]
 mod sha256_ni;
+mod xxh64;
 
 use calisto_ruby::{Ruby, VALUE};
 use std::ffi::{c_int, c_void};
@@ -38,6 +39,7 @@ pub fn register(vm: &Ruby) -> Result<(), String> {
         let hash = (n.rb_define_module_under)(calisto, c"Hash".as_ptr());
         (n.rb_define_singleton_method)(hash, c"sha256".as_ptr(), hash_sha256 as *const c_void, -1);
         (n.rb_define_singleton_method)(hash, c"blake3".as_ptr(), hash_blake3 as *const c_void, -1);
+        (n.rb_define_singleton_method)(hash, c"xxh64".as_ptr(), hash_xxh64 as *const c_void, -1);
     }
     Ok(())
 }
@@ -73,4 +75,26 @@ unsafe extern "C" fn hash_sha256(argc: c_int, argv: *mut VALUE, _self: VALUE) ->
 
 unsafe extern "C" fn hash_blake3(argc: c_int, argv: *mut VALUE, _self: VALUE) -> VALUE {
     hash_one_arg(argc, argv, blake3::hash)
+}
+
+/// `xxh64(data, seed = 0)` -> Integer (u64 sem sinal). O `Bun.hash` do Ruby.
+unsafe extern "C" fn hash_xxh64(argc: c_int, argv: *mut VALUE, _self: VALUE) -> VALUE {
+    let vm = vm();
+    if argc < 1 || argc > 2 {
+        vm.raise(
+            vm.e_arg_error(),
+            &format!("wrong number of arguments (given {argc}, expected 1..2)"),
+        );
+    }
+    let mut v = unsafe { *argv };
+    let (ptr, len) = vm.string_bytes(&mut v);
+    let seed = if argc == 2 {
+        // seed: Integer (u64) — aceita qualquer valor que rb_num2ll leia;
+        // bits tratados como u64 (espelho do seed do C)
+        unsafe { (vm.native().rb_num2ll)(*argv.add(1)) as u64 }
+    } else {
+        0
+    };
+    let h = xxh64::xxh64(unsafe { std::slice::from_raw_parts(ptr, len) }, seed);
+    unsafe { (vm.native().rb_ull2inum)(h) }
 }

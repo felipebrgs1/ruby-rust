@@ -64,6 +64,74 @@ else
       def self.blake3(_data)
         raise NotImplementedError, \"Calisto::Hash.blake3 requer o daemon calisto (indisponivel em --cold)\"
       end
+
+      def self.xxh64(_data, _seed = 0)
+        raise NotImplementedError, \"Calisto::Hash.xxh64 requer o daemon calisto (indisponivel em --cold)\"
+      end
+    end
+  end
+end
+";
+
+
+
+/// Shim de `require "calisto/base64"` (Fase T): nativo no daemon (Rust);
+/// em --cold cai no stdlib base64 (pure Ruby) — mesma saida, paridade
+/// cold/warm (so perde a velocidade nativa).
+pub const BASE64_SHIM: &str = "# frozen_string_literal: true
+# Gerado pelo calisto (Fase T): marcador das APIs nativas `calisto/base64`
+# (Rust no daemon). Fallback puro em --cold: stdlib base64 (mesma saida).
+if defined?(Calisto::Base64)
+  Calisto::Base64
+else
+  require \"base64\"
+  module Calisto
+    module Base64
+      def self.encode64(bin) = ::Base64.encode64(bin)
+      def self.decode64(str) = ::Base64.decode64(str)
+      def self.strict_encode64(bin) = ::Base64.strict_encode64(bin)
+      def self.strict_decode64(str) = ::Base64.strict_decode64(str)
+      def self.urlsafe_encode64(bin, padding: true) = ::Base64.urlsafe_encode64(bin, padding:)
+      def self.urlsafe_decode64(str) = ::Base64.urlsafe_decode64(str)
+    end
+  end
+end
+";
+
+
+
+/// Shim de `require "calisto/url"` (Fase T): nativo no daemon; em --cold cai
+/// no CGI da stdlib (mesma semantica escape/unescape).
+pub const URL_SHIM: &str = "# frozen_string_literal: true
+# Gerado pelo calisto (Fase T): marcador das APIs nativas `calisto/url`
+# (Rust no daemon). Fallback puro em --cold: CGI da stdlib.
+if defined?(Calisto::URL)
+  Calisto::URL
+else
+  require \"cgi\"
+  module Calisto
+    module URL
+      def self.escape(s) = CGI.escape(s)
+      def self.unescape(s) = CGI.unescape(s)
+    end
+  end
+end
+";
+
+
+
+/// Shim de `require "calisto/html"` (Fase T): nativo no daemon (Bun.
+/// escapeHTML do Ruby); em --cold cai no ERB::Util da stdlib.
+pub const HTML_SHIM: &str = "# frozen_string_literal: true
+# Gerado pelo calisto (Fase T): marcador das APIs nativas `calisto/html`
+# (Rust no daemon). Fallback puro em --cold: ERB::Util da stdlib.
+if defined?(Calisto::HTML)
+  Calisto::HTML
+else
+  require \"erb\"
+  module Calisto
+    module HTML
+      def self.escape(s) = ERB::Util.html_escape(s)
     end
   end
 end
@@ -79,6 +147,9 @@ pub fn ensure_native_shims(dir: &Path) {
     for (name, content) in [
         ("calisto/sqlite.rb", SQLITE_SHIM),
         ("calisto/hash.rb", HASH_SHIM),
+        ("calisto/base64.rb", BASE64_SHIM),
+        ("calisto/url.rb", URL_SHIM),
+        ("calisto/html.rb", HTML_SHIM),
     ] {
         let p = dir.join(name);
         if !p.is_file() {

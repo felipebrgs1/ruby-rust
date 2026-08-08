@@ -322,6 +322,11 @@ end"#;
     if let Err(e) = calisto_hash::register(vm) {
         return Err(format!("registro calisto/hash falhou: {e}"));
     }
+    // Fase T: codecs de string (base64/url/html) — sem deps externas, o
+    // registro e obrigatorio como o do hash (nao degrada).
+    if let Err(e) = calisto_native::register(vm) {
+        return Err(format!("registro calisto/base64,url,html falhou: {e}"));
+    }
     if let Err(e) = calisto_sqlite::register(vm) {
         // sem libsqlite3 do sistema: degrada — o shim do require levanta
         // LoadError claro (o calisto segue util sem o sqlite nativo)

@@ -242,3 +242,189 @@ printf "ratio: %.2f\n", (t2 - t1) / (t1 - t0)"#;
         assert!(ratio >= 3.0, "calisto deve ser >=3x o Digest::SHA256 (medido: {ratio:.2}x)");
     }
 }
+
+// ---- Fase T: Calisto::Base64 / Calisto::URL / Calisto::HTML -------------------
+// Codecs de string em Rust (stdlib Ruby e pure Ruby: base64 0.3, CGI, ERB).
+// Paridade = mesma SAIDA da stdlib, cold/warm concordando (o cold cai nos
+// shims com fallback puro). Os scripts rodam identicos nos dois modos.
+
+/// Script compartilhado: paridade com a stdlib em todos os metodos/sizes.
+const B64_PARITY_CODE: &str = r#"require "calisto/base64"
+require "base64"
+sizes = ["", "a", "ab", "abc", "x" * 56, "x" * 57, "x" * 60, "x" * 61, "x" * 1000, "x" * 1048576]
+sizes.each do |s|
+  raise "encode64 #{s.bytesize}" unless Calisto::Base64.encode64(s) == Base64.encode64(s)
+  raise "strict_encode64 #{s.bytesize}" unless Calisto::Base64.strict_encode64(s) == Base64.strict_encode64(s)
+  raise "urlsafe #{s.bytesize}" unless Calisto::Base64.urlsafe_encode64(s) == Base64.urlsafe_encode64(s)
+  raise "urlsafe nopad #{s.bytesize}" unless Calisto::Base64.urlsafe_encode64(s, padding: false) == Base64.urlsafe_encode64(s, padding: false)
+  enc = Base64.strict_encode64(s)
+  raise "decode64 #{s.bytesize}" unless Calisto::Base64.decode64(enc) == Base64.decode64(enc)
+  raise "strict_decode64 #{s.bytesize}" unless Calisto::Base64.strict_decode64(enc) == Base64.strict_decode64(enc)
+  us = Base64.urlsafe_encode64(s)
+  raise "urlsafe_decode64 #{s.bytesize}" unless Calisto::Base64.urlsafe_decode64(us) == Base64.urlsafe_decode64(us)
+end
+puts "B64-PARITY-OK""#;
+
+#[test]
+fn native_base64_parity_cold_warm_and_stdlib() {
+    let dir = runtime_dir("native-base64");
+    let warm = warm_eval(&dir, B64_PARITY_CODE);
+    assert!(warm.status.success(), "warm stderr: {}", String::from_utf8_lossy(&warm.stderr));
+    let cold = run(&dir, &["run", "--cold", "-e", B64_PARITY_CODE]);
+    assert!(cold.status.success(), "cold stderr: {}", String::from_utf8_lossy(&cold.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&warm.stdout),
+        String::from_utf8_lossy(&cold.stdout),
+        "cold/warm devem concordar (fallback stdlib == Rust)"
+    );
+}
+
+#[test]
+fn native_base64_decode_semantics_match_stdlib() {
+    // decode64 lenient (lixo ignorado, `=` para, grupo parcial final) e
+    // strict_decode64/urlsafe_decode64 (ArgumentError "invalid base64") —
+    // mesmas regras do pack "m"/"m0", em warm E cold (o stdlib levanta nos
+    // dois; o nativo precisa replicar).
+    let dir = runtime_dir("native-base64-dec");
+    let code = r#"require "calisto/base64"
+require "base64"
+# lenient: mesmas saidas do stdlib
+["aGVsbG8=", "aGVs bG8=", "YQ bG8=", "!!aGVsbG8@@##", "aGVsbG8", "====", "YQ", "Y", "", "YQ=YQ", "aGVsbG8=extra", "aGVsbG8X"].each do |s|
+  raise "decode64 #{s.inspect}" unless Calisto::Base64.decode64(s) == Base64.decode64(s)
+end
+# strict: casos invalidos levantam nos DOIS (mesma mensagem); validos concordam
+[["YQ==", true], ["YWI=", true], ["aGVsbG8X", true], ["", true],
+ ["YQ", false], ["YWI", false], ["aGVsbG8", false], ["====", false], ["Y===", false],
+ ["aGVsbG8!", false], ["aGVs bG8=", false], ["YQ===", false], ["YQ=a", false]].each do |s, ok|
+  native_ok = begin; Calisto::Base64.strict_decode64(s); true; rescue ArgumentError => e
+    raise "msg nativa #{s.inspect}: #{e.message}" unless e.message == "invalid base64"
+    false
+  end
+  stdlib_ok = begin; Base64.strict_decode64(s); true; rescue ArgumentError => e
+    raise "msg stdlib #{s.inspect}: #{e.message}" unless e.message == "invalid base64"
+    false
+  end
+  raise "strict #{s.inspect} nativa=#{native_ok} stdlib=#{stdlib_ok}" unless native_ok == stdlib_ok && native_ok == ok
+end
+# urlsafe_decode64: tr -_ -> +/ e strict (base64 0.3.0 — unpadded e completado)
+raise "us" unless Calisto::Base64.urlsafe_decode64("-_8=") == Base64.urlsafe_decode64("-_8=")
+raise "us unpadded" unless Calisto::Base64.urlsafe_decode64("-_8") == Base64.urlsafe_decode64("-_8")
+begin; Calisto::Base64.urlsafe_decode64("-__8="); raise "us invalido"; rescue ArgumentError; end
+puts "B64-DEC-OK""#;
+    let warm = warm_eval(&dir, code);
+    assert!(warm.status.success(), "warm stderr: {}", String::from_utf8_lossy(&warm.stderr));
+    let cold = run(&dir, &["run", "--cold", "-e", code]);
+    assert!(cold.status.success(), "cold stderr: {}", String::from_utf8_lossy(&cold.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&warm.stdout),
+        String::from_utf8_lossy(&cold.stdout)
+    );
+}
+
+#[test]
+fn native_url_parity_cold_warm_and_cgi() {
+    let dir = runtime_dir("native-url");
+    let code = r#"require "calisto/url"
+require "cgi"
+["a b-c.d_e~f", "café & <tag>", "+%/=?", "a+b", "%2F%3D", "x" * 1000, "üñïçødé 日本", ""].each do |s|
+  raise "escape #{s.inspect}" unless Calisto::URL.escape(s) == CGI.escape(s)
+  raise "unescape #{s.inspect}" unless Calisto::URL.unescape(s) == CGI.unescape(s)
+  raise "roundtrip #{s.inspect}" unless Calisto::URL.unescape(Calisto::URL.escape(s)) == s
+end
+raise "bad pct" unless Calisto::URL.unescape("%zz%2F") == CGI.unescape("%zz%2F")
+raise "lower hex" unless Calisto::URL.unescape("%c3%a9") == CGI.unescape("%c3%a9")
+puts "URL-PARITY-OK""#;
+    let warm = warm_eval(&dir, code);
+    assert!(warm.status.success(), "warm stderr: {}", String::from_utf8_lossy(&warm.stderr));
+    let cold = run(&dir, &["run", "--cold", "-e", code]);
+    assert!(cold.status.success(), "cold stderr: {}", String::from_utf8_lossy(&cold.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&warm.stdout),
+        String::from_utf8_lossy(&cold.stdout)
+    );
+}
+
+#[test]
+fn native_html_escape_parity_cold_warm_and_erb() {
+    let dir = runtime_dir("native-html");
+    let code = r#"require "calisto/html"
+require "erb"
+["a&b<c>d\"e'f", "no specials", "café 日本", "&" * 1000, "<script>alert(1)</script>", ""].each do |s|
+  raise "escape #{s.inspect}" unless Calisto::HTML.escape(s) == ERB::Util.html_escape(s)
+end
+puts "HTML-PARITY-OK""#;
+    let warm = warm_eval(&dir, code);
+    assert!(warm.status.success(), "warm stderr: {}", String::from_utf8_lossy(&warm.stderr));
+    let cold = run(&dir, &["run", "--cold", "-e", code]);
+    assert!(cold.status.success(), "cold stderr: {}", String::from_utf8_lossy(&cold.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&warm.stdout),
+        String::from_utf8_lossy(&cold.stdout)
+    );
+}
+
+#[test]
+fn native_hash_xxh64_matches_official_vectors() {
+    // Vetores oficiais do sanity check do xxHash (Cyan4973/xxHash
+    // cli/xsum_sanity_check.c): buffer pseudo-aleatorio deterministico
+    // (byteGen = PRIME32, *= PRIME64 do TESTE 0x9E3779B185EBCA8D) com
+    // seeds 0 e PRIME32 — cobertura de caminhos <32 (tail) e >=32 (blocos).
+    let dir = runtime_dir("native-xxh64");
+    let code = r#"require "calisto/hash"
+gen = 2654435761
+buf = (0...2367).map { |i| b = (gen >> 56) & 0xff; gen = (gen * 0x9E3779B185EBCA8D) & 0xFFFFFFFFFFFFFFFF; b }.pack("C*")
+{0 => 0xEF46DB3751D8E999, 1 => 0xE934A84ADB052768, 4 => 0x9136A0DCA57457EE,
+ 14 => 0x8282DCC4994E35C8, 222 => 0xB641AE8CB691C174, 512 => 0x4358D2FDD62B58A7}.each do |len, exp|
+  raise "len #{len}: #{Calisto::Hash.xxh64(buf.byteslice(0, len)).to_s(16)}" unless Calisto::Hash.xxh64(buf.byteslice(0, len)) == exp
+end
+raise "seeded" unless Calisto::Hash.xxh64(buf.byteslice(0, 222), 2654435761) == 0x20CB8AB7AE10C14A
+puts Calisto::Hash.xxh64("abc")"#;
+    let warm = warm_eval(&dir, code);
+    assert!(warm.status.success(), "warm stderr: {}", String::from_utf8_lossy(&warm.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&warm.stdout).trim(),
+        "4952883123889572249", // xxh64("abc") = 0x44BC2CF5AD770999
+        "stdout inesperado"
+    );
+    // cold: sem o daemon o xxh64 e NotImplementedError (nao ha stdlib)
+    let cold = run(&dir, &["run", "--cold", "-e", r#"require "calisto/hash"
+begin
+  Calisto::Hash.xxh64("x")
+  raise "nao levantou"
+rescue NotImplementedError
+  puts "COLD-XXH-OK"
+end"#]);
+    assert!(cold.status.success(), "cold stderr: {}", String::from_utf8_lossy(&cold.stderr));
+    assert!(String::from_utf8_lossy(&cold.stdout).contains("COLD-XXH-OK"));
+}
+
+#[test]
+fn native_hash_xxh64_benchmark_beats_digest() {
+    // Marco da Fase T: xxh64 (hash NAO-criptografico, o Bun.hash) de 100MB
+    // >= 3x o Digest::SHA256 — a stdlib nao tem hash de bytes rapido;
+    // cache keys/sharding de apps Rails usam SHA256 hoje, xxh64 e o
+    // substituto (5-8GB/s vs ~1.5GB/s do SHA256 com SHA-NI).
+    let dir = runtime_dir("native-xxh-bench");
+    let code = r#"require "calisto/hash"
+require "digest"
+data = "x" * (100 * 1024 * 1024)
+t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+h = Calisto::Hash.xxh64(data)
+t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+d = Digest::SHA256.hexdigest(data)
+t2 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+raise "digest vazio" if d.empty? || h.zero?
+printf "ratio: %.2f\n", (t2 - t1) / (t1 - t0)"#;
+    let out = warm_eval(&dir, code);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let ratio: f64 = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("ratio: ").and_then(|r| r.trim().parse().ok()))
+        .expect("ratio no stdout");
+    if cfg!(debug_assertions) {
+        eprintln!("native: benchmark em build debug (ratio {ratio:.2}x) — rodar --release para o marco");
+    } else {
+        assert!(ratio >= 3.0, "calisto deve ser >=3x o Digest::SHA256 (medido: {ratio:.2}x)");
+    }
+}
