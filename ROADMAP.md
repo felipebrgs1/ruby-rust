@@ -73,6 +73,12 @@ graph LR
   railsapp **<1s** quente.
 - `calisto run -e` quente **36ms** (<50ms); scaffold do init **33ms**;
   `run db:migrate` 135ms; `task db:migrate` 530 → 98ms.
+- Cold (1º comando): bundler/setup condicional (só com Gemfile — o ruby puro
+  também não carrega bundler fora de bundle) + poll de spawn 25→2ms: cold
+  preload-0 **127→91ms**, warm **50→37ms**, `--cold` **66→58ms**. O resto do
+  gap vs o ruby puro (58ms) é o boot do CLI do MRI + dlopen — snapshot de
+  heap (o que Node/Bun fazem) não existe no CRuby (Fase O: criu exige
+  privilégio; a decisão fica: fork do daemon quente).
 - Fase M: Private_Dirty de child do Chatwoot **−58%** (compactação + CoW,
   revalidado no daemon Rust na Fase S; era −46% no legado).
 - Fase N: 1º request `/cpu` 119–188ms → **6–13ms** com YJIT + warmup.

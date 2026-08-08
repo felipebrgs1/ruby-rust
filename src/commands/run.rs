@@ -333,8 +333,9 @@ pub fn cmd_run_version() -> i32 {
 
 
 pub fn run_cold(ruby: &Path, script: &str, args: &[String], cwd: &Path, flags: &RunFlags) -> i32 {
-    // -rbundler/setup: ativa o Gemfile do cwd (como `bundle exec ruby`);
-    // no-op fora de bundle, mantendo a paridade com o daemon warm.
+    // -rbundler/setup SO com Gemfile no cwd (paridade com o child warm):
+    // ativa o bundle como `bundle exec ruby`; sem bundle, o ruby puro nao
+    // carrega bundler — e o calisto tambem nao (economia de ~20-30ms).
     // -I <runtime>: shims nativos calisto/sqlite.rb + calisto/hash.rb (o
     // hash cai no fallback Digest — paridade cold/warm; o sqlite levanta
     // LoadError claro, e nativo do daemon).
@@ -348,7 +349,12 @@ pub fn run_cold(ruby: &Path, script: &str, args: &[String], cwd: &Path, flags: &
         Some(n) => { cmd.arg(format!("-W{n}")); }
         None => {}
     };
-    cmd.arg("-I").arg(&shims).arg("-rbundler/setup");
+    cmd.arg("-I").arg(&shims);
+    // -rbundler/setup so com Gemfile (paridade com o child warm: sem bundle
+    // o ruby puro tambem nao carrega bundler — economiza ~20-30ms do cold).
+    if has_gemfile_from(cwd) {
+        cmd.arg("-rbundler/setup");
+    }
     if let Some(enc) = &flags.encoding {
         cmd.arg("-E").arg(enc);
     }
@@ -382,7 +388,10 @@ pub fn run_cold_eval(ruby: &Path, code: &str, args: &[String], flags: &RunFlags)
         Some(n) => { cmd.arg(format!("-W{n}")); }
         None => {}
     };
-    cmd.arg("-I").arg(&shims).arg("-rbundler/setup");
+    cmd.arg("-I").arg(&shims);
+    if has_gemfile() {
+        cmd.arg("-rbundler/setup");
+    }
     if let Some(enc) = &flags.encoding {
         cmd.arg("-E").arg(enc);
     }

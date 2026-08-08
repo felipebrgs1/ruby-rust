@@ -296,7 +296,7 @@ pub fn connect_or_spawn_daemon_in(
             let _ = child.kill();
             return Err("timed out waiting for daemon socket".into());
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -339,7 +339,12 @@ pub fn connect_or_spawn_app_daemon_in(
     // Fase N: --yjit e flag real do interpretador (ruby_options no modo
     // embutido; `ruby --yjit ...` no legado) — o JIT liga antes do preload/
     // warmup, entao o codigo quente compilado no boot e herdado pelos forks.
-    let mut flags: Vec<&str> = vec!["-rbundler/setup"];
+    // -rbundler/setup so com Gemfile na raiz da app (sem bundle e no-op que
+    // custa ~20-30ms no boot — apps de preload sem Gemfile nao pagam).
+    let mut flags: Vec<&str> = Vec::new();
+    if has_gemfile_from(&app.root) {
+        flags.push("-rbundler/setup");
+    }
     if yjit {
         flags.push("--yjit");
     }

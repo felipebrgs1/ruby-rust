@@ -9,6 +9,7 @@ use std::path::Path;
 use std::os::fd::{RawFd};
 use std::ffi::{c_char, c_int, CString};
 use std::env;
+use crate::appconfig::*;
 use crate::daemon::*;
 
 
@@ -212,9 +213,14 @@ pub fn child_main(
             }
         }
     }
-    // child_enter: ativacao do Gemfile do cwd (no-op fora de bundle)
-    if let Err(e) = vm.require("bundler/setup") {
-        child_error(vm, e);
+    // child_enter: ativacao do Gemfile do cwd. Sem Gemfile (nem
+    // BUNDLE_GEMFILE) o Bundler.setup e no-op mas custa ~20-30ms de load do
+    // bundler POR COMANDO — pula, como o `ruby script.rb` puro (que tambem
+    // nao carrega bundler fora de bundle). Com Gemfile: idem `bundle exec`.
+    if has_gemfile() {
+        if let Err(e) = vm.require("bundler/setup") {
+            child_error(vm, e);
+        }
     }
     // -I do child (calisto test) + dir nativo (Fase P: shims calisto/*).
     // Depois do Bundler.setup (limpa $LOAD_PATH).

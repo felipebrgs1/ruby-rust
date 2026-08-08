@@ -31,10 +31,9 @@ pub fn normalize_preload(v: &str) -> String {
 
 
 
-/// Sobe do cwd ate a raiz procurando um arquivo (mesma busca do Bundler).
-pub fn find_in_parents(name: &str) -> Option<PathBuf> {
-    let cwd = env::current_dir().ok()?;
-    let mut dir: Option<&Path> = Some(cwd.as_path());
+/// Sobe de um dir ate a raiz procurando um arquivo (mesma busca do Bundler).
+pub fn find_in_parents_from(base: &Path, name: &str) -> Option<PathBuf> {
+    let mut dir: Option<&Path> = Some(base);
     while let Some(d) = dir {
         let cand = d.join(name);
         if cand.is_file() {
@@ -43,6 +42,14 @@ pub fn find_in_parents(name: &str) -> Option<PathBuf> {
         dir = d.parent();
     }
     None
+}
+
+
+
+/// Sobe do cwd ate a raiz procurando um arquivo (mesma busca do Bundler).
+pub fn find_in_parents(name: &str) -> Option<PathBuf> {
+    let cwd = env::current_dir().ok()?;
+    find_in_parents_from(&cwd, name)
 }
 
 
@@ -85,11 +92,22 @@ pub fn load_dotenv() {
 /// Sinatra 4), o Bundler aborta com "already activated". Com Gemfile, o
 /// preload fica vazio e o bundler ativa o necessario (interpretador "fresco",
 /// como o `bundle exec`).
-pub fn has_gemfile() -> bool {
+/// Gemfile/gems.rb a partir de um dir explicito (ou BUNDLE_GEMFILE). O
+/// child (pos-chdir) e o cold (cwd proprio) usam a base certa — o env do
+/// processo cliente pode nao ser o do alvo.
+pub fn has_gemfile_from(base: &Path) -> bool {
     if env::var_os("BUNDLE_GEMFILE").is_some() {
         return true;
     }
-    find_in_parents("Gemfile").is_some() || find_in_parents("gems.rb").is_some()
+    find_in_parents_from(base, "Gemfile").is_some()
+        || find_in_parents_from(base, "gems.rb").is_some()
+}
+
+
+
+pub fn has_gemfile() -> bool {
+    let Ok(cwd) = env::current_dir() else { return false };
+    has_gemfile_from(&cwd)
 }
 
 
