@@ -7,10 +7,13 @@
 #
 # Uso: ruby examples/html_server.rb  |  calisto run examples/html_server.rb
 # Env: HTML_PORT (default 0 = efemera; imprime "READY <port>" e flush),
-#      HTML_LOG=1 (timing por request no stderr).
+#      HTML_LOG=1 (timing por request no stderr),
+#      HTML_THREADS (default 1 — threads compartilham o accept; I/O libera
+#      o GVL, entao um servidor de I/O-bound escala com threads mesmo no MRI).
 require "socket"
 
 port = Integer(ENV.fetch("HTML_PORT", "0"))
+threads = Integer(ENV.fetch("HTML_THREADS", "1"))
 server = TCPServer.new("127.0.0.1", port)
 port = server.addr[1]
 
@@ -22,25 +25,29 @@ response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" \
 puts "READY #{port}"
 $stdout.flush
 
-loop do
-  client = server.accept
-  begin
-    # consome a request (headers ate a linha vazia)
-    while (line = client.gets)
-      break if line == "\r\n" || line == "\n"
-    end
-    t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    client.write(response)
-    if ENV["HTML_LOG"]
-      ms = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000
-      warn format("req %.3fms", ms)
-    end
-  rescue IOError, Errno::EPIPE, Errno::ECONNRESET
-    # cliente sumiu no meio — segue
-  ensure
+worker = lambda do
+  loop do
+    client = server.accept
     begin
-      client.close
-    rescue IOError
+      # consome a request (headers ate a linha vazia)
+      while (line = client.gets)
+        break if line == "\r\n" || line == "\n"
+      end
+      t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      client.write(response)
+      if ENV["HTML_LOG"]
+        ms = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000
+        warn format("req %.3fms", ms)
+      end
+    rescue IOError, Errno::EPIPE, Errno::ECONNRESET
+      # cliente sumiu no meio — segue
+    ensure
+      begin
+        client.close
+      rescue IOError
+      end
     end
   end
 end
+
+threads.times.map { Thread.new(&worker) }.each(&:join)
