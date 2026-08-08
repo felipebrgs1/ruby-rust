@@ -106,7 +106,29 @@ daemon (app preload), NUNCA no `-I` do cold (paridade: cold carrega a gem pg
 real do bundle). Sem libpq: daemon degrada com warning e `require "pg"`
 levanta LoadError claro. Marco: goldens maybe (Rails 7.2) e chatwoot (Rails
 7.1, pgvector, ActionCable) rodando com o pg nativo — realapps 3/3 — e
-`test/pgnative.rs` gated em `CALISTO_TEST_PG`.
+`test/pgnative.rs` gated em `CALISTO_TEST_PG`. Marco benchmark (chatwoot
+seedado: 20k contacts / 30k conversations / 600k messages — bulk
+generate_series via `connection.execute`, 28.7s): queries pesadas
+(joins/laterais/agregações/seq scans com padrão ILIKE paramétrico) em
+**paridade** com a gem pg real (server-bound — o wire é libpq nos dois;
+benchmarks SEMPRE em `--release`, debug não mede Rust) e a materialização
+de 200k linhas fechou a paridade com os **decoders por OID** (Fase PG.2):
+`type_map_for_results=` marca o Conn (shim → `_calisto_result_type_map!`),
+o Result herda o flag no wrap, e `values`/`[]`/`typed_getvalue` decodificam
+int2/4/8/oid→Integer (`parse_i64_raw` à mão, como o fast path do pg — o
+`from_utf8`+`parse` do std era mais caro que alocar a string), float4/8→Float
+(NaN/Infinity do postgres) e bool→t/f; `getvalue` segue cru (paridade com o
+pg) e date/timestamp/numeric/bytea ficam string (o typecast do AR cobre).
+Dois bugs reais achados no caminho: (1) `row_values` construía as células
+num Vec no heap Rust + `rb_ary_new_from_values` — o GC conservador não vê o
+buffer (coleta strings mid-loop → dangling → "[BUG] try to mark T_NONE
+object" em GC.stress pesado); corrigido com array Ruby na pilha
+(`rb_ary_new_capa`+push — root visível); (2) `cmd_tuples` devolvia String —
+o pg 1.5 devolve **Integer** (LONG2NUM(strtol)) e o AR compara
+numericamente (`destroy_row > 0`, `affected_rows != 1` do optimistic
+locking) → "comparison of String with 0 failed" no destroy de sessões do
+chatwoot; agora Integer. Shims com auto-reparo por conteúdo (um dir de
+runtime antigo com shim stale silenciosamente não aplica mudanças).
 Ciclo L–T fechado; próximos candidatos: degraus reais com o instalado,
 snapshot gated se o cenário de privilégio mudar.
 

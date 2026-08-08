@@ -63,6 +63,34 @@ fn pg_native_exec_params_prepared_and_values() {
 }
 
 #[test]
+fn pg_decoders_by_oid() {
+    let Some(conn) = pg_conn() else {
+        eprintln!("skipping pgnative: CALISTO_TEST_PG nao definido (postgres vivo necessario)");
+        return;
+    };
+    let dir = common::runtime_dir("pgnative-decode");
+    let script = common::fixture("pgdecoders.rb");
+    let script = script.to_str().unwrap();
+    let out = run_opt(
+        &dir,
+        RunOpts {
+            args: &["run", script],
+            env: &[("CALISTO_TEST_PG", &conn)],
+            stdin: None,
+            cwd: None,
+            timeout: 60,
+        },
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "pgdecoders falhou:\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(stdout.contains("PG_DECODE_OK"), "stdout={stdout}\nstderr={stderr}");
+}
+
+#[test]
 fn pg_gems_dir_only_in_warm_load_path() {
     let dir = common::runtime_dir("pgnative-lp");
     let probe = "puts $LOAD_PATH.any? { |p| p.end_with?(\"/gems\") }";

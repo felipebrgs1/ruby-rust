@@ -278,6 +278,28 @@ fn result_class() -> VALUE {
     CLASS_RESULT.lock().unwrap().expect("result class")
 }
 
+/// Indice UTF-8 da VM (rb_utf8_encindex — constante). LazyLock: inicializa
+/// no primeiro acesso (pos-register, quando a VM esta bootada) e depois e
+/// um load atomico — um Mutex aqui custaria ~20-40ns POR STRING.
+static UTF8_ENC_IDX: std::sync::LazyLock<c_int> =
+    std::sync::LazyLock::new(|| unsafe { (vm().native().rb_utf8_encindex)() });
+
+fn utf8_enc_idx() -> c_int {
+    *UTF8_ENC_IDX
+}
+
+/// String Ruby de bytes com tag UTF-8 — caminho rapido igual ao
+/// pg_text_dec_string do pg gem: rb_str_new + associar o INDICE de encoding
+/// (rb_enc_associate_index, lookup em array). O rb_utf8_str_new da API faz
+/// rb_enc_to_index (lookup na tabela de encodings) POR STRING — ~100ns a
+/// mais por célula (o gap de 2x medido na conversao de 200k linhas).
+fn utf8_string(vm: &Ruby, ptr: *const c_char, len: c_long) -> VALUE {
+    let n = vm.native();
+    let s = unsafe { (n.rb_str_new)(ptr, len) };
+    unsafe { (n.rb_enc_associate_index)(s, utf8_enc_idx()) };
+    s
+}
+
 // ---- TypedData (handles conn/result com dfree no GC) --------------------------
 
 /// Ponteiro cru num static exige Sync — o conteudo nunca e mutado depois da
@@ -316,6 +338,7 @@ unsafe extern "C" fn res_free(p: *mut c_void) {
 unsafe extern "C" fn conn_alloc(klass: VALUE) -> VALUE {
     let boxed = Box::into_raw(Box::new(Conn {
         conn: std::ptr::null_mut(),
+        decode: false,
     }));
     (vm().native().rb_data_typed_object_wrap)(klass, boxed as *mut c_void, conn_type())
 }
@@ -323,6 +346,7 @@ unsafe extern "C" fn conn_alloc(klass: VALUE) -> VALUE {
 unsafe extern "C" fn res_alloc(klass: VALUE) -> VALUE {
     let boxed = Box::into_raw(Box::new(Res {
         res: std::ptr::null_mut(),
+        decode: false,
     }));
     (vm().native().rb_data_typed_object_wrap)(klass, boxed as *mut c_void, res_type())
 }
@@ -363,18 +387,22 @@ fn res_type() -> &'static RbDataType {
     &RES_TYPE.0
 }
 
-/// Handle de Connection: `conn` nulo = fechado (close/finish/GC).
+/// Handle de Connection: `conn` nulo = fechado (close/finish/GC); `decode`
+/// = type_map_for_results setado (conversao de valores por OID — espelho do
+/// pg gem, que herda o type map do conn nos results).
 #[repr(C)]
 struct Conn {
     conn: *mut PGconn,
+    decode: bool,
 }
 
-/// Handle de Result: `res` nulo = limpo (clear/GC). Resultados sao
-/// autossuficientes em memoria (PQclear e seguro apos PQfinish do conn) —
-/// nao guardam referencia ao Connection.
+/// Handle de Result: `res` nulo = limpo (clear/GC); `decode` herdado da
+/// conexao no momento da criacao (como o p_typemap do pg gem). Resultados
+/// sao autossuficientes em memoria (PQclear e seguro apos PQfinish).
 #[repr(C)]
 struct Res {
     res: *mut PGresult,
+    decode: bool,
 }
 
 fn conn_of(vm: &Ruby, obj: VALUE) -> *mut Conn {
@@ -569,24 +597,109 @@ fn fatal_message(p: &PqFns, res: *mut PGresult) -> Option<String> {
 }
 
 /// Empacota um PGresult como PG::Result (TypedData) — o dfree limpa no GC.
-fn wrap_result(vm: &Ruby, res: *mut PGresult) -> VALUE {
-    let boxed = Box::into_raw(Box::new(Res { res }));
+/// `decode` herda o flag do Connection (type_map_for_results do pg gem).
+fn wrap_result(vm: &Ruby, res: *mut PGresult, decode: bool) -> VALUE {
+    let boxed = Box::into_raw(Box::new(Res { res, decode }));
     unsafe { (vm.native().rb_data_typed_object_wrap)(result_class(), boxed as *mut c_void, res_type()) }
 }
 
-/// Linha i do resultado como Array de strings (nil para NULL).
-fn row_values(vm: &Ruby, res: *mut PGresult, i: c_int) -> VALUE {
+/// Parse de int texto canonico do postgres (digitos ASCII, sinal opcional) —
+/// a mao, como o fast path do pg_text_dec_integer (o pg documenta o
+/// rb_cstr2inum como lento; from_utf8+parse do std e pior ainda: validacao
+/// UTF-8 + aritmetica checked por digito). Sem overflow check: o texto do
+/// int8 cobre exatamente o range do i64 (o pg tambem nao checa).
+fn parse_i64_raw(c: *const c_char, len: c_int) -> Option<i64> {
+    if len <= 0 {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(c as *const u8, len as usize) };
+    let (neg, start) = match bytes[0] {
+        b'-' => (true, 1),
+        b'+' => (false, 1),
+        b'0'..=b'9' => (false, 0),
+        _ => return None,
+    };
+    if start >= bytes.len() {
+        return None;
+    }
+    let mut i: i64 = 0;
+    for &b in &bytes[start..] {
+        match b {
+            b'0'..=b'9' => i = i * 10 + (b - b'0') as i64,
+            _ => return None,
+        }
+    }
+    Some(if neg { -i } else { i })
+}
+
+/// Decodifica uma celula por OID (espelho do type map do AR/pg gem):
+/// int2/4/8/oid -> Integer (rb_ll2inum — Fixnum, SEM alocacao de string),
+/// float4/8 -> Float (NaN/Infinity do postgres mapeados), bool -> true/false.
+/// OIDs fora do conjunto -> None (o caller cai na string; AR typecasta
+/// strings corretamente — date/timestamp/numeric/bytea ficam string).
+fn decode_value(vm: &Ruby, oid: Oid, c: *const c_char, len: c_int) -> Option<VALUE> {
+    match oid {
+        20 | 21 | 23 | 26 => {
+            // int8/int2/int4/oid
+            parse_i64_raw(c, len).map(|i| unsafe { (vm.native().rb_ll2inum)(i) })
+        }
+        700 | 701 => {
+            // float4/float8 — formatos do postgres: "NaN", "Infinity",
+            // "-Infinity", ou numero canonico
+            let bytes = unsafe { std::slice::from_raw_parts(c as *const u8, len as usize) };
+            let v = match bytes {
+                b"NaN" => f64::NAN,
+                b"Infinity" => f64::INFINITY,
+                b"-Infinity" => f64::NEG_INFINITY,
+                _ => std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()?,
+            };
+            Some(unsafe { (vm.native().rb_float_new)(v) })
+        }
+        16 => match unsafe { *c as u8 } {
+            // bool: formato texto do libpq ('t'/'f')
+            b't' => Some(calisto_ruby::Qtrue),
+            b'f' => Some(calisto_ruby::Qfalse),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Linha i do resultado como Array (nil para NULL; com decode=true, valores
+/// tipados por OID — int/bool/float — senao strings).
+fn row_values(vm: &Ruby, res: *mut PGresult, i: c_int, decode: bool) -> VALUE {
     let p = pq();
     let n = vm.native();
     let nf = unsafe { (p.nfields)(res) };
-    let row = unsafe { (n.rb_ary_new)() };
+    // OIDs por coluna UMA vez (o PQftype e leitura de campo no libpq, mas
+    // evita a chamada por celula no loop quente)
+    let oids: Vec<Oid> = if decode {
+        (0..nf).map(|j| unsafe { (p.ftype)(res, j) }).collect()
+    } else {
+        Vec::new()
+    };
+    // mesmo padrao do pgresult_values do pg gem, com UMA diferenca critica:
+    // as células sao empurradas num array Ruby criado ANTES do loop (nao num
+    // Vec Rust + rb_ary_new_from_values no fim). O array e um root visivel
+    // ao GC conservador (esta no stack Rust) — um GC disparado por uma
+    // alocacao mid-loop coleta as strings que so viveriam no buffer do Vec
+    // (invisivel), deixando ponteiros dangling no array final. (Bug real
+    // achado em GC: "try to mark T_NONE object".)
+    let row = unsafe { (n.rb_ary_new_capa)(nf as c_long) };
     for j in 0..nf {
         let v = if unsafe { (p.getisnull)(res, i, j) } != 0 {
             calisto_ruby::Qnil
         } else {
             let c = unsafe { (p.getvalue)(res, i, j) };
             let len = unsafe { (p.getlength)(res, i, j) };
-            unsafe { (n.rb_utf8_str_new)(c, len as c_long) }
+            if decode {
+                match decode_value(vm, oids[j as usize], c, len) {
+                    Some(v) => v,
+                    None => utf8_string(vm, c, len as c_long),
+                }
+            } else {
+                utf8_string(vm, c, len as c_long)
+            }
         };
         unsafe { (n.rb_ary_push)(row, v) };
     }
@@ -646,7 +759,7 @@ unsafe extern "C" fn conn_exec(argc: c_int, argv: *mut VALUE, self_: VALUE) -> V
         (p.clear)(res);
         vm.raise(error_class(), &msg);
     }
-    wrap_result(vm, res)
+    wrap_result(vm, res, (*h).decode)
 }
 
 /// `Connection#exec_params(sql, params=nil)` — binds nil/String (ou to_s).
@@ -668,7 +781,7 @@ unsafe extern "C" fn conn_exec_params(argc: c_int, argv: *mut VALUE, self_: VALU
         (p.clear)(res);
         vm.raise(error_class(), &msg);
     }
-    wrap_result(vm, res)
+    wrap_result(vm, res, (*h).decode)
 }
 
 /// `Connection#prepare(name, sql)` — statement nomeada na sessao.
@@ -713,7 +826,7 @@ unsafe extern "C" fn conn_exec_prepared(argc: c_int, argv: *mut VALUE, self_: VA
         (p.clear)(res);
         vm.raise(error_class(), &msg);
     }
-    wrap_result(vm, res)
+    wrap_result(vm, res, (*h).decode)
 }
 
 /// `Connection#escape(str)` — PQescapeStringConn (AR: quote_string).
@@ -741,7 +854,7 @@ unsafe extern "C" fn conn_escape(argc: c_int, argv: *mut VALUE, self_: VALUE) ->
     if err != 0 {
         vm.raise(error_class(), &format!("PQescapeStringConn falhou: {}", conn_error_msg(p, conn)));
     }
-    (vm.native().rb_utf8_str_new)(buf.as_ptr() as *const c_char, out_len as c_long)
+    utf8_string(vm, buf.as_ptr() as *const c_char, out_len as c_long)
 }
 
 /// `Connection#escape_literal(str)` / `#escape_identifier(str)` — retorno
@@ -1005,6 +1118,20 @@ unsafe extern "C" fn conn_set_notice_receiver(argc: c_int, _argv: *mut VALUE, _s
     calisto_ruby::Qnil
 }
 
+/// `Connection#_calisto_result_type_map!(map)` — privado (shim): marca se a
+/// conversao de valores decodifica por OID (o equivalente funcional do
+/// `type_map_for_results=` do pg gem; o map em si e guardado como ivar no
+/// shim). Nil desliga; qualquer outro valor liga.
+unsafe extern "C" fn conn_calisto_result_type_map(argc: c_int, argv: *mut VALUE, self_: VALUE) -> VALUE {
+    let vm = vm();
+    if argc != 1 {
+        vm.raise(vm.e_arg_error(), &format!("wrong number of arguments (given {argc}, expected 1)"));
+    }
+    let h = conn_of(vm, self_);
+    unsafe { (*h).decode = *argv != calisto_ruby::Qnil };
+    *argv
+}
+
 /// `Connection#get_last_result` — consome um resultado pendente da fila do
 /// libpq (o AR 7.1 chama apos `prepare` para "limpar a fila"). No modelo
 /// sync nao ha resultado pendente -> nil (como o pg gem em conexao sync).
@@ -1024,7 +1151,7 @@ unsafe extern "C" fn conn_get_last_result(argc: c_int, _argv: *mut VALUE, self_:
         (p.clear)(res);
         vm.raise(error_class(), &msg);
     }
-    wrap_result(vm, res)
+    wrap_result(vm, res, (*h).decode)
 }
 
 /// `PG::Connection.conndefaults_hash` — Hash { simbolo => valor } dos
@@ -1086,7 +1213,8 @@ unsafe extern "C" fn conn_quote_ident(argc: c_int, argv: *mut VALUE, _self: VALU
 
 // ---- metodos nativos: PG::Result ---------------------------------------------
 
-/// `Result#values` — Array de linhas (strings; nil para NULL).
+/// `Result#values` — Array de linhas (nil para NULL; com type map setado
+/// na conexao, valores tipados por OID: int/bool/float — senao strings).
 unsafe extern "C" fn res_values(argc: c_int, _argv: *mut VALUE, self_: VALUE) -> VALUE {
     let vm = vm();
     if argc != 0 {
@@ -1094,12 +1222,13 @@ unsafe extern "C" fn res_values(argc: c_int, _argv: *mut VALUE, self_: VALUE) ->
     }
     let h = res_of(vm, self_);
     let res = check_open_res(vm, h);
+    let decode = unsafe { (*h).decode };
     let p = pq();
     let n = vm.native();
     let nt = (p.ntuples)(res);
-    let rows = unsafe { (n.rb_ary_new)() };
+    let rows = unsafe { (n.rb_ary_new_capa)(nt as c_long) };
     for i in 0..nt {
-        unsafe { (n.rb_ary_push)(rows, row_values(vm, res, i)) };
+        unsafe { (n.rb_ary_push)(rows, row_values(vm, res, i, decode)) };
     }
     rows
 }
@@ -1115,11 +1244,11 @@ unsafe extern "C" fn res_fields(argc: c_int, _argv: *mut VALUE, self_: VALUE) ->
     let p = pq();
     let n = vm.native();
     let nf = (p.nfields)(res);
-    let fields = unsafe { (n.rb_ary_new)() };
+    let fields = unsafe { (n.rb_ary_new_capa)(nf as c_long) };
     for j in 0..nf {
         let name = (p.fname)(res, j);
         let bytes = unsafe { CStr::from_ptr(name) }.to_bytes();
-        let s = unsafe { (n.rb_utf8_str_new)(bytes.as_ptr() as *const c_char, bytes.len() as c_long) };
+        let s = utf8_string(vm, bytes.as_ptr() as *const c_char, bytes.len() as c_long);
         unsafe { (n.rb_ary_push)(fields, s) };
     }
     fields
@@ -1159,7 +1288,7 @@ unsafe extern "C" fn res_get(argc: c_int, argv: *mut VALUE, self_: VALUE) -> VAL
     if i < 0 || i >= (p.ntuples)(res) as i64 {
         return calisto_ruby::Qnil;
     }
-    row_values(vm, res, i as c_int)
+    row_values(vm, res, i as c_int, unsafe { (*h).decode })
 }
 
 /// `Result#getvalue(row, col)` / `#getisnull(row, col)` — bounds checados.
@@ -1181,7 +1310,38 @@ unsafe extern "C" fn res_getvalue(argc: c_int, argv: *mut VALUE, self_: VALUE) -
     }
     let c = (p.getvalue)(res, i as c_int, j as c_int);
     let len = (p.getlength)(res, i as c_int, j as c_int);
-    (vm.native().rb_utf8_str_new)(c, len as c_long)
+    utf8_string(vm, c, len as c_long)
+}
+
+/// `Result#typed_getvalue(row, col)` — como getvalue mas decodifica por OID
+/// quando o result tem type map (usado pelo PG::Tuple do shim — o pg 1.5+
+/// devolve valores tipados nas tuplas). nil para NULL.
+unsafe extern "C" fn res_typed_getvalue(argc: c_int, argv: *mut VALUE, self_: VALUE) -> VALUE {
+    let vm = vm();
+    if argc != 2 {
+        vm.raise(vm.e_arg_error(), &format!("wrong number of arguments (given {argc}, expected 2)"));
+    }
+    let h = res_of(vm, self_);
+    let res = check_open_res(vm, h);
+    let p = pq();
+    let i = (vm.native().rb_num2ll)(*argv);
+    let j = (vm.native().rb_num2ll)(*argv.add(1));
+    if i < 0 || i >= (p.ntuples)(res) as i64 || j < 0 || j >= (p.nfields)(res) as i64 {
+        vm.raise(vm.e_arg_error(), "indice fora do range do result");
+    }
+    if (p.getisnull)(res, i as c_int, j as c_int) != 0 {
+        return calisto_ruby::Qnil;
+    }
+    let c = (p.getvalue)(res, i as c_int, j as c_int);
+    let len = (p.getlength)(res, i as c_int, j as c_int);
+    if unsafe { (*h).decode } {
+        match decode_value(vm, (p.ftype)(res, j as c_int), c, len) {
+            Some(v) => v,
+            None => utf8_string(vm, c, len as c_long),
+        }
+    } else {
+        utf8_string(vm, c, len as c_long)
+    }
 }
 
 unsafe extern "C" fn res_getisnull(argc: c_int, argv: *mut VALUE, self_: VALUE) -> VALUE {
@@ -1234,7 +1394,10 @@ unsafe extern "C" fn res_fmod(argc: c_int, argv: *mut VALUE, self_: VALUE) -> VA
     (vm.native().rb_ll2inum)((pq().fmod)(res, j as c_int) as i64)
 }
 
-/// `Result#cmd_tuples` — "N" (string) ou nil quando nao se aplica.
+/// `Result#cmd_tuples` — Integer (o pg gem devolve LONG2NUM(strtol(...)),
+/// nao String: o AR compara numericamente — `destroy_row > 0`,
+/// `affected_rows != 1` do optimistic locking; String "1" > 0 quebra com
+/// ArgumentError "comparison of String with 0 failed").
 unsafe extern "C" fn res_cmd_tuples(argc: c_int, _argv: *mut VALUE, self_: VALUE) -> VALUE {
     let vm = vm();
     if argc != 0 {
@@ -1243,15 +1406,16 @@ unsafe extern "C" fn res_cmd_tuples(argc: c_int, _argv: *mut VALUE, self_: VALUE
     let h = res_of(vm, self_);
     let res = check_open_res(vm, h);
     let s = (pq().cmd_tuples)(res);
-    if s.is_null() {
-        return calisto_ruby::Qnil;
-    }
-    let bytes = unsafe { CStr::from_ptr(s) }.to_bytes();
-    if bytes.is_empty() {
-        calisto_ruby::Qnil
+    let n = if s.is_null() {
+        0
     } else {
-        vm.utf8_str(bytes)
-    }
+        let bytes = unsafe { CStr::from_ptr(s) }.to_bytes();
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|t| t.parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+    (vm.native().rb_ll2inum)(n)
 }
 
 /// `Result#result_status` — ExecStatusType (int).
@@ -1410,6 +1574,7 @@ pub fn register(vm: &Ruby) -> Result<(), String> {
         define_method(vm, conn, "socket_io", conn_socket_io);
         define_method(vm, conn, "set_client_encoding", conn_set_client_encoding);
         define_method(vm, conn, "set_notice_receiver", conn_set_notice_receiver);
+        define_method(vm, conn, "_calisto_result_type_map!", conn_calisto_result_type_map);
         define_method(vm, conn, "get_last_result", conn_get_last_result);
         define_method(vm, res, "values", res_values);
         define_method(vm, res, "rows", res_values);
@@ -1418,6 +1583,7 @@ pub fn register(vm: &Ruby) -> Result<(), String> {
         define_method(vm, res, "nfields", res_nfields);
         define_method(vm, res, "[]", res_get);
         define_method(vm, res, "getvalue", res_getvalue);
+        define_method(vm, res, "typed_getvalue", res_typed_getvalue);
         define_method(vm, res, "getisnull", res_getisnull);
         define_method(vm, res, "ftype", res_ftype);
         define_method(vm, res, "fmod", res_fmod);

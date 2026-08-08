@@ -10,7 +10,7 @@ conn.exec("CREATE TABLE calisto_pg_check (id serial PRIMARY KEY, name text, n in
 
 r = conn.exec_params("INSERT INTO calisto_pg_check (name, n, note) VALUES ($1, $2, $3) RETURNING id",
                      ["z\u00e9", 7, nil])
-raise "cmd_tuples=#{r.cmd_tuples.inspect}" unless r.cmd_tuples == "1"
+raise "cmd_tuples=#{r.cmd_tuples.inspect}" unless r.cmd_tuples == 1
 raise "ntuples=#{r.ntuples}" unless r.ntuples == 1
 
 conn.prepare("calisto_pg_check_sel", "SELECT name, n, note FROM calisto_pg_check WHERE n = $1")

@@ -245,13 +245,11 @@ if defined?(PG::CALISTO_NATIVE)
     def [](key)
       idx = key.is_a?(Integer) ? key : @result.fields.index(key)
       return nil unless idx
-      @result.getisnull(@index, idx) ? nil : @result.getvalue(@index, idx)
+      @result.typed_getvalue(@index, idx)
     end
 
     def to_a
-      Array.new(@result.nfields) do |j|
-        @result.getisnull(@index, j) ? nil : @result.getvalue(@index, j)
-      end
+      Array.new(@result.nfields) { |j| @result.typed_getvalue(@index, j) }
     end
 
     def values = to_a
@@ -295,6 +293,7 @@ class PG::Connection
 
   def type_map_for_results=(map)
     @calisto_type_map_for_results = map
+    _calisto_result_type_map!(map) # marca o decode por OID no native
     map
   end
 
@@ -322,7 +321,11 @@ pub fn ensure_native_shims(dir: &Path) {
         ("gems/pg.rb", PG_SHIM),
     ] {
         let p = dir.join(name);
-        if !p.is_file() {
+        // reescreve quando o conteudo difere (nao so quando falta): um dir de
+        // runtime antigo com shim stale (ex.: antes de um bump do PG_SHIM)
+        // silenciosamente nao aplica as mudancas — o daemon novo repara sozinho
+        let stale = fs::read_to_string(&p).map(|old| old != content).unwrap_or(true);
+        if stale {
             if let Err(e) = fs::write(&p, content) {
                 eprintln!("calisto: warning: nao consegui escrever {}: {e}", p.display());
             }
